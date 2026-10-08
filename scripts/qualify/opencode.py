@@ -25,6 +25,7 @@ import unittest
 import opencode_cases as cases
 import opencode_safety as safety
 import opencode_runroot as runroots
+import opencode_diagnostic as diagnostic
 from opencode_ownership import OwnershipRegistry
 
 REPO = Path(__file__).resolve().parents[2]
@@ -51,7 +52,8 @@ E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests", "opencode_readiness_tests",
                 "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests",
                 "opencode_reply_tests", "opencode_review_tests", "opencode_config_tests", "opencode_isolation_tests",
-                "opencode_event_tests", "opencode_runroot_tests", "opencode_daemon_tests", "opencode_c1_tests")
+                "opencode_event_tests", "opencode_runroot_tests", "opencode_daemon_tests", "opencode_c1_tests",
+                "opencode_diagnostic_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -101,12 +103,16 @@ def arguments(argv=None):
     parser.add_argument("--fake-gate-manifest", type=Path, default=FAKE_GATE_MANIFEST,
                         help="saved fake gates bound to both VIA builds and current Rust source")
     parser.add_argument("--phase", action="append", choices=[row.name for row in cases.PHASES])
+    parser.add_argument("--diagnostic-mock-case",action="append",choices=sorted(diagnostic.MOCK_CASES),
+                        help="preflight plus named loopback-only cases; never qualifies the route")
     args = parser.parse_args(argv)
     if args.self_test:
-        if args.live or args.acquire:
+        if args.live or args.acquire or args.diagnostic_mock_case:
             parser.error("--self-test cannot acquire or execute live")
         return args
-    if not args.live:
+    if args.diagnostic_mock_case and (args.live or args.phase):
+        parser.error("mock diagnostic mode cannot select live or public phases")
+    if not args.live and not args.diagnostic_mock_case:
         parser.error("--live is required; use --self-test for offline checks")
     if not args.via_release or not args.via_failpoints or not args.evidence:
         parser.error("both VIA builds and --evidence are required")
@@ -358,11 +364,14 @@ def main(argv=None):
     records, cleanup, driver = [], {}, None
     run_root = None
     current_phase, phase_rows = 'setup', []
-    phases = selected_phases(args.phase)
+    diagnostic_cases=getattr(args,'diagnostic_mock_case',None)
+    diagnostic_selection=diagnostic.selection(diagnostic_cases) if diagnostic_cases else None
+    phases = list(diagnostic_selection) if diagnostic_selection else selected_phases(args.phase)
     info = {"runner": "scripts/qualify/opencode.py", "vendor_version": VERSION,
             "started_at": time.time(), "phases": phases, "oc_rows": cases.OC_DISPOSITIONS,
             "live_rows": cases.L_DISPOSITIONS, "openapi_e7_sha256": E7_SHA256,
             "blocks": []}
+    if diagnostic_selection:info['diagnostic_mode']={'mock_only':True,'cases':diagnostic_cases,'qualifies':False}
 
     def retain_block(error, stage):
         retainer=getattr(driver,'reply_evidence',None)
@@ -420,7 +429,9 @@ def main(argv=None):
             from opencode_driver import Driver
             driver = Driver(via_release=args.via_release, via_failpoints=args.via_failpoints,
                             opencode=pinned, evidence=args.evidence, signals=signals,
-                            public_free=True, initialize=False, ownership=ownership,git_templates=templates,run_root=run_root)
+                            public_free=not bool(diagnostic_selection), initialize=False, ownership=ownership,git_templates=templates,run_root=run_root,
+                            diagnostic_mock_only=bool(diagnostic_selection))
+            driver.diagnostic_mock_only=bool(diagnostic_selection)
             vault = driver.vault
             driver.fake_gate_manifest = fake_gates
             # A fresh evidence path must still find the previous stopped-daemon
@@ -444,7 +455,8 @@ def main(argv=None):
                     records.extend(rows[accepted:])
                     accepted = len(rows)
                     phase_rows = list(rows)
-                phase_records = cases.run_phase(adapter, phase, record_sink=retain_phase)
+                options={'case_names':diagnostic_selection[phase],'mock_only':True} if diagnostic_selection else {}
+                phase_records = cases.run_phase(adapter, phase, record_sink=retain_phase,**options)
                 if accepted != len(phase_records):
                     retain_phase(phase_records)
                 info['blocks'].extend(row['blocking'] for row in phase_records if 'blocking' in row)
@@ -456,6 +468,7 @@ def main(argv=None):
         except BaseException as error:
             # No arbitrary exception string can leak a password, handle or raw response.
             info["runner_error"] = type(error).__name__
+            if diagnostic_selection:info['diagnostic_exception_sites']=diagnostic.exception_sites(error)
             if hasattr(error,'ancestor_discovery'): info['ancestor_discovery']=error.ancestor_discovery
             retain_block(error, 'runner')
         finally:
@@ -519,6 +532,11 @@ def main(argv=None):
                     with safety.block_context(phase='cleanup',case=None,verb=None):
                         retain_block(error,'cleanup')
             info.update(summary_verdict(records, phases, cleanup, bool(signals.interrupted)))
+            if diagnostic_selection:
+                expected={name for names in diagnostic_selection.values() for name in names}
+                diagnostic_pass={row['case'] for row in records}==expected \
+                    and all(row['result']=='pass' for row in records) and cleanup.get('proven') is True
+                if diagnostic_pass:info['result']='diagnostic_pass'
             if any(key in info for key in ("runner_error", "cleanup_error", "proof_error")) \
                     or signals.interrupted:
                 info["result"] = "blocked"
@@ -546,7 +564,7 @@ def main(argv=None):
                 vault.clear()
     print(json.dumps({key: info[key] for key in ("result", "gate_count", "gate_passed")},
                      sort_keys=True))
-    return 0 if info["result"] == "pass" else 1
+    return 0 if info["result"] in {"pass","diagnostic_pass"} else 1
 
 
 if __name__ == "__main__":

@@ -734,14 +734,14 @@ class ProviderTests(unittest.TestCase):
         if tools is not None:
             value["tools"] = tools
         if messages is not None:value["messages"]=messages
-        conn.request("POST", "/v1/chat/completions", json.dumps(value),
-                     {"Content-Type": "application/json"})
-        response = conn.getresponse()
         try:
+            conn.request("POST", "/v1/chat/completions", json.dumps(value),
+                         {"Content-Type": "application/json"})
+            response = conn.getresponse()
             body = response.read()
+            return response.status, body
         finally:
             conn.close()
-        return response.status, body
 
     def test_usage_exchange_retains_shapes_and_served_cache_without_content(self):
         tools=[{'type':'function','function':{'name':'shell','parameters':{
@@ -832,7 +832,7 @@ class ProviderTests(unittest.TestCase):
         with cases.LoopbackProvider() as provider:
             provider.TOTAL_CONNECTIONS=2
             self.request(provider);self.request(provider)
-            with self.assertRaises((http.client.RemoteDisconnected,ConnectionResetError)):
+            with self.assertRaises((http.client.RemoteDisconnected,ConnectionResetError,BrokenPipeError)):
                 self.request(provider)
             self.assertTrue(provider.receipt().get('connection_limit_reached'))
             self.assertEqual(provider.receipt().get('connection_limit'),2)

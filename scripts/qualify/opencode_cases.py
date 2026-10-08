@@ -640,7 +640,8 @@ def usage_ledger(events: list, session: str, execution: str, input_id: str) -> d
 
 
 def case_usage(driver: CaseDriver, case: Case) -> None:
-    project = fixture(driver, "usage-cache", provider="mock", context=4096,
+    # §13: measure tool steps/cache here; the separate L7 fixture forces compaction.
+    project = fixture(driver, "usage-cache", provider="mock", context=32768,
                       cache_read=7, cache_write=3)
     result = turn(driver, project, "Use the local tool then answer with its output.")
     envelope = completed(case, result)
@@ -912,6 +913,7 @@ class LoopbackProvider:
 
             def do_POST(self):
                 try:
+                    self.response_shape = {}
                     length = int(self.headers.get("Content-Length", "-1"))
                     if not 0 <= length <= provider.BODY_BYTES:
                         self.send_error(413)
@@ -1778,13 +1780,16 @@ PHASE_CASES = {
 }
 
 
-def run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list[dict]:
+def run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None,
+              case_names=None, mock_only=False) -> list[dict]:
     """Keep phase context even when a setup/guard block precedes its first case (§13)."""
     with safety.block_context(phase=phase_name):
-        return _run_phase(driver, phase_name, record_sink=record_sink)
+        return _run_phase(driver, phase_name, record_sink=record_sink,
+                          case_names=case_names, mock_only=mock_only)
 
 
-def _run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list[dict]:
+def _run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None,
+               case_names=None, mock_only=False) -> list[dict]:
     phase = next((row for row in PHASES if row.name == phase_name), None)
     if phase is None:
         raise EvidenceUnavailable("unknown phase")
@@ -1794,10 +1799,13 @@ def _run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise EvidenceUnavailable("unverifiable VIA build hash")
     driver.execute("phase_begin", phase=phase.name, seconds=phase.seconds,
-                   public_turns=phase.public_turns, mock_turns=phase.mock_turns,
+                   public_turns=0 if mock_only else phase.public_turns, mock_turns=phase.mock_turns,
                    build=phase.build)
     records = []
-    for name in PHASE_CASES[phase_name]:
+    names=PHASE_CASES[phase_name] if case_names is None else case_names
+    if any(name not in PHASE_CASES[phase_name] for name in names):
+        raise safety.Blocked('case selection differs from phase')
+    for name in names:
         driver.execute("phase_guard")
         if name in {"compaction", "error_shapes"}:
             driver.execute("phase_build", build="release")

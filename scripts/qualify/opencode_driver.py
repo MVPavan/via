@@ -38,7 +38,8 @@ from opencode_catalog import catalog_record
 from opencode_reply import ReplyEvidence, reply_check
 from opencode_cases import REPOSITORY_SENTINELS, PHASES
 from opencode_events import terminal_event
-from opencode_c1 import TERMINAL_STATES, SCOPES, CANCEL_OUTCOMES, CLEANUP_STATES, ERROR_CODES
+from opencode_c1 import (TERMINAL_STATES, SCOPES, CANCEL_OUTCOMES, CLEANUP_STATES,
+                         ERROR_CODES, FAILURE_CLASSES, STOP_REASONS)
 from opencode_runroot import ANCHOR_SOCKET_TAIL, SOCKET_BYTES
 
 Blocked = safety.Blocked
@@ -148,6 +149,10 @@ def strict_reply(raw, schema):
         if value['revision']<0:raise Blocked('negative envelope revision')
         if value['failure'] is not None:
             _typed(value['failure'],{'class':S,'message':S},'failure')
+            if value['failure']['class'] not in FAILURE_CLASSES:
+                raise Blocked('envelope failure class invalid')
+        if value['stop_reason'] is not None and value['stop_reason'] not in STOP_REASONS:
+            raise Blocked('envelope stop reason invalid')
         if value['cancel'] is not None:
             _typed(value['cancel'],{'outcome':S,'cleanup':S},'cancel')
         if value['cost']['scope'] not in SCOPES:
@@ -260,7 +265,7 @@ class Driver:
 
     def __init__(self,release=None,failpoints=None,pinned=None,evidence=None,*,
                  via_release=None,via_failpoints=None,opencode=None,signals=None,
-                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None,ownership=None,git_templates=None,run_root=None):
+                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None,ownership=None,git_templates=None,run_root=None,diagnostic_mock_only=False):
         release=release if release is not None else via_release
         failpoints=failpoints if failpoints is not None else via_failpoints
         pinned=pinned if pinned is not None else opencode
@@ -277,10 +282,13 @@ class Driver:
         self.proc=proc or safety.ProcReader()
         self.execute=execute or bounded_command
         self.vault=safety.PasswordVault()
-        self.guard=safety.SpendingGuard(public_free=public_free,owned_mock_origins=mock_origins)
+        self.guard=safety.SpendingGuard(public_free=public_free,owned_mock_origins=mock_origins,
+                                        mock_only=diagnostic_mock_only)
         self.mock_origins=set(mock_origins)
         self.rg=rg
         self.public_free=public_free
+        self.diagnostic_mock_only=diagnostic_mock_only
+        self._diagnostic_sessions={};self._submitted_models={}
         self._http=None; self._binary=None; self.daemon=None; self.anchor=None; self.vendor_identity=None
         self.identities=set(); self.uncertain=[]; self.build_hashes={}; self.handles={}
         self.bearer_forms=set()
@@ -933,7 +941,14 @@ class Driver:
                 except (ValueError,IndexError) as error:raise Blocked('invalid CLI cancel grace') from error
                 if not 0<=grace<=FOREGROUND_WAIT_SECONDS:raise Blocked('CLI cancel grace exceeds phase ceiling')
             timeout=grace+CANCEL_CLEANUP_SECONDS+WAIT_REPLY_MARGIN_SECONDS
-        if verb=='close':timeout=CLOSE_REPLY_SECONDS+WAIT_REPLY_MARGIN_SECONDS
+        if verb=='close':
+            timeout=CLOSE_REPLY_SECONDS+WAIT_REPLY_MARGIN_SECONDS
+            if '--deadline-ms' in args:
+                try:close_deadline=int(args[args.index('--deadline-ms')+1])/1000
+                except (ValueError,IndexError) as error:raise Blocked('invalid CLI close deadline') from error
+                if not 0<=close_deadline<=FOREGROUND_WAIT_SECONDS:
+                    raise Blocked('CLI close deadline exceeds phase ceiling')
+                timeout=close_deadline+30+WAIT_REPLY_MARGIN_SECONDS
         if verb=='spawn' and '--background' not in args:
             timeout=FOREGROUND_WAIT_SECONDS+WAIT_REPLY_MARGIN_SECONDS
         if verb=='wait':
@@ -1004,8 +1019,15 @@ class Driver:
         if verb in {'spawn','resume'}:
             timing=dict(receipt if receipt is not None else value)
             if verb=='resume':timing['session_id']=args[1]
+            self._submitted_models[timing['session_id']]=submitted_model
             self._timeline_submit(timing,submitted_model,command_started,submitted_generation)
         if schema=='envelope':
+            if self.diagnostic_mock_only and type(value['vendor_session_id']) is str:
+                sid=value['vendor_session_id']
+                model=self._submitted_models.get(value['session_id'])
+                if model!=safety.MOCK_IDENTITY:raise Blocked('mock diagnostic session identity unverifiable')
+                fixture=next((name for name,row in self.fixtures.items() if row['path']==self.project),None)
+                self._diagnostic_sessions[sid]={'model':model,'fixture':fixture,'project':self.project}
             if self._timelines:
                 self._timeline_bind(value['session_id'],value['vendor_session_id'],turn=value['turn'])
             self.account(value)
@@ -1588,7 +1610,8 @@ class Driver:
 
     def _approved_model(self,identity):
         """§13: unapproved identities latch the stop before acquisition or polling."""
-        if identity not in {safety.FREE_IDENTITY,safety.MOCK_IDENTITY}:
+        allowed={safety.MOCK_IDENTITY} if self.diagnostic_mock_only else {safety.FREE_IDENTITY,safety.MOCK_IDENTITY}
+        if identity not in allowed:
             self.guard.stopped=True
             raise Blocked('paid or unapproved model identity')
 
@@ -3196,7 +3219,8 @@ def fail_closed(error,reached):
                 raise Blocked('long-run barrier outside reviewed fixture')
             path=self.project/'.opencode'/'tool-helper.py'
             if not path.is_file(): raise Blocked('pre-created long-run helper absent')
-            provider=next((p for name,p in self.mock_providers.items() if self.fixtures[name]['path']==self.project),None)
+            provider=next((p for name,p in self.mock_providers.items()
+                           if self.fixtures.get(name,{}).get('path')==self.project),None)
             if provider is None: raise Blocked('long-run mock provider absent')
             provider.script.append({'name':'shell','arguments':{'command':'/usr/bin/python3 '+str(path)}})
             return {'prepared':True,'helper':'tool','barrier_seconds':1800}
@@ -3283,7 +3307,7 @@ def fail_closed(error,reached):
                                 and str(event.get('data',event).get('inboxID','')).startswith('msg_via') for event in rows)}
         if kind=='mock_receipt':
             row=next((provider for name,provider in self.mock_providers.items()
-                      if self.fixtures[name]['path']==self.project),None)
+                      if self.fixtures.get(name,{}).get('path')==self.project),None)
             if row is None: raise Blocked('owned mock provider absent')
             receipt=row.receipt()
             if not receipt['received'] or not receipt['model_matches']:
@@ -3519,6 +3543,12 @@ def fail_closed(error,reached):
         """Final cleanup/immutable-pin proof; uncertainty retains roots and fails closure."""
         failures=[];traffic={'received_requests':0,'providers':0}
         diagnostic_error=None
+        if self.diagnostic_mock_only:
+            try:
+                from opencode_diagnostic import capture
+                self._record('mock-diagnostic-before-cleanup',capture(self.work,self.ownership,self._diagnostic_sessions,
+                    replacements=(*self.vault.redaction_forms(),*self.secret_forms,*self.bearer_forms)))
+            except BaseException as error:diagnostic_error=error
         try:self._timeline_flush('model-timelines-before-cleanup')
         except BaseException as error:diagnostic_error=error
         if self.external_root:
@@ -3567,6 +3597,10 @@ def fail_closed(error,reached):
             diagnostic_error.diagnostic_failure=True
             failures.append(diagnostic_error)
         if failures: raise failures[0]
+        if self.diagnostic_mock_only:
+            from opencode_diagnostic import capture
+            self._record('mock-diagnostic',capture(self.work,self.ownership,self._diagnostic_sessions,
+                replacements=(*self.vault.redaction_forms(),*self.secret_forms,*self.bearer_forms)))
         safety.verify_binary(self.pinned)
         if self.external_root:
             self._check_ancestors('finish')

@@ -1424,7 +1424,25 @@ a stop. The ancestor control must remain sensitive to both markers. After
 owned-process/pgrep/lock absence proof, retain allow-listed native session,
 message, instruction, log and consistent VIA Store projections, reapply the
 secrecy scan, and remove the private run root with an absence record. Raw
-storage, log text, credentials and bearer handles are never copied to evidence.
+storage, credentials and bearer handles are never copied to evidence. The owner
+authorized a mock-only diagnostic exception (2026-10-08):
+`--diagnostic-mock-case usage` runs preflight plus that explicitly named scripted
+case, with zero public-turn admission and only `oclive-mock/fixture-free`
+approved. `compaction` may also be explicitly named; neither selection qualifies
+the route. Only enrolled mock sessions may export bounded native error names
+and messages and relevant private vendor log lines. Replace the private run-root
+path and every password/bearer representation before the protected evidence
+write, then run the ordinary whole-root secrecy scan. Public-free sessions
+retain only closed projections, never this text. Diagnostic runs retain the
+ordinary identity, ancestor, spending and cleanup proofs and report
+`diagnostic_pass` separately from qualification.
+The usage/cache fixture uses a 32,768-token mock context to measure its scripted
+tool steps without triggering automatic compaction first. L7's separate mock
+fixture retains its small context. The first mock-only usage diagnostic showed
+`compaction.failed` with "Compaction summary did not match the required template"
+at the former 4,096-token context; its canned tool/final response is not a
+compaction summary. Mock-only error/log exports run before cleanup and again
+after a proven stop, so the final export includes the vendor logger's flush.
 Root removal uses the current `stop_result` process/lock/pgrep proof even if
 native diagnostic retention subsequently fails. That diagnostic failure is
 reported separately and still blocks qualification. Every new start/stop

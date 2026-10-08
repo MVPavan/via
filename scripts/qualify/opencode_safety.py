@@ -468,6 +468,10 @@ class PasswordVault:
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
 
+    def redaction_forms(self):
+        """§13 mock-only error export: private memory forms, never written or logged."""
+        return tuple(self._values.values())
+
     def clear(self):
         self._values.clear()
         self._names.clear()
@@ -1337,12 +1341,13 @@ class SpendingGuard:
     """Structural controls before every model-capable request; missing cost is null."""
 
     def __init__(self, *, allowed_environment=VENDOR_ENVIRONMENT,
-                 owned_mock_origins=(), public_free=False):
+                 owned_mock_origins=(), public_free=False, mock_only=False):
         self.allowed_environment = frozenset(allowed_environment)
         self.mock_origins = frozenset(owned_mock_origins)
         for origin in self.mock_origins:
             loopback_origin(origin)
         self.public_free = public_free
+        self.mock_only = mock_only
         self.stopped = False
 
     def check(self, *, integration, environment_names, catalog, provider, model,
@@ -1362,7 +1367,8 @@ class SpendingGuard:
             if frozenset(environment_names) != self.allowed_environment:
                 raise Blocked("environment allow-list failed")
             identity = f"{provider}/{model}"
-            if identity not in {FREE_IDENTITY, MOCK_IDENTITY}:
+            allowed={MOCK_IDENTITY} if self.mock_only else {FREE_IDENTITY, MOCK_IDENTITY}
+            if identity not in allowed:
                 raise Blocked("paid or unapproved model identity")
             if not isinstance(catalog, dict) or not isinstance(catalog.get(identity), dict) \
                     or catalog[identity].get("free") is not True:
