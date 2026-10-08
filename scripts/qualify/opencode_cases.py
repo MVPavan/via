@@ -782,6 +782,8 @@ class LoopbackProvider:
         self.admission_blocked = False
         self.response_hold = response_hold
         self.received, self.model_matches, self.requests = False, False, 0
+        self.admitted_requests = self.refused_requests = self.unreleased_responses = 0
+        self.connection_limit_reached = False
         self.server = self.thread = None
         self._lock = threading.Lock()
         self._connections = set()
@@ -845,6 +847,8 @@ class LoopbackProvider:
 
             def process_request(self, request, address):
                 with provider._lock:
+                    if len(provider._handlers) >= provider.TOTAL_CONNECTIONS:
+                        provider.connection_limit_reached = True
                     if (provider._closing or len(provider._connections) >= provider.ACTIVE_CONNECTIONS
                             or len(provider._handlers) >= provider.TOTAL_CONNECTIONS):
                         self.shutdown_request(request)
@@ -902,23 +906,33 @@ class LoopbackProvider:
                         self.send_error(400)
                         return
                     value = json.loads(raw)
-                    provider.received = True
-                    provider.requests += 1
-                    if type(value) is dict and type(value.get("model")) is str:
-                        provider.models.add(value["model"])
-                        if provider.admit_request is not None:
-                            try:
+                    rejected = False
+                    with provider._lock:
+                        provider.received = True
+                        provider.requests += 1
+                        if type(value) is dict and type(value.get("model")) is str:
+                            provider.models.add(value["model"])
+                        try:
+                            if type(value) is not dict or type(value.get("model")) is not str:
+                                raise EvidenceUnavailable("unexpected fixture model")
+                            if provider.admit_request is not None:
                                 provider.admit_request(value["model"])
-                            except Exception:
-                                # No exception string, request, or header reaches
-                                # stderr/evidence. The owner's guard is sticky.
-                                provider.admission_blocked = True
-                                if provider.response_hold is not None:
-                                    provider.response_hold.abort()
-                                    self.close_connection = True
-                                    return
-                                self.reply(403, b'{"error":{"type":"fixture.admission-stop"}}')
-                                return
+                            if value["model"] != provider.model:
+                                raise EvidenceUnavailable("unexpected fixture model")
+                            provider.admitted_requests += 1
+                        except Exception:
+                            # No exception string, request, or header reaches
+                            # stderr/evidence. The owner's guard is sticky.
+                            provider.refused_requests += 1
+                            provider.admission_blocked = True
+                            rejected = True
+                    if rejected:
+                        if provider.response_hold is not None:
+                            provider.response_hold.abort()
+                            self.close_connection = True
+                            return
+                        self.reply(403, b'{"error":{"type":"fixture.admission-stop"}}')
+                        return
                     messages = json.dumps(value.get("messages", [])) if type(value) is dict else ""
                     for name, marker in provider.markers.items():
                         if marker in messages:
@@ -1027,6 +1041,8 @@ class LoopbackProvider:
 
             def reply(self, status, body, content_type="application/json"):
                 if provider.response_hold is not None and not provider.response_hold.wait():
+                    with provider._lock:
+                        provider.unreleased_responses += 1
                     self.close_connection = True
                     return
                 self.connection.settimeout(provider.CONNECTION_SECONDS)
@@ -1061,7 +1077,11 @@ class LoopbackProvider:
         return {"received": self.received, "model_matches": self.model_matches,
                 "requests": self.requests, "mode": "mock", "models": sorted(self.models),
                 "scripted_tools": sorted(self.scripted_tools), "read_calls": list(self.read_calls),
-                "admission_blocked": self.admission_blocked, **self.observed_markers}
+                "admission_blocked": self.admission_blocked,
+                "admitted_requests": self.admitted_requests, "refused_requests": self.refused_requests,
+                "unreleased_responses": self.unreleased_responses,
+                "connection_limit_reached": self.connection_limit_reached,
+                "connection_limit": self.TOTAL_CONNECTIONS, **self.observed_markers}
 
     def __exit__(self, *_args):
         if self._closing:

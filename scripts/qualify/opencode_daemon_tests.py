@@ -1,6 +1,7 @@
 """Private daemon idle generations and fixed identity diagnostics (§13)."""
 
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -13,6 +14,50 @@ import opencode_via_tests as audit
 
 
 class DaemonGenerationTests(unittest.TestCase):
+    def cleanup_fixture(self, root):
+        d,_=self.fixture(root)
+        successor=safety.Identity(125,458)
+        home=Path(root)/'private-home';home.mkdir(mode=0o700)
+        d.env={'HOME':str(home)}
+        d.proc.root=Path(root)/'proc'
+        (d.proc.root/str(successor.pid)).mkdir(parents=True)
+        d.proc.stat.return_value={'pid':successor.pid,'start_ticks':successor.start_ticks}
+        d.proc.read.return_value=b'HOME='+os.fsencode(home)+b'\0'
+        d.identities.add(d.daemon)
+        live={d.daemon:False,successor:True}
+        d.proc.alive.side_effect=lambda identity:live[identity]
+        d._lock_free=mock.Mock(side_effect=lambda _path:not live[successor])
+        d._lock_rows=mock.Mock(side_effect=lambda:{path:[(successor.pid,'FLOCK')]
+            if live[successor] else [] for path in d._lock_paths()})
+        d._pgrep_clear=mock.Mock(return_value=True)
+        return d,successor,live
+
+    def test_cleanup_registers_unseen_lock_holder_before_waiting_for_exit(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+            d,successor,live=self.cleanup_fixture(root)
+            d.pinned=Path(root)/'absent-pin'
+            d.secrecy_scan=mock.Mock(return_value={'secret_absent':True,'payload_captures':0})
+            with mock.patch('opencode_driver.safety.verify_binary'), \
+                    mock.patch('opencode_driver.time.sleep',side_effect=lambda _s:live.update({successor:False})):
+                proof=d.finish()
+            self.assertTrue(proof['proven'])
+            self.assertIn(successor,d.identities)
+            self.assertEqual(d.daemon_generations[0]['pid'],125)
+            self.assertEqual(d.daemon_generations[0]['start_ticks'],458)
+            self.assertEqual(d.daemon_generations[0]['discovery'],'private-locks-and-home')
+
+    def test_cleanup_unseen_holder_with_foreign_home_or_unknown_identity_blocks(self):
+        for fault in ('home','identity','lock-kind'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+                d,successor,live=self.cleanup_fixture(root)
+                if fault=='home':d.proc.read.return_value=b'HOME=/unowned-fixture\0'
+                if fault=='identity':d.proc.stat.return_value=None
+                if fault=='lock-kind':d._lock_rows.return_value=None;d._lock_rows.side_effect=lambda:{
+                    path:[(successor.pid,'POSIX')] for path in d._lock_paths()}
+                with mock.patch('opencode_driver.time.sleep',side_effect=lambda _s:live.update({successor:False})):
+                    with self.assertRaisesRegex(safety.Blocked,'private.*(locker|daemon)'):
+                        d.stop()
+
     def test_not_verified_retains_role_and_false_or_unknown(self):
         for value in (False, None):
             with self.subTest(liveness=value):
@@ -114,6 +159,35 @@ class DaemonGenerationTests(unittest.TestCase):
 
 @unittest.skipUnless(audit.AVAILABLE,'optional real-VIA audit: build release, failpoints and via-fake-agent')
 class RealDaemonTests(unittest.TestCase):
+    def test_cleanup_discovers_real_daemon_autostart_behind_retired_identity(self):
+        with audit.ViaFixture('failpoints',auto_start=False) as fixture:
+            d=fixture.driver
+            execute=d.execute
+            def accelerated(argv,**kwargs):
+                if argv[0]==str(d.paths['failpoints']):
+                    kwargs['env']={**kwargs['env'],'VIA_TEST_IDLE_EXIT_MS':'1200'}
+                return execute(argv,**kwargs)
+            d.execute=accelerated
+            d.start('failpoints',fixture.project)
+            old=d.daemon
+            d.stop()
+            # As in run21, a CLI starts a successor before Driver registers it;
+            # cleanup still has only the exited predecessor saved.
+            code,out,err=d.execute([str(d.paths['failpoints']),'daemon','status','--json'],
+                                  env=d.env,cwd=fixture.project,timeout=10)
+            self.assertEqual((code,err),(0,b''))
+            successor=json.loads(out)['pid']
+            row=d.proc.stat(successor)
+            self.assertIsNotNone(row)
+            d.daemon=old
+            proof=d.finish()
+            self.assertTrue(proof['proven'])
+            recorded=[r for r in d.daemon_generations if r['pid']==successor]
+            self.assertEqual(len(recorded),1)
+            self.assertEqual(recorded[0]['start_ticks'],row['start_ticks'])
+            self.assertEqual(recorded[0]['discovery'],'private-locks-and-home')
+            self.assertIs(d.proc.alive(safety.Identity(successor,row['start_ticks'])),False)
+
     def test_real_idle_exit_during_retirement_then_bootstrap(self):
         # The existing test-only interval accelerates the designed idle expiry;
         # no client or keepalive runs during retirement. The release stays 60 s.

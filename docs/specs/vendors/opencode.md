@@ -1338,6 +1338,20 @@ owned locks, using the same private state/runtime/HOME as the first start.
 Each start and proven clean idle end is retained as a numbered generation;
 every process-verification block retains a fixed role and false/unknown
 liveness. No daemon identity is renewed from elapsed time alone.
+Cleanup also discovers daemon generations started by a private CLI before the
+runner registered them: an invoking-user process must hold a private daemon or
+Store FLOCK and have the exact private HOME, with pid/start ticks re-verified
+around those observations. Its PID/start ticks are retained immediately after
+ownership proof. Cleanup waits up to 180 s for observed processes to exit and
+both locks to be released; an ambiguous holder or identity blocks. This covers
+bounded mock-abort retries followed by the designed idle shutdown without
+keepalives or signalling a newly discovered process.
+Each local mock admits at most the phase's physical-request ceiling; retries
+are included. Each provider also has at most 64 handled connections (16 active,
+5 s header/body deadline), and exceeding that transport ceiling blocks closure.
+Final receipts distinguish received, admitted, refused and admitted responses
+left unreleased by the bootstrap barrier. Retries never become completed-turn
+or gate evidence and never consume the public free-turn budget.
 
 **Qualification run-root amendment (owner, 2026-10-07; isolation ruling 2026-10-08):**
 Every vendor/VIA-visible controlled path lives under one fresh, owned 0700

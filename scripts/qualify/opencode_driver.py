@@ -50,6 +50,7 @@ SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
 WAIT_REPLY_MARGIN_SECONDS = 10  # §13: allow the CLI to return its bounded wait reply.
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
 IDLE_RETIREMENT_SECONDS = 90  # §13: natural exit of each process, clipped to its phase.
+CLEANUP_SECONDS = 180  # §13: bounded mock abort/retries, then natural daemon idle shutdown.
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
 CONFIG_READY_POLL_SECONDS = .2  # §13: only empty or verified previous endpoint maps wait.
@@ -664,8 +665,10 @@ class Driver:
         if len(raw)>OBSERVATION_BYTES: raise Blocked('lock evidence exceeds bound')
         ids={}
         for path in self._lock_paths():
-            try: row=path.stat()
+            try: row=path.lstat()
             except OSError as error: raise Blocked('private lock file absent') from error
+            if not stat.S_ISREG(row.st_mode) or row.st_uid!=os.getuid() or row.st_nlink!=1:
+                raise Blocked('private lock file identity unverified')
             ids[f'{os.major(row.st_dev):02x}:{os.minor(row.st_dev):02x}:{row.st_ino}']=path
         result={path:[] for path in self._lock_paths()}
         for line in raw.decode('ascii','strict').splitlines():
@@ -677,14 +680,62 @@ class Driver:
     def _locks_owned(self,pid):
         return all((pid,'FLOCK') in rows for rows in self._lock_rows().values())
 
-    def _discover_private_lockers(self):
+    def _discover_private_lockers(self,*,strict=False):
+        """§13: retain unseen daemon generations by private locks/HOME, never by name."""
         try:
-            for rows in self._lock_rows().values():
-                for pid,_ in rows:
-                    row=self.proc.stat(pid)
-                    if row is None: self.uncertain.append('unreadable private locker')
-                    else: self.identities.add(safety.Identity(pid,row['start_ticks']))
-        except Blocked: self.uncertain.append('private lockers unverifiable')
+            holders=self._lock_rows()
+            candidates=sorted({(pid,kind) for rows in holders.values() for pid,kind in rows})
+            for pid,kind in candidates:
+                if kind!='FLOCK' or pid<=0: raise Blocked('private locker kind unverifiable')
+                row=self.proc.stat(pid)
+                if row is None: raise Blocked('private locker identity unreadable')
+                identity=safety.Identity(pid,row['start_ticks'])
+                if any(record['pid']==pid and record['start_ticks']==identity.start_ticks
+                       for record in self.daemon_generations):
+                    # Already proved owned. Its designed shutdown may release
+                    # either lock before process death; absence is polled below.
+                    if self.proc.alive(identity) is None:
+                        raise safety.process_block('daemon',None,'private locker identity unreadable')
+                    continue
+                self._verify(identity,'daemon')
+                info=(self.proc.root/str(pid)).stat()
+                if info.st_uid!=os.getuid(): raise Blocked('private locker owner unverified')
+                # Read only HOME's value, with descriptor-bound identity checks;
+                # no other environment value is sliced, logged or persisted.
+                raw=self.proc.read(identity,'environ')
+                home=[];offset=0
+                while offset<len(raw):
+                    end=raw.find(b'\0',offset)
+                    if end<0:break
+                    if raw.startswith(b'HOME=',offset):home.append(raw[offset+5:end])
+                    offset=end+1
+                valid=raw.endswith(b'\0') and home==[os.fsencode(self.env['HOME'])]
+                del raw,home
+                if not valid: raise Blocked('private locker HOME unverified')
+                for directory in (self.state,Path(self.env['HOME'])):
+                    info=directory.lstat()
+                    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() \
+                            or stat.S_IMODE(info.st_mode)!=0o700:
+                        raise Blocked('private daemon directory identity unverified')
+                again=self._lock_rows()
+                if not any((pid,'FLOCK') in rows for rows in again.values()):
+                    if self.proc.alive(identity) is not False:
+                        raise Blocked('private locker ownership changed')
+                self._verify(identity,'daemon')
+                self.identities.add(identity)
+                if not any(record['pid']==pid and record['start_ticks']==identity.start_ticks
+                           for record in self.daemon_generations):
+                    record={'generation':len(self.daemon_generations)+1,'pid':pid,
+                            'start_ticks':identity.start_ticks,'build':self.phase_kind,
+                            'discovery':'private-locks-and-home'}
+                    self.daemon_generations.append(record)
+                    self.ownership.daemon_started(self.state)
+                    self._record('daemon-generation',{'event':'cleanup-observed',**record})
+        except (Blocked,OSError,KeyError) as error:
+            if strict:
+                if isinstance(error,Blocked): raise
+                raise Blocked('private locker observation unverifiable') from error
+            self.uncertain.append('private lockers unverifiable')
 
     @reply_check
     def via(self,args):
@@ -2522,8 +2573,11 @@ class Driver:
                         self._bootstrap_cleanup=False
                 reply=self.via(['daemon','stop','--force'])
                 if reply.get('exit_code'): raise Blocked('private daemon stop refused')
-        deadline=time.monotonic()+90
+        deadline=time.monotonic()+CLEANUP_SECONDS
         while time.monotonic()<deadline:
+            locks=[self._lock_free(path) for path in self._lock_paths()]
+            if any(lock is False for lock in locks):
+                self._discover_private_lockers(strict=True)
             owned=sorted(self.identities,key=lambda value:(value.pid,value.start_ticks))
             states=[self.proc.alive(identity) for identity in owned]
             locks=[self._lock_free(path) for path in self._lock_paths()]
@@ -2536,7 +2590,7 @@ class Driver:
             if any(lock is None for lock in locks):
                 raise Blocked('owned stop identity or lock unverifiable')
             if all(state is False for state in states) and locks==[True,True]: break
-            time.sleep(0.02)
+            time.sleep(0.2)
         pgrep=self._pgrep_clear()
         safety.stop_proof(process_states=states,locks_free=locks,uncertain=self.uncertain,pgrep_clear=pgrep)
         self.stop_result={'complete':True,'proven':True,'processes_gone':True,'locks_free':True,'pgrep_clear':True}
@@ -3191,9 +3245,18 @@ print('VIA HELPER DONE')
                     failure.__cause__=error
                     failures.append(failure)
             try:
-                traffic={'received_requests':sum(provider.requests for provider in self.mock_providers.values()),
-                         'providers':len(self.mock_providers)}
+                receipts=[{'fixture':name,**{key:provider.receipt()[key] for key in (
+                    'requests','admitted_requests','refused_requests','unreleased_responses',
+                    'connection_limit_reached','connection_limit')}}
+                    for name,provider in sorted(self.mock_providers.items())]
+                traffic={'received_requests':sum(row['requests'] for row in receipts),
+                         'admitted_requests':sum(row['admitted_requests'] for row in receipts),
+                         'refused_requests':sum(row['refused_requests'] for row in receipts),
+                         'unreleased_responses':sum(row['unreleased_responses'] for row in receipts),
+                         'providers':len(receipts),'receipts':receipts}
                 self._record('mock-traffic',traffic)
+                if any(row['connection_limit_reached'] for row in receipts):
+                    failures.append(Blocked('mock provider connection ceiling exhausted'))
             except BaseException as error:
                 failure=Blocked('mock received request aggregate unverified')
                 failure.__cause__=error;failures.append(failure)

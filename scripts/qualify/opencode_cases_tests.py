@@ -737,6 +737,40 @@ class ProviderTests(unittest.TestCase):
             self.assertTrue(provider.receipt()["received"])
             self.assertTrue(provider.receipt()["model_matches"])
 
+    def test_aborted_bootstrap_retries_are_counted_separately_from_admission(self):
+        hold=cases.ResponseHold(time.monotonic()+5)
+        def admit(_model):
+            if provider.requests>2: raise cases.safety.Blocked('mock model request ceiling exhausted')
+        with cases.LoopbackProvider(response_hold=hold,admit_request=admit) as provider:
+            hold.abort()
+            for _ in range(5):
+                with self.assertRaises(http.client.RemoteDisconnected):self.request(provider)
+            receipt=provider.receipt()
+            self.assertEqual(receipt.get('admitted_requests'),2)
+            self.assertEqual(receipt.get('refused_requests'),3)
+            self.assertEqual(receipt.get('unreleased_responses'),2)
+            self.assertEqual(receipt['requests'],5)
+
+    def test_mock_connection_ceiling_is_visible_in_receipt(self):
+        with cases.LoopbackProvider() as provider:
+            provider.TOTAL_CONNECTIONS=2
+            self.request(provider);self.request(provider)
+            with self.assertRaises((http.client.RemoteDisconnected,ConnectionResetError)):
+                self.request(provider)
+            self.assertTrue(provider.receipt().get('connection_limit_reached'))
+            self.assertEqual(provider.receipt().get('connection_limit'),2)
+            self.assertEqual(provider.receipt()['requests'],2)
+
+    def test_paid_identity_preserves_spending_latch_with_accounting(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-provider-') as root:
+            driver=transport.Driver('release','fp','pin',Path(root)/'evidence')
+            driver.set_phase_budget(0,8)
+            with cases.LoopbackProvider(admit_request=driver._mock_request_admit) as provider:
+                self.assertEqual(self.request(provider,model='paid-model')[0],403)
+                self.assertTrue(driver.guard.stopped)
+                self.assertEqual(provider.receipt()['refused_requests'],1)
+                self.assertEqual(provider.receipt()['admitted_requests'],0)
+
     def test_paid_identity_mock_refused_locally(self):
         with cases.LoopbackProvider() as provider:
             self.assertEqual(self.request(provider, model="paid-model")[0], 403)
