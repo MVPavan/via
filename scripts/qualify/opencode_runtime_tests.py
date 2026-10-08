@@ -14,6 +14,7 @@ from unittest import mock
 
 import opencode_driver as runtime
 import opencode_safety as safety
+from opencode_safety_tests import fake_cli_generation
 
 
 class RuntimeTests(unittest.TestCase):
@@ -128,6 +129,7 @@ class RuntimeTests(unittest.TestCase):
             def execute(*args,**kwargs):
                 calls.append(kwargs); return 4,b'',b''
             d=self.driver(root,execute=execute); d._binary=Path('release')
+            fake_cli_generation(d)
             with self.assertRaisesRegex(safety.Blocked,'private daemon unreachable'):
                 d.via(['wait','s_fixture/1','--timeout-ms','180000'])
             self.assertGreater(calls[0]['timeout'],180)
@@ -137,6 +139,7 @@ class RuntimeTests(unittest.TestCase):
             reply={'session_id':'s_fixture','turn':'s_fixture/1','handle':'h_fake_bearer',
                    'effective':{'effort':None,'max_steps':None}}
             d=self.driver(root,execute=lambda *args,**kwargs:(0,json.dumps(reply).encode(),b''))
+            fake_cli_generation(d)
             d._binary=Path('release')
             with mock.patch.object(d,'spending_check'),mock.patch.object(d,'_admit_model'):
                 d.via(['spawn','--background','--prompt','fixture'])
@@ -218,6 +221,7 @@ class RuntimeTests(unittest.TestCase):
                       'effective':{'effort':None,'max_steps':None}}
                      for number,handle in ((1,'h_old_bearer'),(2,'h_next_bearer'))]
             d=self.driver(root,execute=mock.Mock(side_effect=[(0,json.dumps(reply).encode(),b'') for reply in replies]))
+            fake_cli_generation(d)
             d._binary=Path('release')
             with mock.patch.object(d,'spending_check'),mock.patch.object(d,'_admit_model'):
                 for _ in replies: d.via(['spawn','--background','--prompt','fixture'])

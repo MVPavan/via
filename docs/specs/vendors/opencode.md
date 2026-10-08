@@ -1342,6 +1342,15 @@ CLI execution except `daemon stop`, both private locks must have exactly the
 registered PID as their sole FLOCK holder before its reply is trusted. A foreign,
 additional or unregistered holder blocks; a definitively ended generation goes
 through the same clean-idle proof, never adoption from a later shutdown record.
+CLI calls require a registered generation; the sole initial exception is
+`start()`'s own status call, whose reply is then verified by pid/start ticks
+and both locks. If binding proves a generation ended cleanly, later calls
+block until `start()` registers another generation. A still-live saved daemon
+with one or both locks released is an idle exit in progress: wait at most
+30 s, clipped to the phase, rechecking pid/start ticks and allowing only its
+own remaining FLOCKs or released locks on each poll. Then require the same
+clean-idle Store/log/lock proof; foreign ownership, unknown liveness or the
+deadline blocks. This does not keep the daemon alive.
 Cleanup also discovers daemon generations started by a private CLI before the
 runner registered them: an invoking-user process must hold a private daemon or
 Store FLOCK and have the exact private HOME, with pid/start ticks re-verified
@@ -1416,6 +1425,10 @@ owned-process/pgrep/lock absence proof, retain allow-listed native session,
 message, instruction, log and consistent VIA Store projections, reapply the
 secrecy scan, and remove the private run root with an absence record. Raw
 storage, log text, credentials and bearer handles are never copied to evidence.
+Root removal uses the current `stop_result` process/lock/pgrep proof even if
+native diagnostic retention subsequently fails. That diagnostic failure is
+reported separately and still blocks qualification. Every new start/stop
+invalidates an earlier stop proof, so it cannot remove a later live generation.
 Every native case-session message and part is retained as a closed diagnostic
 projection linked by `sessionID` and message sequence: role, part type, native
 built-in tool name (otherwise `other`), tool status, finish reason, fixed E34
@@ -1429,7 +1442,20 @@ part exports retain the existing byte/row bounds and a 65,536-part bound.
 On a helper-barrier timeout, retain only folder/readiness-file presence,
 whether readiness was seen and whether a non-ready file was seen. Failure to
 retain that evidence preserves the timeout and marks retention uncertainty.
+Each helper catches runtime exceptions and atomically writes `ready:false`
+with its fixed exception class (otherwise `other`), errno name if available,
+and step: initialization, fork, session, identity, readiness, protocol, barrier,
+release or complete. No exception message or path is recorded. Release-thread
+exceptions use the same writer; a failure latch prevents a later ready record
+from overwriting the failure. The barrier timeout exports only that closed
+projection, including when the helper has already exited; it proves no spawn
+or ownership. A snapshot observer retains the projection before blocking.
 No failed helper attempt causes an automatic model re-ask.
+Native session-ID readiness uses C1 §3.7's session state `active`, distinct
+from the active turn's `running` state. An active session with no native ID
+is pending under the existing ownership-verified readiness deadline; a string
+ID with false verification still blocks immediately. Reply diagnostics retain
+both closed state fields without retaining message content.
 The public cancellation prompt names the exact project-relative command
 `/usr/bin/python3 .opencode/tool-helper.py`; no private absolute path is sent
 to the public provider. The hash-verified 2.0.22 embedded source defaults
@@ -1452,6 +1478,9 @@ The minimal PATH links the exact checked system `rg`; fake LSP/local helpers
 avoid vendor installs. Inventory still covers all private HOME/XDG, namespace
 and fixture `.opencode` roots. Credential files remain existence/mode only;
 package/binary additions still block except the reviewed exceptions below.
+Inventory skips an ENOENT/ESRCH entry only when the exception's filename names
+that exact entry. Loss of the pinned executable, a template dependency or an
+unidentified file inside an acceptance check blocks rather than hiding a binary.
 
 **Qualification inventory amendment (owner, 2026-10-07):** OpenCode 2.0.22's
 Bun executable extracts multiple embedded runtime objects as its native

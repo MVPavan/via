@@ -13,9 +13,18 @@ from unittest import mock
 
 from opencode_driver import Driver
 from opencode_safety import Blocked, Identity
+from opencode_safety_tests import fake_cli_generation
 
 
 class ReplyTests(unittest.TestCase):
+    def test_c1_session_active_state_and_turn_state_remain_distinct_in_projection(self):
+        from opencode_reply import reply_projection
+        row={'state':'active','active_turn':{'state':'running','phase':'submitting'},
+             'vendor_identity_verified':False,'vendor_session_id':None}
+        retained=reply_projection(json.dumps(row).encode(),lambda _raw:False)['projection']
+        self.assertEqual(retained['state'],'active')
+        self.assertEqual(retained['active_turn'],{'state':'running','phase':'submitting'})
+
     def driver(self,root,body):
         d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
         d.project=d.evidence/'project'
@@ -59,6 +68,7 @@ class ReplyTests(unittest.TestCase):
         body={'pid':71,'stopping':'FAKE-vendor-error-text','handle':'h_FAKE-secret'}
         with tempfile.TemporaryDirectory(prefix='via-ocreply-') as root:
             d=self.driver(root,{});d._binary=Path('FAKE-via')
+            fake_cli_generation(d)
             d.execute=mock.Mock(return_value=(0,json.dumps(body).encode(),b''))
             with self.assertRaisesRegex(Blocked,'daemon stop.stopping: wrong field type'):
                 d.via(['daemon','stop'])
@@ -246,6 +256,7 @@ class ReplyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='via-ocreply-') as root:
             d=self.driver(root,{})
             d._binary=Path(sys.executable);d.execute=opencode_driver.bounded_command
+            fake_cli_generation(d)
             d.env={'PATH':'/usr/bin:/bin','HOME':root}
             d.project=Path(root)
             with self.assertRaisesRegex(Blocked,'private command observation bound'):

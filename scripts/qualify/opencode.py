@@ -472,6 +472,8 @@ def main(argv=None):
                         cleanup = driver.finish()
                 except BaseException as error:
                     info["cleanup_error"] = type(error).__name__
+                    if getattr(error,'diagnostic_failure',False):
+                        info['diagnostic_error']=type(error).__name__
                     info["failure_order"].append({"stage": "cleanup", "kind": info["cleanup_error"]})
                     retain_block(error, 'cleanup')
                 try:
@@ -494,7 +496,12 @@ def main(argv=None):
                 retain_block(error, 'proof')
             if run_root is not None:
                 try:
-                    root_proof=cleanup if cleanup.get('proven') is True else None
+                    stop_proof=getattr(driver,'stop_result',None)
+                    root_proof=stop_proof if type(stop_proof) is dict and stop_proof.get('proven') is True \
+                        else cleanup if cleanup.get('proven') is True else None
+                    if root_proof is not None:
+                        info['process_cleanup']={key:root_proof.get(key) for key in
+                            ('proven','processes_gone','pgrep_clear','locks_free')}
                     # Before any owned process was admitted, only the synchronous
                     # template probe can have used this root; it has already returned.
                     unused=driver is None or getattr(driver,'external_root',False) is not True \

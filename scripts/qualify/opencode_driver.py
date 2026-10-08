@@ -27,6 +27,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import textwrap
 import time
 import urllib.parse
 
@@ -307,6 +308,7 @@ class Driver:
         self._namespace_bootstraps={}
         self._verified_endpoint_maps={}; self._endpoint_reloads={}
         self._daemon_log_mark=None; self.daemon_generations=[]
+        self._daemon_start_status=False
         self.reply_evidence=ReplyEvidence(self._record,self._reply_protected,self._reply_context,
             vault=self.vault,secret_forms=lambda:(*self.secret_forms,*self.bearer_forms))
         self.git_templates=safety.GitTemplateCopies(
@@ -532,8 +534,11 @@ class Driver:
             if row['path']==self.project: self.provider_endpoints=self._validate_provider_config(row['config'])
         self._refresh_inventory()
         log_mark=self._daemon_log_checkpoint()
+        self.stop_result=None
         try:
-            reply=self.via(['daemon','status'])
+            self._daemon_start_status=True
+            try: reply=self.via(['daemon','status'])
+            finally: self._daemon_start_status=False
             row=self.proc.stat(reply['pid'])
             if row is None: raise safety.process_block('daemon',None,'private daemon PID disappeared')
             identity=safety.Identity(reply['pid'],row['start_ticks'])
@@ -613,11 +618,19 @@ class Driver:
             raise Blocked('daemon idle exit record is not a clean idle shutdown')
         return required
 
-    def _refresh_daemon(self,*,restart=True):
+    def _refresh_daemon(self,*,restart=True,idle_exit_pending=False):
         """Accept only a proven clean idle end, then identify a fresh private daemon (§13)."""
         if self.daemon is None: return
         identity=self.daemon; alive=self.proc.alive(identity)
-        if alive is True: return
+        if alive is True:
+            if not idle_exit_pending:return
+            def owned_release():
+                holders=self._lock_rows()
+                if set(holders)!=set(self._lock_paths()) or any(
+                        rows not in ([],[(identity.pid,'FLOCK')]) for rows in holders.values()):
+                    raise Blocked('CLI daemon generation lock ownership changed')
+            self._await_gone([identity],'daemon idle exit did not complete',guard=owned_release)
+            alive=self.proc.alive(identity)
         if alive is not False:
             raise safety.process_block('daemon',alive,'owned process is not verified alive')
         try:
@@ -683,7 +696,9 @@ class Driver:
 
     def _bind_cli_generation(self):
         """§13: a served reply must belong to the registered private daemon."""
-        if self.daemon is None:return  # start() verifies and registers its first status reply.
+        if self.daemon is None:
+            if self._daemon_start_status:return  # start() verifies and registers this status.
+            raise Blocked('CLI requires registered daemon generation')
         identity=self.daemon;holders=self._lock_rows()
         if set(holders)!=set(self._lock_paths()):
             raise Blocked('CLI daemon generation lock ownership changed')
@@ -698,7 +713,8 @@ class Driver:
         if alive is not True:
             raise safety.process_block('daemon',alive,'CLI daemon generation unverifiable')
         if not all(rows==[(identity.pid,'FLOCK')] for rows in holders.values()):
-            raise Blocked('CLI daemon generation lock ownership changed')
+            self._refresh_daemon(restart=False,idle_exit_pending=True)
+            return
         self._verify(identity,'daemon')
 
     def _discover_private_lockers(self,*,strict=False):
@@ -783,6 +799,8 @@ class Driver:
             self._check_ancestors('cli-'+verb)
         if self.daemon is not None and not (verb=='daemon' and len(args)>1 and args[1]=='stop'):
             self._refresh_daemon()
+        if self.daemon is None and not (self._daemon_start_status and args[:2]==['daemon','status']):
+            raise Blocked('CLI requires registered daemon generation')
         if verb in {'spawn','resume','steer'} and '--max-steps' not in args:
             # §13 allows only the exact held mock bootstrap and the fixed L11
             # credential-fence probe. L11's unoffered effort (§5) is a second
@@ -906,7 +924,7 @@ class Driver:
                 # status path below confirms generation and open admission.
                 self.via(['status',target])
             elif verb=='status' and value.get('vendor_identity_verified') is True \
-                    and value.get('admission')=='open' and value.get('state') in {'idle','running'} \
+                    and value.get('admission')=='open' and value.get('state') in {'idle','active'} \
                     and type(value.get('vendor_session_id')) is str:
                 self._bootstrap_session=None
                 closed=self.via(['close',bootstrap])
@@ -1120,18 +1138,19 @@ class Driver:
             return rows if ready(rows) else None
         return self._await_owned(read,reason)
 
-    def _await_gone(self,identities,reason,*,seconds=OWNED_READINESS_SECONDS):
+    def _await_gone(self,identities,reason,*,seconds=OWNED_READINESS_SECONDS,guard=None):
         """§13: live with verified ticks is pending; unverifiable absence is never retried."""
         end=time.monotonic()+seconds
         if self.phase_deadline is not None: end=min(end,self.phase_deadline)
         while True:
+            if self.signals: self.signals.guard()
+            if guard is not None:guard()
             states=[self.proc.alive(identity) for identity in identities]
             if any(state is None for state in states):
                 identity=identities[states.index(None)]
                 raise safety.process_block(self._process_role(identity),None,
                                            'owned disappearance identity unverifiable')
             if all(state is False for state in states): return
-            if self.signals: self.signals.guard()
             if time.monotonic()>=end: raise Blocked(reason)
             time.sleep(min(.01,max(0,end-time.monotonic())))
 
@@ -1139,7 +1158,7 @@ class Driver:
         """§13 L14/marker: a tool spawn can precede VIA's acceptance commit."""
         def read():
             value=self.via(['status',session]); active=value.get('active_turn')
-            if value.get('state')!='running' or value.get('admission')!='open' or type(active) is not dict:
+            if value.get('state')!='active' or value.get('admission')!='open' or type(active) is not dict:
                 raise Blocked('live turn pin ended or admission changed')
             phase=active.get('phase')
             if phase not in {'submitting','accepted'} and not (phase is None and active.get('state')=='queued'):
@@ -1666,7 +1685,8 @@ class Driver:
                 return sid
             if sid is not None and type(sid) is not str:
                 raise Blocked('native session identity malformed')
-            if value.get('state')!='running': raise Blocked('session ended before native creation')
+            # C1 §§1,3.7: status.state is the session state, not a turn state.
+            if value.get('state')!='active': raise Blocked('session ended before native creation')
             return None
         return self._await_owned(read,'confirmed vendor session ID missing')
 
@@ -1798,7 +1818,7 @@ class Driver:
             for sid in self._l9_sessions:
                 status=self.via(['status',sid])
                 if type(status.get('state')) is not str: raise Blocked('sampled session state unavailable')
-                active+=status['state']=='running'
+                active+=status['state']=='active'
             return {'complete':True,'rss_bytes':rss,'at':time.monotonic(),
                     'active_sessions':active,'sessions':len(self._l9_sessions),
                     'retained_keys':None,'retained_bytes':None,'within_packet_bounds':None,
@@ -1914,6 +1934,10 @@ class Driver:
             raw=path.read_bytes()
             if self.vault.leaks(raw): raise Blocked('helper wrote password')
             value=self._json(raw)
+            failure=self._helper_failure(value)
+            if failure is not None:
+                self._record('helper-failure',failure)
+                raise Blocked('helper reported failure')
             _typed(value,{'pid':I,'start_ticks':I,'password_key_absent':B},'helper')
             identity=safety.Identity(value['pid'],value['start_ticks'])
             if self.proc.alive(identity) is True:
@@ -2216,7 +2240,7 @@ class Driver:
         status_reply=self._live_pin(active_session)
         active=status_reply.get('active_turn')
         live_pin=type(active) is dict and active.get('phase')=='accepted' \
-            and status_reply.get('state')=='running' \
+            and status_reply.get('state')=='active' \
             and status_reply.get('admission')=='open' and status_reply['vendor_identity_verified'] is True
         if not live_pin: raise Blocked('L14 live turn pin or no-retirement admission unverified')
         reached=False
@@ -2568,6 +2592,7 @@ class Driver:
 
     def stop(self):
         """Stop all observed owned generations, then prove locks and identities absent."""
+        self.stop_result=None
         if self.journal.path.exists(): self.journal.recover()
         for provider in self.mock_providers.values():
             if provider.response_hold is not None: provider.response_hold.abort()
@@ -2604,8 +2629,10 @@ class Driver:
                         close_error=error
                     finally:
                         self._bootstrap_cleanup=False
-                reply=self.via(['daemon','stop','--force'])
-                if reply.get('exit_code'): raise Blocked('private daemon stop refused')
+                # A close reply can prove this generation's clean idle end.
+                if self.daemon is not None:
+                    reply=self.via(['daemon','stop','--force'])
+                    if reply.get('exit_code'): raise Blocked('private daemon stop refused')
         deadline=time.monotonic()+CLEANUP_SECONDS
         while time.monotonic()<deadline:
             locks=[self._lock_free(path) for path in self._lock_paths()]
@@ -2763,19 +2790,23 @@ class Driver:
         self.helper_channels[str(project)]=observations
         path=project/'.opencode'/f'{kind}-helper.py'
         code='''#!/usr/bin/python3
-import json, os, pathlib, time, sys, threading
+import errno, json, os, pathlib, time, sys, threading
 kind=KIND
 if kind=='marker':
+    step='fork'
     pid=os.fork()
     if pid:
+        step='barrier'
         end=time.monotonic()+BARRIER_SECONDS
         while not (pathlib.Path(OBSERVATIONS)/'marker-parent.release').exists() and time.monotonic()<end:
             time.sleep(.01)
         sys.exit(0)
 # §13: the pinned shell may exec this helper as an already detached session leader.
+step='session'
 if SEPARATE and os.getsid(0)!=os.getpid():
     os.setsid()
 root=pathlib.Path(OBSERVATIONS)
+step='identity'
 raw=pathlib.Path('/proc/self/stat').read_bytes()
 ticks=int(raw[raw.rindex(b')')+2:].split()[19])
 value={'pid':os.getpid(),'start_ticks':ticks,'kind':kind,'point':kind+'_during',
@@ -2783,19 +2814,27 @@ value={'pid':os.getpid(),'start_ticks':ticks,'kind':kind,'point':kind+'_during',
        'pgid':os.getpgrp()}
 path=root/(kind+'.json')
 def persist():
-    temporary=root/(kind+'.'+str(os.getpid())+'.tmp')
-    temporary.write_text(json.dumps(value)); temporary.chmod(0o600)
-    temporary.replace(path)
+    with report_lock:
+        if failure_seen.is_set(): return
+        temporary=root/(kind+'.'+str(os.getpid())+'.tmp')
+        temporary.write_text(json.dumps(value)); temporary.chmod(0o600)
+        temporary.replace(path)
+step='readiness'
 persist()
 if kind in {'lsp','mcp'}:
     def released():
-        end=time.monotonic()+BARRIER_SECONDS
-        while not (root/(kind+'.release')).exists() and time.monotonic()<end:
-            time.sleep(.01)
-        value['point']=kind+'_after'
-        persist()
+        try:
+            end=time.monotonic()+BARRIER_SECONDS
+            while not (root/(kind+'.release')).exists() and time.monotonic()<end:
+                time.sleep(.01)
+            value['point']=kind+'_after'
+            persist()
+        except BaseException as error:
+            record_failure(error,'release')
+            raise
     threading.Thread(target=released,daemon=True).start()
 if kind=='mcp':
+    step='protocol'
     for line in sys.stdin.buffer:
         request=json.loads(line)
         if 'id' not in request: continue
@@ -2815,6 +2854,7 @@ if kind=='mcp':
         sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result})+'\\n')
         sys.stdout.flush()
 elif kind=='lsp':
+    step='protocol'
     while True:
         line=sys.stdin.buffer.readline()
         if not line: break
@@ -2828,17 +2868,60 @@ elif kind=='lsp':
                 sys.stdout.buffer.flush()
             if request.get('method')=='exit': break
 else:
+    step='barrier'
     end=time.monotonic()+BARRIER_SECONDS
     while not (root/(kind+'.release')).exists() and time.monotonic()<end:
         time.sleep(.01)
 value['point']=kind+'_after'; value['ready']=True
+step='complete'
 persist()
 print('VIA HELPER DONE')
 '''
+        header,body=code.split('kind=KIND',1)
+        reporter='''kind=KIND
+root=pathlib.Path(OBSERVATIONS)
+step='initialization'
+report_lock=threading.Lock()
+failure_seen=threading.Event()
+def record_failure(error,reached):
+    name=type(error).__name__
+    number=getattr(error,'errno',None)
+    failure={'kind':kind,'ready':False,'failure':{
+        'exception_class':name if name in EXCEPTION_CLASSES else 'other',
+        'errno':errno.errorcode.get(number) if type(number) is int else None,
+        'step':reached if reached in FAILURE_STEPS else 'other'}}
+    with report_lock:
+        failure_seen.set()
+        temporary=root/(kind+'.'+str(os.getpid())+'.failure.tmp')
+        temporary.write_text(json.dumps(failure)); temporary.chmod(0o600)
+        temporary.replace(root/(kind+'.json'))
+'''
+        handler='''except BaseException as error:
+    if isinstance(error,SystemExit) and error.code in (None,0): raise
+    record_failure(error,step)
+    raise
+'''
+        code=header+reporter+'try:\n'+textwrap.indent('kind=KIND'+body,'    ')+handler
+        code=code.replace('EXCEPTION_CLASSES',repr(tuple(sorted(safety.HELPER_EXCEPTION_CLASSES))))
+        code=code.replace('FAILURE_STEPS',repr(tuple(sorted(safety.HELPER_FAILURE_STEPS))))
         code=code.replace('KIND',repr(kind)).replace('SEPARATE',repr(separate_group)).replace('OBSERVATIONS',repr(str(observations)))
         code=code.replace('BARRIER_SECONDS',str(barrier_seconds))
         path.write_text(code); path.chmod(0o500)
         return path
+
+    def _helper_failure(self,row):
+        """§13: failed-helper data is diagnostic only; it cannot prove an owned spawn."""
+        if type(row) is not dict or row.get('ready') is not False or 'failure' not in row:return None
+        failure=row['failure']
+        if type(failure) is not dict:raise Blocked('helper failure record malformed')
+        def label(value,allowed):
+            return value if type(value) is str and value in allowed \
+                and not self._reply_protected(value.encode()) else 'other'
+        number=label(failure.get('errno'),frozenset(errno.errorcode.values()))
+        return {'ready':False,
+            'exception_class':label(failure.get('exception_class'),safety.HELPER_EXCEPTION_CLASSES),
+            'errno':None if number=='other' else number,
+            'step':label(failure.get('step'),safety.HELPER_FAILURE_STEPS)}
 
     def _helper_folder(self,project):
         if project is None or str(project) not in self.helper_channels:
@@ -3073,14 +3156,19 @@ print('VIA HELPER DONE')
             if args.get('cancel_diagnostic') is True:
                 self._cancel_diagnostic_session=self._vendor_sid(args['session'])
             helper=args['helper']; path=self._helper_folder(self.project)/(helper+'.json')
-            readiness_seen=False;not_ready_seen=False
+            readiness_seen=False;not_ready_seen=False;failure_seen=None
             def read():
-                nonlocal readiness_seen,not_ready_seen
+                nonlocal readiness_seen,not_ready_seen,failure_seen
                 try: raw=path.read_bytes()
                 except FileNotFoundError: return None
                 readiness_seen=True
                 if len(raw)>OBSERVATION_BYTES: raise Blocked('helper observation bound')
                 row=self._json(raw)
+                failure=self._helper_failure(row)
+                if failure is not None:
+                    if row.get('kind')!=helper:raise Blocked('helper failure kind mismatch')
+                    not_ready_seen=True;failure_seen=failure
+                    return None
                 _typed(row,{'pid':I,'start_ticks':I,'ready':B,'kind':S},'helper readiness')
                 identity=safety.Identity(row['pid'],row['start_ticks'])
                 self._verify(identity)
@@ -3098,7 +3186,8 @@ print('VIA HELPER DONE')
                     try:
                         self._record('helper-readiness',{'timed_out':True,
                             'folder_exists':path.parent.exists(),'readiness_file_exists':path.exists(),
-                            'readiness_seen':readiness_seen,'not_ready_seen':not_ready_seen})
+                            'readiness_seen':readiness_seen,'not_ready_seen':not_ready_seen,
+                            'failure':failure_seen})
                     except BaseException:
                         error.helper_readiness_retention_failed=True
                 raise
@@ -3319,7 +3408,9 @@ print('VIA HELPER DONE')
                 failure=Blocked('mock received request aggregate unverified')
                 failure.__cause__=error;failures.append(failure)
             self.mock_providers.clear()
-        if diagnostic_error is not None:failures.append(diagnostic_error)
+        if diagnostic_error is not None:
+            diagnostic_error.diagnostic_failure=True
+            failures.append(diagnostic_error)
         if failures: raise failures[0]
         safety.verify_binary(self.pinned)
         if self.external_root:

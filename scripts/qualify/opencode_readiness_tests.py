@@ -88,7 +88,7 @@ class ReadinessTests(unittest.TestCase):
 
     def test_native_string_session_with_false_verification_blocks_immediately(self):
         self.driver.handles['s_owned']='fake-memory-only-handle'
-        self.driver.via=mock.Mock(return_value={'state':'running',
+        self.driver.via=mock.Mock(return_value={'state':'active',
             'vendor_identity_verified':False,'vendor_session_id':'ses_owned'})
         with self.assertRaisesRegex(Blocked,'native session identity unverified'):
             self.driver._vendor_sid('s_owned')
@@ -256,7 +256,7 @@ class ReadinessTests(unittest.TestCase):
                 self.assertEqual(records[0],{'timed_out':True,'folder_exists':mode!='absent-folder',
                     'readiness_file_exists':mode=='not-ready',
                     'readiness_seen':mode in {'not-ready','vanished-not-ready'},
-                    'not_ready_seen':mode in {'not-ready','vanished-not-ready'}})
+                    'not_ready_seen':mode in {'not-ready','vanished-not-ready'},'failure':None})
 
     def test_helper_timeout_retention_failure_preserves_reason_and_flags_uncertainty(self):
         self.driver.phase_deadline=.03
@@ -329,10 +329,43 @@ class ReadinessTests(unittest.TestCase):
     def test_native_session_id_waits_for_background_creation(self):
         self.driver.handles['s_owned'] = 'fake-memory-only-handle'
         self.driver.via = mock.Mock(side_effect=[
-            {'state': 'running', 'vendor_identity_verified': False, 'vendor_session_id': None},
-            {'state': 'running', 'vendor_identity_verified': True, 'vendor_session_id': 'ses_owned'}])
+            {'state': 'active', 'vendor_identity_verified': False, 'vendor_session_id': None},
+            {'state': 'active', 'vendor_identity_verified': True, 'vendor_session_id': 'ses_owned'}])
         self.assertEqual(self.driver._vendor_sid('s_owned'), 'ses_owned')
         self.assertEqual(self.driver.via.call_count, 2)
+
+    def test_native_session_id_waits_on_c1_active_session_not_turn_state(self):
+        self.driver.handles['s_owned']='fake-memory-only-handle'
+        self.driver.via=mock.Mock(side_effect=[
+            {'state':'active','active_turn':{'state':'running','phase':'submitting'},
+             'vendor_identity_verified':False,'vendor_session_id':None},
+            {'state':'active','active_turn':{'state':'running','phase':'accepted'},
+             'vendor_identity_verified':True,'vendor_session_id':'ses_owned'}])
+        self.assertEqual(self.driver._vendor_sid('s_owned'),'ses_owned')
+        self.assertEqual(self.driver.via.call_count,2)
+        self.assertGreater(self.clock[0],0)
+
+    def test_memory_sample_counts_c1_active_sessions(self):
+        d=self.driver;d.ensure_vendor=mock.Mock()
+        d.proc.read.return_value=b'VmRSS: 64 kB\n'
+        d.handles={'s_owned':'FAKE-memory-handle','s_idle':'FAKE-memory-handle'}
+        d.via=mock.Mock(side_effect=[{'state':'active'},{'state':'idle'}])
+        sample=d.observe('memory_sample',{'sessions':['s_owned','s_idle']})
+        self.assertEqual(sample['active_sessions'],1)
+        self.assertEqual(sample['sessions'],2)
+
+    def test_lifecycle_accepts_c1_active_session_with_accepted_turn(self):
+        d=self.driver;d._prepare_lifecycle=mock.Mock();d.ensure_vendor=mock.Mock()
+        d._request=mock.Mock(return_value=(200,b'{"pid":13}'))
+        d._live_pin=mock.Mock(return_value={'state':'active','admission':'open',
+            'vendor_identity_verified':True,'active_turn':{'state':'running','phase':'accepted'}})
+        d._publication_entered.set()
+        d.observe=mock.Mock(return_value={'events':[]})
+        d._lock_holders=mock.Mock(return_value=[d.anchor.report()])
+        d.build_hashes={'release':'a'*64};d.phase_kind='release'
+        sample=d.lifecycle('publication')
+        self.assertTrue(sample['live_pin'])
+        self.assertFalse(sample['retirement_inflight'])
 
     def test_native_session_id_blocks_terminal_before_creation(self):
         self.driver.handles['s_owned'] = 'fake-memory-only-handle'
@@ -459,9 +492,9 @@ class ReadinessTests(unittest.TestCase):
 
     def test_live_pin_waits_for_via_to_commit_native_acceptance(self):
         self.driver.via = mock.Mock(side_effect=[
-            {'state': 'running', 'admission': 'open', 'vendor_identity_verified': True,
+            {'state': 'active', 'admission': 'open', 'vendor_identity_verified': True,
              'active_turn': {'phase': 'submitting'}},
-            {'state': 'running', 'admission': 'open', 'vendor_identity_verified': True,
+            {'state': 'active', 'admission': 'open', 'vendor_identity_verified': True,
              'active_turn': {'phase': 'accepted'}}])
         self.driver.journal._signal = mock.Mock()
         result = self.driver._operation('server_loss_for_marker', {'session': 's_owned'})

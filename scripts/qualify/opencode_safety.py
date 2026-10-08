@@ -40,6 +40,13 @@ from dataclasses import dataclass
 PINNED_SHA256 = "32cf5aa0a69a650e36277e3315d189835ddc79fb9aa1d0aef5025be5af5ad122"
 # §13: public cancellation names only a system interpreter and a project-relative helper.
 CANCEL_HELPER_COMMAND = '/usr/bin/python3 .opencode/tool-helper.py'
+# §13: helper diagnostics are closed labels; exception messages/paths are never retained.
+HELPER_EXCEPTION_CLASSES = frozenset({'PermissionError','FileNotFoundError','ProcessLookupError',
+    'OSError','ValueError','TypeError','RuntimeError','KeyError','IndexError','JSONDecodeError',
+    'KeyboardInterrupt','SystemExit','AssertionError','OverflowError','MemoryError','BrokenPipeError',
+    'ChildProcessError','NotADirectoryError','IsADirectoryError','TimeoutError','ZeroDivisionError'})
+HELPER_FAILURE_STEPS = frozenset({'initialization','fork','session','identity','readiness',
+                                'protocol','barrier','release','complete'})
 NPM_URL = "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.0.22.tgz"
 # Packet §§2, 13 qualification acquisition: reviewed unpacked archive size.
 NPM_UNPACKED_SIZE = 204482252
@@ -1313,7 +1320,8 @@ class Inventory:
                                 binaries[(index, str(path.relative_to(root)))] = (
                                     row.st_dev, row.st_ino, row.st_size, sha256(path))
                     except OSError as error:
-                        if error.errno in {errno.ENOENT,errno.ESRCH}:
+                        if error.errno in {errno.ENOENT,errno.ESRCH} and error.filename is not None \
+                                and Path(os.fsdecode(error.filename))==path:
                             # Snapshot absence is safe; baseline loss still fails check().
                             continue
                         raise Blocked("private inventory entry unreadable") from error

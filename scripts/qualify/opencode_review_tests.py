@@ -15,6 +15,7 @@ import opencode_driver_tests as driver_tests
 import opencode_reply as replies
 import opencode_reply_tests as reply_tests
 import opencode_safety as safety
+from opencode_safety_tests import fake_cli_generation
 
 
 class ReviewTests(unittest.TestCase):
@@ -193,6 +194,7 @@ class ReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='via-ocreview-') as root:
             d=self.driver(root,{})
             d._binary=Path('FAKE-via');d.execute=mock.Mock(return_value=(0,b'[]',b''))
+            fake_cli_generation(d)
             with self.assertRaisesRegex(safety.Blocked,'CLI reply object missing'):
                 d.via(['FAKE-private-verb'])
             record=self.retained(d)

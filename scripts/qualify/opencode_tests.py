@@ -13,9 +13,53 @@ from unittest.mock import patch
 
 import opencode
 from opencode_safety import Blocked
+from opencode_safety_tests import fake_cli_generation
 
 
 class EntryTests(unittest.TestCase):
+    def test_proven_stop_removes_run_root_even_when_native_diagnostic_fails(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix='oc-entry-',dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory);instances=[]
+            class FakeDriver:
+                def __init__(self,**kwargs):
+                    self.vault=opencode.safety.PasswordVault()
+                    self.proc=opencode.safety.ProcReader(root/'synthetic-proc')
+                    self.work=kwargs['run_root'];self.external_root=True
+                    self.identities={opencode.safety.Identity(123,456)};self.daemon=None
+                    self.stop_result=None;instances.append(self)
+                def prepare(self):pass
+                def observe(self,*_args):return {'release':'a'*64,'test-failpoints':'b'*64}
+                def finish(self):
+                    self.stop_result={'proven':True,'processes_gone':True,'pgrep_clear':True,'locks_free':True}
+                    error=Blocked('native diagnostic unavailable');error.diagnostic_failure=True
+                    raise error
+            class Adapter:
+                def execute(self,operation,**_kwargs):
+                    if operation=='build_hashes':return {'release':'a'*64,'test-failpoints':'b'*64}
+                    return {}
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                acquire=False,opencode=root/'pin',via_release=root/'release',via_failpoints=root/'fp',
+                fake_gate_manifest=root/'gates')
+            def preflight(_driver,case):case.check('FAKE predicate',True)
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'system_tools_preflight',return_value={'rg':True,'python3':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), \
+                 patch.object(opencode_driver,'Driver',FakeDriver), \
+                 patch.object(opencode.cases,'DriverAdapter',return_value=Adapter()), \
+                 patch.dict(opencode.cases.CASES,{'preflight':preflight}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            self.assertFalse(instances[0].work.exists())
+            self.assertTrue(summary.get('run_root_cleanup',{}).get('removed'))
+            self.assertEqual(summary['blocks'][0]['reason'],'native diagnostic unavailable')
+            self.assertEqual(summary.get('diagnostic_error'),'Blocked')
+            self.assertTrue(summary.get('process_cleanup',{}).get('proven'))
+
     def setUp(self):
         # Entry tests script admission; ancestor discovery is independently tested.
         ancestors=patch.object(opencode.runroots,'check_ancestors',return_value={
@@ -87,6 +131,7 @@ class EntryTests(unittest.TestCase):
                                      (0,b'{"harness":"opencode"}',b''))
                 def prepare(self):
                     self._binary=root/'release'; self.project=root; self.env={}
+                    fake_cli_generation(self)
                 def build(self, _kind): return 'a'*64
                 def observe(self, kind, _args=None):
                     if kind=='build_hashes':
@@ -94,7 +139,9 @@ class EntryTests(unittest.TestCase):
                     if kind=='interruption': return {'interrupted':False}
                     if kind=='fresh_max_steps': return self.via(['describe'])
                     raise AssertionError('unexpected FAKE observation')
-                def finish(self): raise Blocked('FAKE cleanup stop proof unavailable')
+                def finish(self):
+                    self.daemon=None  # FAKE transport owns no real process.
+                    raise Blocked('FAKE cleanup stop proof unavailable')
             args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
                                  acquire=False,opencode=root/'fake-pin',via_release=root/'release',
                                  via_failpoints=root/'fp',fake_gate_manifest=root/'gates')

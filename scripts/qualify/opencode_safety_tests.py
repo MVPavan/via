@@ -40,6 +40,16 @@ def fake_stat(pid=71, ticks=123, state="S"):
     return f"{pid} (fake vendor) ".encode() + " ".join(fields).encode()
 
 
+def fake_cli_generation(driver):
+    """FAKE registered PID/ticks and sole FLOCK holders for transport-only tests (§13)."""
+    driver.daemon=safety.Identity(123,456)
+    driver.proc=mock.Mock()
+    driver.proc.alive.side_effect=lambda identity:True if identity==driver.daemon else None
+    driver.proc.verify.side_effect=lambda identity:identity==driver.daemon
+    driver._lock_rows=mock.Mock(side_effect=lambda:{
+        path:[(driver.daemon.pid,'FLOCK')] for path in driver._lock_paths()})
+
+
 class SafetyTests(unittest.TestCase):
     def test_pidfd_proves_exit_when_second_stat_is_reaped(self):
         proc=safety.ProcReader()
@@ -288,7 +298,7 @@ class SafetyTests(unittest.TestCase):
         for operation in ('lstat','open'):
             original=getattr(Path,operation)
             def gone(path,*args,**kwargs):
-                if path==entry:raise FileNotFoundError(safety.errno.ENOENT,'FAKE vanished')
+                if path==entry:raise FileNotFoundError(safety.errno.ENOENT,'FAKE vanished',str(entry))
                 return original(path,*args,**kwargs)
             with self.subTest(operation=operation),mock.patch.object(Path,operation,gone):
                 self.assertTrue(inventory.check())
@@ -296,6 +306,19 @@ class SafetyTests(unittest.TestCase):
         binary=root/'existing';binary.write_bytes(b'\x7fELF FAKE baseline')
         inventory=safety.Inventory([root]);binary.unlink()
         self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+
+    def test_inventory_missing_policy_dependency_is_not_a_vanished_candidate(self):
+        root=self.root/'inventory-policy';root.mkdir()
+        entry=root/'candidate';pin=self.root/'pin'
+        for policy_name in ('embedded_runtime','git_templates'):
+            for filename in (str(pin),None):
+                with self.subTest(policy=policy_name,filename_known=filename is not None):
+                    policy=mock.Mock()
+                    inventory=safety.Inventory([root],**{policy_name:policy})
+                    entry.write_bytes(b'\x7fELF FAKE candidate')
+                    policy.accept.side_effect=FileNotFoundError(safety.errno.ENOENT,'FAKE missing dependency',filename)
+                    self.assertBlocked(inventory.check,'private inventory entry unreadable')
+                    entry.unlink()
 
     def test_inventory_walk_error_skips_gone_subtree_but_not_root_or_permissions(self):
         root=self.root/'inventory';root.mkdir();inventory=safety.Inventory([root])

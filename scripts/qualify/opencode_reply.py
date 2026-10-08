@@ -35,7 +35,7 @@ BOOLS = frozenset({'more','stopping','already_terminal','vendor_identity_verifie
                   'complete','received','model_matches','disabled','accepted','enabled','below_free_floor'})
 ENUM_KEYS = frozenset({'type','state','status','scope','support','kind','kind2','class','outcome',
                        'cleanup','admission','phase','effect','action','version_status'})
-ENUMS = frozenset({'document','directory','running','idle','queued','submitting','accepted',
+ENUMS = frozenset({'document','directory','running','active','idle','queued','submitting','accepted',
     'completed','failed','cancelled','unknown','closed','open','fenced','closing',
     'turn','vendor_interval','session_cumulative','unavailable','reported','derived',
     'supported','unsupported','native','best_effort','tested','untested','allow','deny','ask',
@@ -52,7 +52,7 @@ ENUMS = frozenset({'document','directory','running','idle','queued','submitting'
     'turn.cancelled','turn.unknown','action.denied','session.opened','session.closed'})
 CONTAINERS = frozenset({'data','info','model','cost','usage','cache','settings','effective',
     'failure','error','cancel','progress','capabilities','params','max_steps','events',
-    'content','snapshot','turns','inherit','warnings','denied_actions','limits','disk','storage'})
+    'content','snapshot','turns','active_turn','inherit','warnings','denied_actions','limits','disk','storage'})
 MAPS = frozenset({'providers','agents','models','variants'})
 PRIVATE = frozenset({'handle','token','password','apikey','api_key','authorization',
                      'headers','credential','credentials','secret','access_token','refresh_token'})

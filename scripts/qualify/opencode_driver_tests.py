@@ -14,9 +14,95 @@ from pathlib import Path
 
 from opencode_safety import Blocked, Identity
 from opencode_driver import Driver, strict_reply, read_pages, bounded_command, input_id
+from opencode_safety_tests import fake_cli_generation
 
 
 class DriverTests(unittest.TestCase):
+    def test_release_thread_failure_cannot_be_overwritten_by_protocol_eof(self):
+        import opencode_safety as safety
+        with tempfile.TemporaryDirectory(prefix='via-oc-helper-') as folder:
+            base=Path(folder);project=base/'project';project.mkdir(mode=0o700)
+            (project/'.opencode').mkdir(mode=0o700)
+            d=Driver('release','fp','pin',base/'evidence',initialize=False)
+            helper=d._helper_fixture(project,'lsp')
+            env={key:str(safety.private_directory(base/part)) for key,part in safety.PRIVATE_PARTS.items()}
+            env.update(PATH='/usr/bin:/bin',LANG='C.UTF-8')
+            script="import pathlib,runpy\noriginal=pathlib.Path.exists\ndef failure(path):\n if path.name=='lsp.release':raise PermissionError(13,'FAKE-private-message','/FAKE-private-path')\n return original(path)\npathlib.Path.exists=failure\nrunpy.run_path("+repr(str(helper))+",run_name='__main__')"
+            process=subprocess.Popen(['/usr/bin/python3','-c',script],cwd=project,env=env,
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            observation=d._helper_folder(project)/'lsp.json';row=None
+            try:
+                end=time.monotonic()+2
+                while time.monotonic()<end and process.poll() is None:
+                    if observation.exists():
+                        row=json.loads(observation.read_text())
+                        if row.get('ready') is False:break
+                    time.sleep(.01)
+            finally:
+                try:process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:process.kill();process.communicate(timeout=5)
+            self.assertIsNotNone(row)
+            self.assertIs(row.get('ready'),False)
+            self.assertEqual(row['failure'],{'exception_class':'PermissionError','errno':'EACCES','step':'release'})
+            self.assertEqual(json.loads(observation.read_text()),row)
+            self.assertNotIn('FAKE-private',json.dumps(row))
+
+    def test_every_helper_atomically_records_closed_failure_before_readiness(self):
+        import opencode_safety as safety
+        for kind in ('tool','marker','lsp','mcp','plugin','hook'):
+            with self.subTest(kind=kind),tempfile.TemporaryDirectory(prefix='via-oc-helper-') as folder:
+                base=Path(folder);project=base/'project';project.mkdir(mode=0o700)
+                (project/'.opencode').mkdir(mode=0o700)
+                d=Driver('release','fp','pin',base/'evidence',initialize=False)
+                helper=d._helper_fixture(project,kind,separate_group=True)
+                env={key:str(safety.private_directory(base/part)) for key,part in safety.PRIVATE_PARTS.items()}
+                env.update(PATH='/usr/bin:/bin',LANG='C.UTF-8')
+                script="import os,runpy\ndef fail(*args):\n raise PermissionError(13,'FAKE-private-message','/FAKE-private-path')\nos.getsid=fail\nos.fork=fail\nrunpy.run_path("+repr(str(helper))+",run_name='__main__')"
+                result=subprocess.run(['/usr/bin/python3','-c',script],cwd=project,env=env,
+                                      capture_output=True,timeout=5,check=False)
+                self.assertNotEqual(result.returncode,0)
+                observation=d._helper_folder(project)/(kind+'.json')
+                self.assertTrue(observation.exists(),'exception disappeared before readiness')
+                row=json.loads(observation.read_text())
+                self.assertEqual(row,{'kind':kind,'ready':False,'failure':{
+                    'exception_class':'PermissionError','errno':'EACCES',
+                    'step':'fork' if kind=='marker' else 'session'}})
+                self.assertNotIn('FAKE-private',json.dumps(row))
+                self.assertEqual(list(observation.parent.glob('*.tmp')),[])
+
+    def test_helper_timeout_retains_failure_without_exposing_extra_fields(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-helper-') as folder:
+            base=Path(folder);d=Driver('release','fp','pin',base/'evidence',initialize=False)
+            observations=base/'observations';observations.mkdir()
+            d.project=base;d._helper_folder=mock.Mock(return_value=observations)
+            row={'kind':'tool','ready':False,'failure':{'exception_class':'PermissionError',
+                'errno':'EPERM','step':'session','message':'FAKE-private-message','path':'/FAKE-private-path'}}
+            (observations/'tool.json').write_text(json.dumps(row))
+            d._verify=mock.Mock(side_effect=AssertionError('failed helper must not become a ready identity'))
+            def timeout(read,reason,**_kwargs):
+                self.assertIsNone(read());raise Blocked(reason)
+            d._await_owned=mock.Mock(side_effect=timeout)
+            with self.assertRaisesRegex(Blocked,'^helper barrier not reached$'):
+                d._operation('helper_barrier',{'helper':'tool'})
+            retained=json.loads(next(d.evidence.glob('*helper-readiness.json')).read_text())
+            self.assertEqual(retained.get('failure'),{'ready':False,
+                'exception_class':'PermissionError','errno':'EPERM','step':'session'})
+            self.assertNotIn('FAKE-private',json.dumps(retained))
+            self.assertTrue(retained['not_ready_seen'])
+            self.assertEqual(d.identities,set())
+
+    def test_helper_snapshot_retains_a_closed_failure_before_blocking(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-helper-') as folder:
+            base=Path(folder);d=Driver('release','fp','pin',base/'evidence',initialize=False)
+            observations=base/'observations';observations.mkdir()
+            d.project=base;d._helper_folder=mock.Mock(return_value=observations)
+            (observations/'lsp.json').write_text(json.dumps({'kind':'lsp','ready':False,
+                'failure':{'exception_class':'FAKE-private-class','errno':'FAKE-private-errno',
+                           'step':'FAKE-private-step','message':'FAKE-private-message'}}))
+            with self.assertRaisesRegex(Blocked,'^helper reported failure$'):d._helper_snapshot()
+            retained=json.loads(next(d.evidence.glob('*helper-failure.json')).read_text())
+            self.assertEqual(retained,{'ready':False,'exception_class':'other','errno':None,'step':'other'})
+
     def test_helper_readiness_survives_an_already_detached_shell(self):
         """FAKE the pinned Shell.create detached launch with the real fixture helper (§13)."""
         import opencode_safety as safety
@@ -427,6 +513,7 @@ class DriverTests(unittest.TestCase):
     def test_bootstrap_cli_cannot_reset_the_absolute_deadline(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
             d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+            fake_cli_generation(d)
             d._binary=Path('fake-via'); d._bootstrap_active=True
             d._bootstrap_deadline=time.monotonic()-1
             d.execute=mock.Mock(return_value=(0,b'{"models":[]}',b''))
@@ -435,15 +522,17 @@ class DriverTests(unittest.TestCase):
             d.execute.assert_not_called()
 
     def test_bootstrap_lease_handoff_requires_a_current_open_successor(self):
-        for current in (False,True):
-            with self.subTest(current=current), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+        for state in ('closed','idle','active'):
+            current=state!='closed'
+            with self.subTest(state=state), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
                 d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+                fake_cli_generation(d)
                 d._binary=Path('fake-via'); d._bootstrap_session='s_bootstrap'
                 d.handles={'s_bootstrap':'test-boot-handle','s_other':'test-other-handle'}
                 envelope={'session_id':'s_other','vendor_session_id':'ses_old','state':'completed'}
                 status={'session_id':'s_other','vendor_session_id':'ses_old',
                         'vendor_identity_verified':current,'admission':'open' if current else 'closed',
-                        'state':'idle' if current else 'closed'}
+                        'state':state}
                 calls=[]
                 def execute(argv,**kwargs):
                     calls.append(argv[1])
@@ -589,6 +678,7 @@ class DriverTests(unittest.TestCase):
                 return (0,b'{"turn":"ses_private/1","state":"running","already_terminal":false,"cancel":null}',b'')
             driver=Driver(root/'release',root/'fp',root/'pin',root/'evidence',
                           execute=command,initialize=False)
+            fake_cli_generation(driver)
             driver._binary=root/'release'
             driver.env={'HOME':str(root)}
             driver.handles['ses_private']='h_memory_only'
@@ -700,6 +790,7 @@ class DriverTests(unittest.TestCase):
                 self.assertEqual(kwargs['input'],b'h_memory_only\n')
                 return 0,b'{"turn":"s_fixture/2","effective":{"effort":null,"max_steps":null}}',b''
             d=Driver('release','fp','pin',root/'evidence',execute=command,initialize=False)
+            fake_cli_generation(d)
             d._binary=root/'release'; d.handles['s_fixture']='h_memory_only'
             with mock.patch.object(d,'spending_check'),mock.patch.object(d,'_admit_model'):
                 d.via(['resume','s_fixture','--prompt',prompt])

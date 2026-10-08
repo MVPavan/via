@@ -15,6 +15,59 @@ from opencode_safety_tests import fake_stat
 
 
 class DaemonGenerationTests(unittest.TestCase):
+    def test_clean_dead_generation_at_bind_cannot_leave_later_wait_unbound(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+            d,_=self.fixture(root);d._binary=Path('FAKE-via')
+            d._lock_rows=mock.Mock(return_value={path:[] for path in d._lock_paths()})
+            d._bind_cli_generation()
+            self.assertIsNone(d.daemon)
+            d.execute=mock.Mock(return_value=(2,b'',
+                b'{"code":-32001,"message":"FAKE terminal refusal","data":{"kind":"not_found"}}'))
+            with self.assertRaisesRegex(safety.Blocked,'CLI requires registered daemon generation'):
+                d.via(['wait','s_FAKE/1','--timeout-ms','0'])
+            d.execute.assert_not_called()
+
+    def test_alive_daemon_releasing_locks_finishes_the_same_clean_idle_proof(self):
+        for fault in (None,'unknown','open-work'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+                d,_=self.fixture(root);d.proc.alive.return_value=True
+                d._lock_rows=mock.Mock(side_effect=lambda:{
+                    path:[] if index==0 or d.proc.alive.return_value is not True else [(123,'FLOCK')]
+                    for index,path in enumerate(d._lock_paths())})
+                if fault=='open-work':
+                    with sqlite3.connect(d.state/'store.sqlite3') as store:
+                        store.execute("INSERT INTO turns VALUES('queued',NULL)")
+                def finish(_seconds):d.proc.alive.return_value=None if fault=='unknown' else False
+                with mock.patch('opencode_driver.time.sleep',side_effect=finish):
+                    if fault:
+                        with self.assertRaises(safety.Blocked):d._bind_cli_generation()
+                    else:d._bind_cli_generation()
+                if not fault:
+                    self.assertIsNone(d.daemon)
+                    ended=list(d.evidence.glob('*daemon-generation.json'))
+                    self.assertEqual(json.loads(ended[0].read_text())['event'],'clean-idle-exit')
+
+    def test_failed_stop_cannot_reuse_an_earlier_process_absence_proof(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+            d,_=self.fixture(root)
+            d.stop_result={'proven':True,'processes_gone':True,'pgrep_clear':True}
+            d.proc.alive.return_value=None
+            with self.assertRaises(safety.Blocked):d.stop()
+            self.assertIsNone(d.stop_result)
+
+    def test_cleanup_needs_no_cli_stop_after_close_proves_clean_generation_end(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+            d,_=self.fixture(root);old=d.daemon;d.identities.add(old)
+            d.proc.alive.return_value=True;d._bootstrap_session='s_FAKE'
+            d._pgrep_clear=mock.Mock(return_value=True)
+            def close(args):
+                if args!=['close','s_FAKE']:raise safety.Blocked('CLI requires registered daemon generation')
+                d.daemon=None;d.proc.alive.return_value=False
+                return {'state':'closed'}
+            d.via=mock.Mock(side_effect=close)
+            self.assertTrue(d.stop()['proven'])
+            d.via.assert_called_once_with(['close','s_FAKE'])
+
     def cleanup_fixture(self, root):
         d,_=self.fixture(root)
         successor=safety.Identity(125,458)
