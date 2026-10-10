@@ -38,6 +38,7 @@ from opencode_catalog import catalog_record
 from opencode_reply import ReplyEvidence, reply_check
 from opencode_cases import REPOSITORY_SENTINELS, PHASES
 from opencode_events import terminal_event
+from opencode_eventbound import event_bound_facts
 from opencode_c1 import (TERMINAL_STATES, SCOPES, CANCEL_OUTCOMES, CLEANUP_STATES,
                          ERROR_CODES, FAILURE_CLASSES, STOP_REASONS)
 from opencode_runroot import ANCHOR_SOCKET_TAIL, SOCKET_BYTES
@@ -1916,6 +1917,11 @@ class Driver:
                         error.event_bound={'line_bytes':len(line),'frame_bytes':len(current),
                             'prior_data_bytes':sum(map(len,data))+max(0,len(data)-1),
                             'complete_line':line.endswith(b'\n'),'total_bytes':total}
+                        # Closed type and byte breakdown only; never the frame's content.
+                        payload=b'\n'.join(data+([line[5:].lstrip().rstrip(b'\r\n')]
+                                                  if line.startswith(b'data:') else []))
+                        try: error.event_bound['event']=event_bound_facts(payload)
+                        except Exception: error.event_bound['event']={'event_type':'facts-unavailable'}
                         raise error
                     if line in (b'\n',b'\r\n'):
                         if data:

@@ -53,7 +53,8 @@ TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_drive
                 "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests",
                 "opencode_reply_tests", "opencode_review_tests", "opencode_config_tests", "opencode_isolation_tests",
                 "opencode_event_tests", "opencode_runroot_tests", "opencode_daemon_tests", "opencode_c1_tests",
-                "opencode_diagnostic_tests", "opencode_round31_tests", "opencode_lockscan_tests", "opencode_round44_tests")
+                "opencode_diagnostic_tests", "opencode_round31_tests", "opencode_lockscan_tests", "opencode_round44_tests",
+                "opencode_eventbound_tests")
 _ACQUISITION_ROOT = None
 
 
