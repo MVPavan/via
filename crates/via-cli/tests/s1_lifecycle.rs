@@ -1164,6 +1164,128 @@ fn s1_f29_ctrl_c_foreground_spawn_exits_130() -> TestResult {
     })
 }
 
+/// C1 P1: a foreground `spawn` waits until the turn is terminal, however
+/// long that takes, not just one `wait` bound. Test builds lower the CLI's
+/// per-request bound (`VIA_TEST_SPAWN_WAIT_MS`); the turn is held past
+/// several bounds, then released, and the CLI prints the receipt and the
+/// envelope and exits 0. The sleep only lets bounds elapse.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn foreground_spawn_waits_past_one_wait_bound() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&held("hold", 1))?;
+        let out = sandbox.root.path().join("spawn.stdout");
+        let mut command = sandbox.command();
+        command
+            .args([
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "hold",
+                "--json",
+            ])
+            .env("VIA_TEST_SPAWN_WAIT_MS", "200")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(File::create(&out)?)
+            .stderr(File::create(sandbox.root.path().join("spawn.stderr"))?);
+        let mut cli = command.spawn()?;
+        sandbox.await_file("hold.entered")?;
+        thread::sleep(Duration::from_millis(1000));
+        let early = cli.try_wait()?;
+        sandbox.release("hold")?;
+        let status = match early {
+            Some(status) => status,
+            None => wait_child(&mut cli, Duration::from_secs(20))?.ok_or("the CLI kept waiting")?,
+        };
+        let stdout = fs::read(&out)?;
+        let lines: Vec<Value> = stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<Result<_, _>>()?;
+        check(
+            early.is_none()
+                && status.code() == Some(0)
+                && lines.len() == 2
+                && lines[1]["state"] == "completed",
+            || {
+                format!(
+                    "foreground spawn ended {status} (early: {}) with {lines:?}; stderr {}",
+                    early.is_some(),
+                    fs::read_to_string(sandbox.root.path().join("spawn.stderr"))
+                        .unwrap_or_default()
+                )
+            },
+        )?;
+        let daemon = sandbox.status()?;
+        let pid = u32::try_from(daemon["pid"].as_u64().ok_or("status has no pid")?)?;
+        sandbox.stop_auto(sandbox.command(), pid)
+    })
+}
+
+/// C1 §4 `cwd`: a `spawn` without `--cwd` runs in the caller's directory,
+/// canonicalised, not the daemon's. The daemon is started from one
+/// directory; the session is spawned from a symlink to another.
+#[test]
+fn spawn_without_cwd_uses_the_callers_directory() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&completes("here", 1))?;
+        let [daemon_dir, caller_dir] =
+            ["daemon-dir", "caller-dir"].map(|name| sandbox.root.path().join(name));
+        for dir in [&daemon_dir, &caller_dir] {
+            fs::DirBuilder::new().mode(0o700).create(dir)?;
+        }
+        let link = sandbox.root.path().join("caller-link");
+        std::os::unix::fs::symlink(&caller_dir, &link)?;
+        let mut start = sandbox.command();
+        start.args(["list", "--json"]).current_dir(&daemon_dir);
+        let started = run_command(&mut start, Duration::from_secs(60))?;
+        check(started.status.success(), || {
+            format!("list exited {}", started.status)
+        })?;
+        let mut spawn = sandbox.command();
+        spawn
+            .args([
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "here",
+                "--background",
+                "--json",
+            ])
+            .current_dir(&link);
+        let spawned = run_command(&mut spawn, Duration::from_secs(60))?;
+        let receipt: Value = serde_json::from_slice(&spawned.stdout)?;
+        let session = receipt["session_id"]
+            .as_str()
+            .ok_or_else(|| format!("no receipt: {}", String::from_utf8_lossy(&spawned.stderr)))?;
+        let envelope = sandbox.wait(&format!("{session}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        let status = sandbox.ok(&["status", session, "--json"])?;
+        let expected = fs::canonicalize(&caller_dir)?;
+        check(
+            status["cwd"] == expected.to_str().ok_or("not UTF-8")?,
+            || {
+                format!(
+                    "session cwd {} is not {}",
+                    status["cwd"],
+                    expected.display()
+                )
+            },
+        )?;
+        let daemon = sandbox.status()?;
+        let pid = u32::try_from(daemon["pid"].as_u64().ok_or("status has no pid")?)?;
+        sandbox.stop_auto(sandbox.command(), pid)
+    })
+}
+
 /// F1 (design §6.1): two auto-starts at once make one daemon. The first
 /// CLI's daemon holds `daemon.lock` at `daemon.startup.after_lock`; a
 /// daemon started meanwhile exits 75 after one line; the second CLI's own

@@ -1113,6 +1113,13 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
             let text = large_text("first ");
             fs::write(&file, &text).map_err(infra)?;
             let path = file.to_str().ok_or_else(|| infra("path"))?;
+            // The CLI always sends a `cwd`; the raw keyed retries send the same.
+            let cwd = setup.root.to_str().ok_or_else(|| infra("cwd"))?;
+            let keyed = || {
+                let mut params = spawn_file(path, Some("k1"));
+                params["cwd"] = json!(cwd);
+                params
+            };
             let receipt = cli(
                 &setup.sandbox,
                 evidence,
@@ -1129,6 +1136,8 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
                     HANDLE,
                     "--idempotency-key",
                     "k1",
+                    "--cwd",
+                    cwd,
                     "--background",
                     "--json",
                 ],
@@ -1160,7 +1169,7 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
             let blobs = setup.blobs()?.len();
 
             let mut conn = Conn::open(&setup.sandbox)?;
-            let retry = conn.exchange(&line(&json!(1), "spawn", &spawn_file(path, Some("k1"))))?;
+            let retry = conn.exchange(&line(&json!(1), "spawn", &keyed()))?;
             check(
                 retry["result"]["session_id"] == session.as_str()
                     && retry["result"]["turn"] == receipt["turn"],
@@ -1175,7 +1184,7 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
                 .failpoints
                 .arm(FREE_BYTES, 1, "value_persist:4096")
                 .map_err(infra)?;
-            let below = conn.exchange(&line(&json!(6), "spawn", &spawn_file(path, Some("k1"))))?;
+            let below = conn.exchange(&line(&json!(6), "spawn", &keyed()))?;
             check(
                 below["result"]["session_id"] == session.as_str()
                     && below["result"]["turn"] == receipt["turn"],
@@ -1195,8 +1204,7 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
             })?;
             setup.failpoints.disarm(FREE_BYTES).map_err(infra)?;
             fs::write(&file, large_text("second ")).map_err(infra)?;
-            let conflict =
-                conn.exchange(&line(&json!(2), "spawn", &spawn_file(path, Some("k1"))))?;
+            let conflict = conn.exchange(&line(&json!(2), "spawn", &keyed()))?;
             check(
                 is_error(&conflict, -32602, "invalid_params")
                     && conflict["error"]["data"]["kind2"] == "idempotency_conflict",

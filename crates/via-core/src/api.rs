@@ -769,9 +769,8 @@ impl ListParams {
         let since_ms = self
             .since
             .as_deref()
-            .map(via_store::at_ms)
-            .transpose()
-            .map_err(|_| ApiError::INVALID_PARAMS)?;
+            .map(|since| rfc3339_ms(since).ok_or(ApiError::INVALID_PARAMS))
+            .transpose()?;
         let limit = self.limit.unwrap_or(50);
         if limit == 0 || limit > 200 {
             return Err(ApiError::INVALID_PARAMS);
@@ -785,6 +784,45 @@ impl ListParams {
             limit,
         })
     }
+}
+
+/// Any RFC 3339 date-time (`YYYY-MM-DDTHH:MM:SS`, optional fractional
+/// seconds, then `Z` or `±HH:MM`; `T` and `Z` in either case) as Unix
+/// milliseconds, fractions past milliseconds truncated; `None` when it is
+/// not one.
+fn rfc3339_ms(text: &str) -> Option<i64> {
+    if !text.is_ascii() || text.len() < 20 || !matches!(text.as_bytes()[10], b'T' | b't') {
+        return None;
+    }
+    let (date, time) = (&text[..10], &text[11..19]);
+    let mut rest = &text[19..];
+    let mut milli = String::from("000");
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let kept = &fraction[..digits.min(3)];
+        milli.replace_range(..kept.len(), kept);
+        rest = &fraction[digits..];
+    }
+    let offset_minutes = match rest.as_bytes() {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2]
+            if [h1, h2, m1, m2].iter().all(|digit| digit.is_ascii_digit()) =>
+        {
+            let hours = i64::from((h1 - b'0') * 10 + (h2 - b'0'));
+            let minutes = i64::from((m1 - b'0') * 10 + (m2 - b'0'));
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let total = hours * 60 + minutes;
+            if *sign == b'-' { -total } else { total }
+        }
+        _ => return None,
+    };
+    let local = via_store::at_ms(&format!("{date}T{time}.{milli}Z")).ok()?;
+    local.checked_sub(offset_minutes.checked_mul(60_000)?)
 }
 
 /// Strict C1 `daemon/status` parameters; the method takes none.
@@ -2617,6 +2655,47 @@ mod tests {
                 retry_identity(raw, &hash, None).unwrap_err().kind,
                 "invalid_params",
                 "{raw}"
+            );
+        }
+    }
+
+    /// C1 §3.10: `since` is any RFC 3339 time, with or without fractional
+    /// seconds, `Z` or a numeric offset; anything else is `invalid_params`.
+    #[test]
+    fn list_since_accepts_any_rfc3339_time() {
+        let since = |text: &str| {
+            serde_json::from_value::<super::ListParams>(serde_json::json!({ "since": text }))
+                .unwrap()
+                .query()
+                .map(|query| query.since_ms)
+        };
+        let midnight = 1_790_812_800_000; // 2026-10-01T00:00:00Z
+        for (text, ms) in [
+            ("2026-10-01T00:00:00Z", midnight),
+            ("2026-10-01T00:00:00.000Z", midnight),
+            ("2026-10-01T00:00:00.5Z", midnight + 500),
+            ("2026-10-01T00:00:00.123456789Z", midnight + 123),
+            ("2026-10-01t00:00:00z", midnight),
+            ("2026-10-01T02:00:00+02:00", midnight),
+            ("2026-09-30T19:30:00-04:30", midnight),
+            ("2026-10-01T00:00:00.250-00:00", midnight + 250),
+        ] {
+            assert_eq!(since(text).ok(), Some(Some(ms)), "{text}");
+        }
+        for text in [
+            "2026-10-01",
+            "2026-10-01T00:00:00",
+            "2026-10-01T00:00:00.Z",
+            "2026-10-01T00:00Z",
+            "2026-10-01T00:00:00+0200",
+            "2026-10-01T00:00:00+24:00",
+            "2026-02-30T00:00:00Z",
+            "2026-10-01 00:00:00Z",
+        ] {
+            assert_eq!(
+                since(text).err().map(|error| error.kind),
+                Some("invalid_params"),
+                "{text}"
             );
         }
     }

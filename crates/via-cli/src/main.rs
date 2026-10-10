@@ -657,9 +657,15 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     if let Some(path) = args.instructions {
         params["instructions"] = json!({"path":absolute(&path, "instructions")?});
     }
-    if let Some(cwd) = args.cwd {
-        params["cwd"] = json!(absolute(&cwd, "cwd")?);
-    }
+    // A new session without `--cwd` runs in the caller's directory, not
+    // the daemon's.
+    let cwd = match args.cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| client::RequestError::invalid_params("cwd", error.to_string()))?,
+    };
+    params["cwd"] = json!(absolute(&cwd, "cwd")?);
     if !args.require.is_empty() {
         params["require"] = json!(args.require);
     }
@@ -691,7 +697,17 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     let address = receipt["turn"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("spawn receipt has no turn address"))?;
-    let outcome = client::request("wait", &json!({"address":address}), true)?;
+    // C1 P1: wait until the turn is terminal. Each `wait` is bounded, and
+    // the read with it; one that times out while the turn runs is resent.
+    let bound = spawn_wait_ms();
+    let read = Duration::from_millis(bound).saturating_add(Duration::from_secs(5));
+    let wait = json!({"address":address,"timeout_ms":bound});
+    let outcome = loop {
+        let outcome = client::request_within("wait", &wait, true, read)?;
+        if outcome["error"]["data"]["kind"] != "wait_timeout" {
+            break outcome;
+        }
+    };
     let Some(envelope) = client::emit_response(&outcome, true)? else {
         return Ok(2);
     };
@@ -700,6 +716,19 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     } else {
         3
     })
+}
+
+/// The bound of each `wait` a foreground `spawn` sends: the daemon's
+/// default; test builds only may lower it with `VIA_TEST_SPAWN_WAIT_MS`.
+fn spawn_wait_ms() -> u64 {
+    #[cfg(feature = "test-failpoints")]
+    if let Some(bound) = std::env::var("VIA_TEST_SPAWN_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return bound;
+    }
+    via_core::DEFAULT_WAIT_MS
 }
 
 /// `via wait` (C1 §3.8).
