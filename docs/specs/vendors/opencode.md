@@ -1769,6 +1769,30 @@ the aggregate physical received count, including rejected requests, rather than
 reporting it unavailable. Crossing the derived ceiling still sets the stop latch
 and blocks. Receipts and the bootstrap are diagnostic records, never gates.
 
+**Seams mock ceiling (coordinator ruling, 2026-10-10):** the seams phase's
+physical mock-request ceiling is derived like the preflight, hostile and anchor
+ceilings, not fixed. Each case contributes its own physical requests plus the
+re-acquisitions it causes, at two bootstrap requests each; the phase adds one
+initial acquisition (2) and the fixed margin (2):
+
+| Case | Own requests | Re-acquisitions | Total |
+|---|---|---|---|
+| write_cancel | 6: two setup turns (primary and title), the partial prompt stopped at its body prefix (0), the response prompt's tool step and interrupted continuation (2) | 2: each mode's cancelled generation drains and retires | 10 |
+| foreign | 11: setup 2, foreign tool step and continuation 2, successor 1, near-limit inbox 6 | 2: seeding stops VIA, and the cleanup successor starts another generation | 15 |
+| transport_loss | 4: setup 2, tool step 1, post-loss continuation 1 | 1: the loss retires the generation | 6 |
+| identity | 3: first turn 2, reopen 1 | 1: idle retirement's successor | 5 |
+| error_shapes | 57: up to three attempts of rate_limit (1 + 10 retries, two titles: 13), quota (3) and context (3) | 9: at most one per shape turn | 75 |
+
+The deferred collision, forms and other rows make no request. The ceiling is
+115 requests. The own counts match the observed requests in diag-all-final-4
+and the earlier identity and error-shape diagnostics; the 32-request ceiling it
+replaces was exhausted by the identity case's re-acquisition. The mocks are
+local and free; the ceiling bounds runaway behaviour, and the margin stays
+small. A runner test counts each seams case's model-capable call sites,
+multiplied by its literal loop bounds, and fails when that pattern changes
+without its declared budget. Every other spending rule is unchanged: any
+request beyond the derived ceiling latches the stop and blocks.
+
 **L4 retry-budget derivation (2026-10-08):** The pinned binary's primary retry
 schedule at byte 145,631,595 allows ten retries (eleven attempts), with nominal
 delays 2, 4, 8, then seven 10-second waits and 0.8–1.2 jitter (at most 100.8

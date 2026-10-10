@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.parse
 import opencode_safety as safety
-from opencode_mock_policy import HOSTILE_PHASE_REQUESTS, ANCHOR_PHASE_REQUESTS
+from opencode_mock_policy import HOSTILE_PHASE_REQUESTS, ANCHOR_PHASE_REQUESTS, SEAMS_PHASE_REQUESTS
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -300,7 +300,7 @@ PHASES = (
     Phase("isolation", 15 * 60, 0, 32, "release"),
     Phase("hostile", 15 * 60, 0, HOSTILE_PHASE_REQUESTS, "release"),
     Phase("helpers", 15 * 60, 6, 32, "release"),
-    Phase("seams", 45 * 60, 12, 32, "test-failpoints"),
+    Phase("seams", 45 * 60, 12, SEAMS_PHASE_REQUESTS, "test-failpoints"),
     Phase("long_run", 20 * 60, 0, 32, "release"),
     Phase("anchor", 120 * 60, 24, ANCHOR_PHASE_REQUESTS, "release"),
     Phase("credentials", 10 * 60, 0, 0, "release"),
