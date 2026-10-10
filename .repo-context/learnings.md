@@ -6,6 +6,20 @@ when it is verified and likely to recur; state the pattern, the evidence
 (repo-relative path, command, or version), and the fix. Design decisions belong
 in the design record (`docs/`), not here.
 
+- OpenCode 2.0.22 can accept connections before its database is ready. Live
+  attempt 7's private vendor log records `/api/info` returning 503 before
+  migration starts and completes. A verified listener alone is insufficient:
+  `scripts/qualify/opencode_driver.py` retries only a matching owned PID/version
+  on 503, under the original deadline and repeated generation/listener checks;
+  a 200 reply is still required for admission. Regression tests cover delayed
+  readiness, changed ownership, expiry and incompatible replies.
+- Permission fixtures must establish their asserted mode with `chmod`, since
+  `mkdir(mode=...)` is filtered by the caller's umask. OpenCode attempt 6's
+  private supervisor uses 0077; the unsafe-namespace and shared-recovery-parent
+  tests inadvertently created 0700 instead of 0755 and blocked admission.
+  Their isolated 0077 reproductions failed before explicit fixture chmod and
+  passed afterwards (`scripts/qualify/opencode_safety_tests.py`,
+  `scripts/qualify/opencode_tests.py`). Keep the private supervisor's umask.
 - OpenCode reopen/leftover fixtures cross a Core boundary: P6 in
   `crates/via-core/src/engine/drive.rs` cancels successors behind an unknown
   submitted predecessor before adapter dispatch. Chunk C's direct

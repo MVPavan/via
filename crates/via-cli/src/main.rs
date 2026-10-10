@@ -600,7 +600,11 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Cancel(args) => cancel(&args),
         Command::Close(args) => close(args),
         Command::Result(args) => {
-            client::call("result", &json!({"address":args.address}), true, true)
+            let response = client::request("result", &json!({"address":args.address}), true)?;
+            let Some(envelope) = client::emit_response(&response, true)? else {
+                return Ok(2);
+            };
+            Ok(envelope_exit_code(&envelope))
         }
         Command::Wait(args) => wait(&args),
         Command::Events(args) => events(args),
@@ -711,11 +715,7 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     let Some(envelope) = client::emit_response(&outcome, true)? else {
         return Ok(2);
     };
-    Ok(if envelope["state"] == "completed" {
-        0
-    } else {
-        3
-    })
+    Ok(envelope_exit_code(&envelope))
 }
 
 /// The bound of each `wait` a foreground `spawn` sends: the daemon's
@@ -742,7 +742,19 @@ fn wait(args: &WaitArgs) -> anyhow::Result<i32> {
     // The daemon answers `wait_timeout` at the bound; allow for the reply.
     let read = read.saturating_add(Duration::from_secs(5));
     let _interrupt = exit_on_interrupt()?;
-    client::call_within("wait", &params, true, true, read)
+    let response = client::request_within("wait", &params, true, read)?;
+    let Some(envelope) = client::emit_response(&response, true)? else {
+        return Ok(2);
+    };
+    Ok(envelope_exit_code(&envelope))
+}
+
+/// C1 §1: foreground spawn, wait and result share the terminal-envelope exit rule.
+fn envelope_exit_code(envelope: &Value) -> i32 {
+    match envelope["state"].as_str() {
+        Some("failed" | "cancelled" | "unknown") => 3,
+        _ => 0,
+    }
 }
 
 /// `via status` (C1 §3.7): the omitted members take the daemon's defaults.
@@ -967,4 +979,20 @@ const CANCEL_WAIT_READ: Duration = Duration::from_hours(24);
 fn write_json(mut output: impl io::Write, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut output, value)?;
     output.write_all(b"\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_exit_three_covers_exactly_c1_failed_cancelled_unknown() {
+        for state in ["failed", "cancelled", "unknown"] {
+            assert_eq!(envelope_exit_code(&json!({"state": state})), 3, "{state}");
+        }
+        for state in ["completed", "queued", "running", "future-state"] {
+            assert_eq!(envelope_exit_code(&json!({"state": state})), 0, "{state}");
+        }
+        assert_eq!(envelope_exit_code(&json!({})), 0);
+    }
 }

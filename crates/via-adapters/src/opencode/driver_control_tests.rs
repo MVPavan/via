@@ -1614,3 +1614,153 @@ fn oc08_c2_tool_end_after_grace_during_held_stop_response_stays_uncertain() {
         crate::Cleanup::Uncertain,
     ));
 }
+
+/// §13 OC04: count only identity lookups, excluding admitted variant/settings reads.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn oc_live_reopen_identity_guard_excludes_settings_and_detects_duplicate() {
+    run(async {
+        use super::driver_request_tests::Points;
+        let points = Points::new();
+        let point = "adapters.opencode.reopen_identity_read";
+        let rig = Rig::new(&json!({}));
+        let cwd = rig.root().to_str().unwrap().to_owned();
+        rig.fixture(&fixture(&cwd, success()));
+        let pin = rig.launch().await.unwrap();
+        let target = json!({"generation":pin.server().as_str(),
+            "session":super::driver_tests::SID,"request":"reopen"});
+        points.arm(point, 1, "pause", target.clone());
+        row(&rig, 1, "running");
+        let mut lane = Lane::open(&rig, true);
+        let first = tokio::spawn(async move {
+            let result = lane.turn(1, None, Duration::from_secs(5)).await;
+            (lane, result)
+        });
+        let entered = until(|| points.entered(point, 1), Duration::from_secs(2)).await;
+        let reads_at_barrier = rig
+            .requests()
+            .iter()
+            .filter(|request| {
+                request["method"] == "GET" && request["target"] == format!("/api/session/{SES}")
+            })
+            .count();
+        points.arm(point, 2, "fail_io", target);
+        points.release(point, 1);
+        let (lane, (end, _)) = first.await.unwrap();
+        let settings_excluded = !points.entered(point, 2);
+        row(&rig, 1, "completed");
+        row(&rig, 2, "running");
+        let mut duplicate = Lane::open(&rig, true);
+        let (duplicate_end, _) = duplicate.turn(2, None, Duration::from_secs(3)).await;
+        duplicate.close().await;
+        lane.close().await;
+        drop(pin);
+        let submitted = prompts(&rig.requests()).len();
+        rig.finish().await;
+        assert!(entered, "identity GET must enter the guard before writing");
+        assert_eq!(reads_at_barrier, 0);
+        assert!(end.terminal.is_some());
+        assert!(
+            settings_excluded,
+            "variant GET is not another identity lookup"
+        );
+        assert!(
+            points.entered(point, 2),
+            "a deliberate second lookup trips the guard"
+        );
+        assert!(duplicate_end.terminal.is_none() && duplicate_end.outcome.is_err());
+        assert_eq!(
+            submitted, 1,
+            "the duplicate guard fires before another prompt"
+        );
+    });
+}
+
+/// §13 L2/OC09: loss after prompt acceptance cannot invent completion or usage.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn oc_live_owned_event_read_failure_after_acceptance_is_unknown() {
+    run(async {
+        use super::driver_request_tests::Points;
+        let points = Points::new();
+        let point = "routes.opencode.before_event_read";
+        let rig = Rig::new(&json!({}));
+        let cwd = rig.root().to_str().unwrap().to_owned();
+        let mut events = success();
+        events.pop();
+        events.extend([
+            json!({"pause_ms":500}),
+            event("session.activity", &json!({"sessionID":SES})),
+        ]);
+        rig.fixture(&fixture(&cwd, events));
+        let pin = rig.launch().await.unwrap();
+        let live = pin.live().unwrap().0;
+        row(&rig, 1, "running");
+        let mut lane = Lane::open(&rig, false);
+        let active = tokio::spawn(async move {
+            let result = lane.turn(1, None, Duration::from_secs(5)).await;
+            (lane, result)
+        });
+        let accepted = until(
+            || {
+                live.routing().state(SES).is_some_and(|state| {
+                    state.execution_owner.is_some() && state.pending_requests == 0
+                })
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        points.arm(
+            point,
+            1,
+            "fail_io",
+            json!({"generation":pin.server().as_str()}),
+        );
+        let (lane, (end, _)) = active.await.unwrap();
+        lane.close().await;
+        drop(pin);
+        let submitted = prompts(&rig.requests()).len();
+        rig.finish().await;
+        assert!(
+            accepted,
+            "acceptance and delivery precede the injected loss"
+        );
+        assert!(
+            points.entered(point, 1),
+            "owned SSE transport must reach the loss seam"
+        );
+        assert_eq!(submitted, 1, "the accepted input is never resubmitted");
+        assert!(
+            end.terminal.is_none() && end.outcome.is_err(),
+            "unknown: {end:?}"
+        );
+        assert!(
+            end.aggregate
+                .as_ref()
+                .is_none_or(|usage| usage.input.is_none() && usage.output.is_none()),
+            "unobserved usage remains unavailable"
+        );
+    });
+}
+
+/// §13: a foreign generation's read-failure command cannot fence this generation.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn oc_live_event_read_failure_ignores_foreign_generation() {
+    run(async {
+        use super::driver_request_tests::Points;
+        let points = Points::new();
+        let point = "routes.opencode.before_event_read";
+        let rig = Rig::new(&json!({}));
+        let cwd = rig.root().to_str().unwrap().to_owned();
+        rig.fixture(&fixture(&cwd, success()));
+        points.arm(point, 1, "fail_io", json!({"generation":"v_foreign"}));
+        row(&rig, 1, "running");
+        let mut lane = Lane::open(&rig, false);
+        let (end, _) = lane.turn(1, None, Duration::from_secs(3)).await;
+        lane.close().await;
+        rig.finish().await;
+        assert!(end.terminal.is_some());
+        assert!(!points.entered(point, 1));
+    });
+}

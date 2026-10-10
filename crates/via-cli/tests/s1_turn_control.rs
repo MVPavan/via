@@ -244,7 +244,8 @@ impl Sandbox {
     /// One successful CLI call's JSON output.
     fn ok(&self, args: &[&str]) -> TestResult<Value> {
         let captured = self.run(args)?;
-        if !captured.status.success() {
+        let decoded = serde_json::from_slice::<Value>(&captured.stdout);
+        if !daemon::cli_exit_matches(args, captured.status, decoded.as_ref().ok()) {
             return Err(format!(
                 "via {args:?} exited {}: {}",
                 captured.status,
@@ -252,7 +253,7 @@ impl Sandbox {
             )
             .into());
         }
-        Ok(serde_json::from_slice(&captured.stdout)?)
+        Ok(decoded?)
     }
 
     /// One CLI call refused with request error `kind`: the error object.

@@ -276,7 +276,21 @@ impl Sandbox {
         let mut command = self.command();
         command.args(args);
         let captured = run_command(&mut command, within)?;
-        if !captured.status.success() {
+        let decoded = serde_json::from_slice::<Value>(&captured.stdout);
+        let exit_valid = if matches!(args.first(), Some(&"wait" | &"result")) {
+            match decoded
+                .as_ref()
+                .ok()
+                .and_then(|value| value["state"].as_str())
+            {
+                Some("completed") => captured.status.success(),
+                Some("failed" | "cancelled" | "unknown") => captured.status.code() == Some(3),
+                _ => false,
+            }
+        } else {
+            captured.status.success()
+        };
+        if !exit_valid {
             return Err(format!(
                 "via {args:?} exited {}: {}",
                 captured.status,
@@ -284,7 +298,7 @@ impl Sandbox {
             )
             .into());
         }
-        Ok(serde_json::from_slice(&captured.stdout)?)
+        Ok(decoded?)
     }
 
     /// One CLI call refused with request error `kind`: the error object.

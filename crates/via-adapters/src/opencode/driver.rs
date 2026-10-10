@@ -922,6 +922,26 @@ async fn reopen(
         .routing()
         .claim_session(id, &facts.driver.spec.session_id)
         .map_err(|cause| routing_failed(facts, cause))?;
+    #[cfg(feature = "test-failpoints")]
+    {
+        // §13 OC04: no identity GET byte exists yet, and no routing lock is held.
+        // Only reopen reaches this point; settings/variant GETs do not consume hits.
+        if via_routes::failpoint::hit_async_targeted(
+            "adapters.opencode.reopen_identity_read",
+            &[
+                ("generation", server.id().as_str()),
+                ("session", facts.driver.spec.session_id.as_str()),
+                ("request", "reopen"),
+            ],
+        )
+        .await
+        .is_err()
+        {
+            return Err(Box::new(
+                facts.setup_failed("the session readback", unavailable_request()),
+            ));
+        }
+    }
     let target = id.to_owned();
     let by = facts.request_by();
     let info = tracked(server, None, move |http| async move {

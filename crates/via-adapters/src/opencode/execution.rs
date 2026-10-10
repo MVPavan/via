@@ -19,7 +19,7 @@ use via_routes::opencode::turn::{self as requests, Submission};
 use via_routes::{CommitOutcome, StoreFailure};
 
 /// §7.1: deterministic caller IDs. Recomputing old IDs never resends them.
-fn input_id(session: &crate::SessionId, turn: TurnNumber) -> String {
+pub(super) fn input_id(session: &crate::SessionId, turn: TurnNumber) -> String {
     let digest = launch::digest(|field| {
         field(b"via-opencode-input-v1");
         field(session.as_str().as_bytes());
@@ -148,6 +148,8 @@ async fn prepare(
         return Err(end);
     }
     switch_variant(facts, server, (settings, id), digest).await?;
+    #[cfg(feature = "test-failpoints")]
+    prompt_barrier(facts, server).await?;
     let link_by = Deadline::at((Instant::now() + Duration::from_secs(3)).min(facts.wall.instant()));
     match server
         .link_turn(&facts.driver.spec.session_id, facts.number, link_by)
@@ -203,6 +205,30 @@ async fn prepare(
         finished: false,
     });
     Ok((input, delivery))
+}
+
+/// §13 L3: a target-bound pause after eligibility, before any prompt byte.
+#[cfg(feature = "test-failpoints")]
+async fn prompt_barrier(facts: &Turn<'_>, server: &Server) -> Result<(), Box<TurnEnd>> {
+    // No request byte or delivery exists yet; a pause owns no routing lock.
+    // The later admit_ready check revalidates foreign execution after release.
+    let input = input_id(&facts.driver.spec.session_id, facts.number);
+    if via_routes::failpoint::hit_async_targeted(
+        "adapters.opencode.prompt_after_eligibility",
+        &[
+            ("generation", server.id().as_str()),
+            ("session", facts.driver.spec.session_id.as_str()),
+            ("request", input.as_str()),
+        ],
+    )
+    .await
+    .is_err()
+    {
+        return Err(Box::new(
+            facts.failed(RouteError::TransportLost { turn: facts.number }),
+        ));
+    }
+    Ok(())
 }
 
 fn session_busy(facts: &Turn<'_>) -> Box<TurnEnd> {

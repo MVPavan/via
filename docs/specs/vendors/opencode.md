@@ -640,6 +640,14 @@ applied: the session runs on the same server, its effective state is
 `config_switch_unverified`. Skills are the one category a session can turn
 off, by its own permission rule (§5).
 
+In default/skills-on sessions, pinned OpenCode 2.0.22 also loads skill
+descriptions from directories above the project's Git root (qualification
+attempt 15, native `instruction_state` and `instruction_blob`, confirmed
+2026-10-07). The effective skills state remains `unknown`. Skills requested
+`off` still uses the session deny rule; whether that rule also removes ancestor
+skill descriptions from instructions is **unverified**: attempt 15 did not
+exercise skills-off. Ancestor `AGENTS.md` did not cross the nested Git boundary.
+
 C1 freezes effective states at spawn, so the frozen state is what the recipe
 guarantees; later evidence (`/api/mcp`, `/api/plugin`, instruction deltas)
 is a diagnostic only.
@@ -647,7 +655,7 @@ is a diagnostic only.
 | Category (OD2 default) | Requested on | Requested off |
 |---|---|---|
 | instruction files (on) | `unknown`: project `AGENTS.md` per location loads (E12, E54); user-level instructions are private and empty | `unknown`: not applied, project files still load |
-| skills (on) | `unknown`: project skills load (E12); user-level skills are private and empty | `off`: session rule `{skill,*,deny}` (§5, E12) |
+| skills (on) | `unknown`: project and ancestor skills above the Git root load (E12; qualification attempt 15); user-level skills are private and empty | `off`: session rule `{skill,*,deny}` (§5, E12) |
 | agents (on) | `unknown`: project agents load (source), no inventory (`/api/agent` returns `[]`, E11); VIA always runs its own `via` agent | `unknown`: not applied |
 | plugins (on) | `unknown`: project plugins load (source) | `unknown`: not applied |
 | MCP servers (off) | `unknown`: project MCP loads (source) | `unknown`: not applied; the MCP resource helpers are denied (§5) |
@@ -950,7 +958,8 @@ keep the lane-order outcome below.
 | C2 observations | 1,024 items / 4 MiB per session, 10 s stall | lane overflow |
 | Prompt admission (`check_turn`, `plan`) | `json_len(prompt) + json_len(cwd) ≤ 1,048,576 − 8,192` | `invalid_params` naming `prompt` |
 | Instruction entry | 262,144 encoded value bytes (§5) | `invalid_params` naming `instructions` |
-| HTTP | headers 64 KiB; response bodies 1 MiB (`/api/model` 4 MiB); JSON depth 64, 65,536 nodes | the turn `protocol`, and the generation drains (§8) |
+| HTTP | headers 64 KiB; response bodies 1 MiB (`/api/model` 4 MiB; inbox listing below); JSON depth 64, 65,536 nodes, including the larger bodies | the turn `protocol`, and the generation drains (§8) |
+| Inbox listing (`INBOX_BODY_BYTES`, `GET /api/session/{id}/inbox`) | 2,097,152 bytes: `2 × ((1,048,576 − 8,192) + 8,192)` | the turn `protocol`, and the generation drains (§8); no prompt for this turn; the draining generation admits no new turns |
 | Final-text candidates | 4 MiB per turn | turn `overflow` |
 | Retained per server | session states 1,024; tombstoned turns 4,096; child sessions 4,096; pending interactive requests 64; requests without a complete response 64. Session states count only sessions VIA opened; descendants count only as child mappings, and sessions of neither kind retain no state. | server generation `overflow` |
 | Correlation keys (aggregate) | caller input, assistant message, tool call and interactive request IDs of every live and tombstoned turn, and child-session IDs, together: 65,536 entries and 8 MiB of retained ID bytes per server | server generation `overflow` |
@@ -958,6 +967,27 @@ keep the lane-order outcome below.
 
 The 64 requests without a complete response are counted from their first byte;
 pool waiters count only toward the session execution rule (§7.2).
+
+**Inbox listing (owner raise-limit decision, via-4sw.3.5).** §7.2 admits
+at most one unanswered VIA input per session: a successor cannot be sent
+until its predecessor has ended or is proven not accepted, and a new
+generation cancels persisted VIA leftovers before dispatch. Allow one
+additional foreign input of the same encoded size (vendor-originated or
+another writer, L3), for two prompt echoes in total. Each gets the prompt
+admission bound plus 8 KiB for IDs, session fields, item metadata and JSON
+framing; the top-level framing shares that allowance. This is a bounded
+tolerance, not a vendor maximum: foreign writers and vendor extra fields
+have no such cap, and a larger listing still takes the HTTP-limit outcome
+above. Foreign items exceeding this bound make every reopen of that session
+fail `protocol` and drain the shared generation. Other sessions retain their
+sent turns but lose that server until a new generation is admitted. Revisit
+this bounded foreign tolerance when L3 observes larger persisted inboxes;
+it does not promise cleanup of an arbitrarily large foreign listing.
+The byte cap does not impose a two-item count cap; many smaller
+items fit subject to the unchanged JSON depth and node limits. Only this
+listing gets the new bound; prompt responses, stops, setup and other
+ordinary responses remain at 1 MiB, and `/api/model` keeps its existing
+4 MiB bound. Echoed text is discarded after decoding the listing IDs.
 
 **Prompt admission (security).** The prompt is echoed whole in the 200
 response and in `session.inbox.enqueued` (E47); OpenCode has no cap (3 MiB
@@ -1180,7 +1210,765 @@ stands. Items that gate route enablement (L4, L5, L14) say so.
 | L10 macOS | Platform deferred | Run OC01–OC12 on macOS under the platform contract |
 | L11 new-version credential shape | A new version's `/api/integration` may change shape or carry values | Before a version joins `checked`, rerun E41's synthetic-credential probe with every other gate (L4, L5, L14) |
 | L12 other unobserved | `superseded` and `inactivity` interrupt reasons; agent `steps`; durable replay; `OPENCODE_DISABLE_AUTOUPDATE` behaviour; truncated-body handling (E56) | Probe each at the next pin review |
-| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch (a `test-failpoints` build of VIA, a test barrier holding Host and the route from retiring the generation or closing its stdin), driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a same-uid scan of `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
+| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch with a test barrier, e.g. SIGSTOP of the private daemon, holding Host and the route from retiring the generation or closing its stdin, and driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP when offered by the pinned configured-read probe, and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a scan of every readable same-uid `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; anchor, server and all descendants must be fully readable; an unreadable outsider is excluded only with verified pre-run/pre-first-generation birth and ancestry, retaining PID/start ticks, fixed comm class and errno; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
+
+### Qualification runner
+
+`scripts/qualify/opencode.py --self-test` runs only fakes, loopback mocks and
+synthetic process observations. Building this runner or passing its self-tests
+does not pass any live row. Live invocation is explicitly opt-in with `--live`,
+two prebuilt VIA artifacts (`--via` for release and `--via-failpoints` for the
+test-only build), a new private `--evidence` directory in the worktree's
+scratchpad, and either `--opencode` for the verified read-only pin or `--acquire`
+for official exact-version acquisition. Both VIA hashes are recorded. Seam
+cases use the test-only build; L14 and the other gates use release VIA.
+When all three built artifacts (release VIA, failpoints VIA and
+`via-fake-agent`) are present, self-tests also run the real VIA CLI interaction
+audit against the scripted OpenCode fake. Missing artifacts are reported as
+optional skips, never as executed tests or live qualification.
+Before acquisition or any start, `--fake-gate-manifest` (defaulting to the
+`scratchpad/execution/oc-live/fake-gate-manifest.json`) must show successful fake
+gates and the required seam tests, bound to the current Rust source and both supplied
+VIA hashes. Missing or stale proof blocks; a live observation never substitutes
+an invented fake-control result.
+
+The runner carries `claude.py`'s cooperative same-user threat model, strict
+reply schemas, bounded loops, deferred signals, pid plus start-tick identities,
+positive stop proofs and rule that unverifiable evidence never passes. Pinned
+acquisition uses plain HTTPS, never npm/npx. Registry SHA-512 and unpacked size
+must equal the runner's reviewed constants before the archive is fetched; the
+archive SHA-512 is verified before decompression, and the packet's binary
+SHA-256 follows extraction. The reviewed unpacked size is 204482252 bytes.
+An alternative npm platform archive needs the same reviewed archive anchors;
+unanchored GitHub fallback is disabled. A read-only binary/directory and an
+end re-hash apply. The owner's 2.0.24 on PATH stays refused. System `rg` and
+`python3` are checked before acquisition.
+
+The qualification-only password exception reads the exact password key once
+from the verified owned vendor's initial environment, in memory only. Evidence
+and rotation comparisons return Booleans; the password and bearer handles are
+never written. Scans cover evidence, fixture content, private logs and the
+owned VIA store. Password and bearer checks apply to every readable regular
+file in the scanned roots, including previously returned bearer handles.
+Synthetic hostile-provider values gate only VIA-owned sinks: evidence and
+phase/summary files, state outside the vendor tree, the Store,
+stderr/undecoded captures and the daemon's private HOME/XDG/TMPDIR roots.
+One ownership registry retains every created or handed-off root for the entire
+run, with a fixed VIA-owned, vendor-private, runner-evidence or helper class.
+Each path uses its longest registered prefix; active state/namespace switches
+never remove or reclassify earlier roots. Every state's whole `vendor/` tree
+is vendor-private, including the version-check probe. The evidence directory
+is a discovery boundary: evidence files and directories are registered when
+written or created, and an uncovered regular file blocks with
+`unregistered evidence file`. Credential-name checks inspect only path parts
+below the classified root. L11 uses the neutral directory name `l11-state`.
+Every regular VIA sink is read regardless of suffix, including rotated logs
+and Store blobs; every registered state's Store/WAL content uses a consistent
+in-memory backup. Only a state whose daemon actually started requires a Store,
+including after shutdown. Cleanup preserves the original failure ahead of
+secondary provider-shutdown errors; an unstarted L11 state does not create a
+spurious missing-Store failure. The summary's `failure_order` lists the original
+case/runner failure before cleanup and proof failures, using safe identities
+and exception kinds rather than arbitrary exception text.
+Non-regular VIA roots or entries, missing required state/Store, vanished VIA
+entries persisting through three whole-scan attempts, and unverifiable backups
+block qualification. A transient VIA disappearance restarts the entire scan.
+Protected matches already observed survive retries; a later scan cannot erase
+evidence that a secret was written.
+Traversal and Store backup order are deterministic. The named operational
+exceptions are the `helpers/rg` symlink and `via.sock` and `anchors/*.sock`
+sockets in the registered runtime root (evidence or the N9 short `/tmp` root);
+the daemon lock remains a regular file.
+The pinned acquisition, `acquisition-home` and `helpers` artifacts are outside
+the VIA sink set. Unexpected credential content in a VIA-owned area blocks
+without being read. Observed synthetic matches in readable vendor-private
+files are a labelled file count, never a gate failure; fixture config values
+remain labelled input. Vendor credential/config files and databases remain
+metadata-only exclusions, reported as a proof limitation. `server.lock` in the
+vendor-private namespace is also never read by the secrecy scan: it is VIA's
+fixed binary fence record (§3.2), containing identities rather than arbitrary
+content. Vendor-private non-regular entries are skipped and counted as
+metadata-only; entries vanishing
+during the walk, lstat or read are skipped and counted separately as
+`vendor_private_vanished_entries`. The scan never follows non-regular entries.
+Returned bearer handles join the in-memory forbidden forms. Structural
+spending controls are checked before model-capable
+requests: known empty integrations, an environment allow-list, frozen free
+catalog/session identities, and loopback endpoints for every overridden
+provider. Missing cost is unavailable; positive cost or a paid identity stops
+admission. Session shell requests consume no model turn unless they invoke a
+model-capable path. Public-free results and synthetic token/cache/compaction
+observations are labelled separately. No network-destination sampling can establish a gate.
+
+**Qualification plan amendment (owner ruling):** `via models` only lists
+models on an acquired server; it does not acquire one. For each required
+acquisition, the runner may submit one labelled
+`qualification-bootstrap-mock-only` turn to its owned loopback mock. Each
+acquisition's bootstrap has its own mock provider, written into the namespace
+project configuration (a new acquisition's configuration, never checked as a
+reload against the retired generation's identities), so no provider's
+64-connection transport ceiling spans the run; only an acquisition for the namespace sentinel's own turn reuses that
+fixture's provider. The
+bootstrap, the namespace repository sentinel and the L11 metadata attempt use
+the state's small namespace project, `projects/<state name>` in the run root,
+as their `--cwd`. It is a private Git fixture outside every vendor HOME/XDG
+root, VIA state and runtime directory and other project; its creation and
+every `start` check that separation against every registered state and
+runtime root and every other distinct fixture or namespace project, and block
+if it is violated; fixture creation checks it too. A vendor
+storage directory is never a turn's cwd, so step snapshots never include the
+vendor's own database, logs or snapshot store (an earlier runner used the
+namespace directory and produced `session.step.ended` `files` lists over the
+1 MiB event bound). VIA's own server still starts in the namespace directory
+(§3.2), and L11's direct seed server mirrors that. Before
+the spawn it verifies the namespace project configuration's credential-free provider
+shape, loopback-only endpoints, private environment allow-list and frozen mock
+model/auxiliary selectors. Every mock response (including an error) is held
+until pid/start-tick identity, the owned listener and §2 handshake are verified,
+and all four structural spending checks above pass on served facts, including
+the native session's mock identity. A failed check aborts the hold, requests
+cancellation and blocks; the response is never released. Acquisition/checks
+have a 30 s absolute bound, followed by a bounded 30 s mock completion wait
+within the remaining phase deadline. Missing or invalid proof blocks.
+The bootstrap is evidence labelled as non-gating, charged only to the phase's
+existing physical mock-request ceiling (including auxiliary requests), and
+never charged to the public-free budget. It keeps a lease until a case session
+has demonstrably attached; the runner then closes the bootstrap session so it
+does not alter later session-count or retirement observations. Failure and
+cleanup abort all outstanding holds. This exception adds no C1 API, result
+field or outcome and permits no paid provider/model.
+
+**Qualification daemon-generation amendment (owner, 2026-10-08):**
+The runner exercises VIA's designed 60 s daemon idle exit without keepalives.
+Retirement waits for both the vendor and daemon to exit (90 s for each,
+clipped to the phase deadline), using process observations only. Vendor death
+can precede the daemon's final shutdown and lock release; returning during that
+interval could let a CLI auto-start a successor behind the saved daemon identity.
+A saved pid/start-tick identity is replaced only when liveness is definitively
+false, both private daemon/Store locks are released, the private Store has no
+open accepted work, and `via.log` contains the generation's own clean `idle`
+`daemon_shutdown` record. A bounded log checkpoint taken before each start
+excludes shutdown records from older generations (including one log rotation).
+Missing, incomplete, non-idle or unverifiable evidence blocks. The next private
+CLI acquisition identifies the new daemon through its status reply and both
+owned locks, using the same private state/runtime/HOME as the first start.
+Each start and proven clean idle end is retained as a numbered generation;
+every process-verification block retains a fixed role and false/unknown
+liveness. No daemon identity is renewed from elapsed time alone. After every
+CLI execution except `daemon stop`, both private locks must have exactly the
+registered PID as their sole FLOCK holder before its reply is trusted. A foreign,
+additional or unregistered holder blocks; a definitively ended generation goes
+through the same clean-idle proof, never adoption from a later shutdown record.
+CLI calls require a registered generation; the sole initial exception is
+`start()`'s own status call, whose reply is then verified by pid/start ticks
+and both locks. If binding proves a generation ended cleanly, later calls
+block until `start()` registers another generation. A still-live saved daemon
+with one or both locks released is an idle exit in progress: wait at most
+30 s, clipped to the phase, rechecking pid/start ticks and allowing only its
+own remaining FLOCKs or released locks on each poll. Then require the same
+clean-idle Store/log/lock proof; foreign ownership, unknown liveness or the
+deadline blocks. This does not keep the daemon alive.
+Cleanup also discovers daemon generations started by a private CLI before the
+runner registered them: an invoking-user process must hold a private daemon or
+Store FLOCK and have the exact private HOME, with pid/start ticks re-verified
+around those observations. Its PID/start ticks are retained immediately after
+ownership proof. Cleanup waits up to 180 s for observed processes to exit and
+both locks to be released; an ambiguous holder or identity blocks. This covers
+bounded mock-abort retries followed by the designed idle shutdown without
+keepalives or signalling a newly discovered process. This backstop is limited:
+unregistered processes are discoverable by private lock ownership or an
+absolute private-run-root argument. A child with only relative arguments and
+no private lock can evade that supplemental search; tracked identities and
+helper lineage/markers remain the primary process proof. This is a recorded
+qualification limitation, not a universal proof against hostile descendants.
+Each local mock admits at most the phase's physical-request ceiling; retries
+are included. Each provider also has at most 64 handled connections (16 active,
+5 s header/body deadline), and exceeding that transport ceiling blocks closure.
+Final receipts distinguish received, admitted, refused and admitted responses
+left unreleased by the bootstrap barrier. Retries never become completed-turn
+or gate evidence and never consume the public free-turn budget. A latched
+spending stop (ceiling exhaustion, an unexpected mock identity, a request after
+the phase deadline or during metadata acquisition), or any provider refusal or
+admission failure, fails cleanup after all processes and providers are stopped,
+whatever the case outcomes: such a run is blocked, never `pass` or
+`diagnostic_pass`. Evidence for an owned SSE bound failure is written once;
+a failed write keeps the block and never interrupts process cleanup.
+
+**Qualification run-root amendment (owner, 2026-10-07; isolation ruling 2026-10-08):**
+Every vendor/VIA-visible controlled path lives under one fresh, owned 0700
+`via-oc-qual.*` root directly inside the invoking user's `XDG_RUNTIME_DIR`:
+fixture and namespace projects, HOME/XDG/TMPDIR, all VIA states/runtime,
+vendor namespaces, helpers, prompt/failpoint files and private copies of both
+VIA builds and the pinned vendor executable. No repository path is handed to
+them. System tools remain verified system executables. Only sanitized evidence
+is written to the worktree's scratchpad, through the existing secrecy controls.
+The runtime parent must be a canonical, non-symlink directory owned by the
+invoking user with mode 0700. Every ancestor through `/` must be root-owned
+or owned by the invoking user and have no group/other write permission. An
+unset, unsafe or excessively long runtime parent blocks; there is no `/tmp`
+fallback. Root resolution must equal its lexical path. The runtime socket
+path plus the reserved 64-byte anchor suffix must fit 107 bytes.
+The ancestor check also tests every parent through `/`, by existence only, for
+`.claude`, `.agents`, `.claude/skills`, `.agents/skills`, `.claude/agents`, `.opencode`,
+`opencode.json`, `opencode.jsonc`, `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md` and `.git`
+(E12/E13 and pinned-binary strings); any present or unverifiable discovery
+source blocks. `CONTEXT.md` discovery is unverified (no literal in the pinned
+binary) and is conservatively checked. Each run scans the hash-verified pinned
+binary for these fixed names and records bounded literal offsets, never raw
+strings. Evidence records the checked names, ancestor path/owner classes and
+modes. Repeat the full check before every `start`, mock bootstrap, direct
+vendor seeding, L11 metadata attempt, and CLI `describe`/`models` probe or
+`spawn`/`resume`/`steer` submission (including driven successor generations).
+Fresh phase-begin and phase-end checks bracket Host's autonomous launches;
+these are phase bracketing, not a per-launch interception inside Host. Failure
+cleanup's `finish` check also brackets an interrupted phase after process
+cleanup and before native reads or the secrecy scan. A later planted discovery
+source or weakened ownership or mode blocks admission.
+The runtime parent on this host is a RAM-backed per-login tmpfs (about 3 GiB);
+capacity exhaustion or disappearance at last logout blocks qualification.
+Every safety/driver block caused by an OS error retains only its fixed errno
+name and trusted code step/line, never the OS message, filename or path.
+
+The qualification daemon config sets a positive `disk.free_floor` of 1 GiB
+(C1 §3.14). VIA's production default is 5 GiB; this host's protected runtime
+filesystem has about 3 GiB total, so that default would refuse every new turn
+before vendor acquisition. The private qualification override preserves the
+disk guard; it does not change VIA's default or the spending controls. A disk
+refusal still blocks, retaining the fixed `admission_refused`/`disk_free_floor`
+kinds and numeric `free_bytes`/`floor_bytes`, without the returned message text.
+
+Private initial Git commits and the exact namespace's 0700 chain remain.
+The nested boundary/control sentinel stays inside its owned outer fixture.
+Ancestor instructions crossing the Git boundary, a missing local marker or
+an insensitive control still stops qualification. Ancestor skills crossing is
+a **record-only vendor finding**, with native instruction-state references,
+independent blob SHA-256 hashes and marker Booleans; it is neither a pass nor
+a stop. The ancestor control must remain sensitive to both markers. After
+owned-process/pgrep/lock absence proof, retain allow-listed native session,
+message, instruction, log and consistent VIA Store projections, reapply the
+secrecy scan, and remove the private run root with an absence record. Raw
+storage, credentials and bearer handles are never copied to evidence. The owner
+authorized a mock-only diagnostic exception (2026-10-08):
+`--diagnostic-mock-case usage` runs preflight plus that explicitly named scripted
+case, with zero public-turn admission and only `oclive-mock/fixture-free`
+approved. Named mock cases also cover compaction, configuration, hostile
+providers, helpers/authentication, the VIA seams, the bounded long run, anchor
+lifetimes and credential seeding; public free/result/continuity/cancel cases
+cannot be selected. No diagnostic selection qualifies the route.
+Only enrolled mock sessions may export bounded native error names
+and messages and relevant private vendor log lines. Errors come only from the
+documented native locations, the message `error` and a tool part's
+`state.error`, never from arguments, outputs or other payloads; at most 1,024
+are exported. Message `seq` must be an integer. Sizes are read with SQL
+`octet_length()` before a body is fetched (16 MiB each, 256 MiB aggregate),
+rows are streamed, and the discovery walk is bounded (100,000 entries, 1,024
+sources). Each log is read once up to the size observed when it was opened
+(16 MiB each, 128 MiB aggregate); later vendor growth is not read. A log is
+named only by a hashed `vendor-log-<16 hex>` identifier. Replace every
+password/bearer representation before the protected evidence write. One shared
+check then searches each text and the whole assembled record, case-folded, in
+raw, repeatedly percent-decoded, JSON-escaped and `\u`-escaped views, for the
+raw, Base64 and hex forms of every protected value (passwords, handles and
+synthetic secrets); a residual or a view still changing after eight rounds
+blocks. Then run the ordinary whole-root secrecy scan. **Run-root ruling
+(coordinator, 2026-10-10):** the private run root
+(`/run/user/<uid>/via-oc-qual.<random>`) is not secret or personal data,
+diagnostic evidence is local and gitignored, and diagnostic capture is
+mock-only. So the run root is not protected material in diagnostic capture or
+the assembled-record check: its exact raw, URL-encoded and JSON-escaped forms
+are replaced with `<private-run-root>` as a cosmetic step, and encoded forms are
+neither proven absent nor blocked. Public-turn protections are unchanged. Public-free sessions
+retain only closed projections, never this text. Diagnostic runs retain the
+ordinary identity, ancestor, spending and cleanup proofs and report
+`diagnostic_pass` separately from qualification (exit 4, versus qualification
+pass exit 0 or block/failure exit 1). Every diagnostic summary records the exact
+runner source manifest/hash. Error log lines associated only by an enrolled
+location boot are labelled
+`location-context`, rather than claiming session attribution. The boot line's
+`directory` field must equal an enrolled location exactly; a prefix does not
+match.
+The usage/cache fixture uses a 32,768-token mock context to measure its scripted
+tool steps without triggering automatic compaction first. L7's separate mock
+fixture retains its small context. The first mock-only usage diagnostic showed
+`compaction.failed` with "Compaction summary did not match the required template"
+at the former 4,096-token context; its canned tool/final response is not a
+compaction summary. For L7, the mock recognizes the pinned initial-summary and
+checkpoint-update prompts and returns the template's Objective, Requirements,
+Decisions, Work State (Completed/Active/Blocked), Next Move, Relevant Files and
+Important Context headings. Normal requests keep their ordinary tool recipe.
+The template starts at byte 145,633,783 of the pinned binary, with native
+validation at byte 145,639,418. Mock-only error/log exports run before cleanup and again
+after a proven stop, so the final export includes the vendor logger's flush.
+Root removal uses the current `stop_result` process/lock/pgrep proof even if
+native diagnostic retention subsequently fails. That diagnostic failure is
+reported separately and still blocks qualification. Every new start/stop
+invalidates an earlier stop proof, so it cannot remove a later live generation.
+Every native case-session message and part is retained as a closed diagnostic
+projection linked by `sessionID` and message sequence: role, part type, native
+built-in tool name (otherwise `other`), tool status, finish reason, fixed E34
+error name (otherwise `other`) and token counts. The closed error-name set also
+includes the SessionV1 and AI SDK classes found in the hash-verified 2.0.22
+executable. Retain numeric `statusCode` and Boolean `isRetryable` when present
+in the error or its `data`, without response bodies or headers. The E8 `streaming` tool state
+maps to `pending`; an unavailable status/count remains null. Unknown part and
+finish labels become `other`. Text, tool arguments, tool output and paths are
+never retained in these projections. Read-only message snapshots precede
+cleanup, preserving case evidence even if cleanup fails; after successful
+cleanup the final native export includes the settled projections. Message and
+part exports retain the existing byte/row bounds and a 65,536-part bound.
+Public-free helper readiness allows 120 s for the model to produce its tool
+call; loopback mock helpers and other owned readiness facts retain the 30 s
+bound. Both waits check identity and signals each poll and clip to the current
+phase deadline. The cancellation helper's barrier remains 180 s after readiness
+and the prompt requests a shell timeout of 180,000 ms from tool launch. These
+bounds outlast the immediate cancel point and its bounded acknowledgement and
+cleanup; the model-readiness wait does not consume the running helper's barrier.
+For every admitted public-free case turn, retain a closed timeline linked by
+VIA session/turn and native `sessionID`, with elapsed milliseconds from CLI
+submission dispatch: first assistant message, first tool part, verified helper
+readiness, and native terminal. The pinned E8 `session.step.started` creates the
+assistant message; `session.tool.input.started` creates its tool part. Timings
+use the owned SSE observer's local monotonic receipt time, not vendor clocks,
+and the verified helper observation. Only events after the exact owned input's
+delivery and before the next delivery/terminal count, from the same owned
+vendor generation. Missing milestones remain null; these diagnostics never
+pass a gate. Preserve accumulated observations across event-capture resets and
+export before and after cleanup, including blocked cases. Retain no message,
+tool input/output, path or exception text. The timeline count is bounded by
+the sum of the phase public-turn ceilings.
+On a helper-barrier timeout, retain only folder/readiness-file presence,
+whether readiness was seen and whether a non-ready file was seen. Failure to
+retain that evidence preserves the timeout and marks retention uncertainty.
+Each helper catches runtime exceptions and atomically writes `ready:false`
+with its fixed exception class (otherwise `other`), errno name if available,
+and step: initialization, fork, session, identity, readiness, protocol, barrier,
+release or complete. No exception message or path is recorded. Release-thread
+exceptions use the same writer; a failure latch prevents a later ready record
+from overwriting the failure. After recording failure, the helper writes only
+`VIA fixture helper failed` to stderr and exits with status 1; no traceback or
+exception message reaches the shell or provider. The barrier timeout exports only that closed
+projection, including when the helper has already exited; it proves no spawn
+or ownership. A snapshot observer retains the projection before blocking.
+No failed helper attempt causes an automatic model re-ask.
+The usage-cache mock retains each request's closed model/stream/tool-presence/
+message-role shape and its response status, completion/chunk shape, scripted
+built-in tool name, finish reason and served usage/cache counts. No content,
+arguments, header values or credentials are retained. These diagnostics are
+exported after owned handlers stop, even when the case or cleanup fails; they
+are not qualification or spending proof.
+Native session-ID readiness uses C1 §3.7's session state `active`, distinct
+from the active turn's `running` state. An active, admission-open session with
+no native ID is pending under the existing ownership-verified readiness
+deadline; a string ID with false verification still blocks immediately.
+Before dispatch, an admission-open `idle` or `active` session is also pending
+only when `active_turn` is null and `turns` identifies exactly the current
+receipted turn as `queued` (C1 §§3.2, 3.7, 7.2). Live acceptance pins then wait
+for that turn's `running/submitting` to become `running/accepted`; a queued
+`active_turn` is not a C1 state. Closing, ended or ambiguous evidence blocks.
+Each poll re-verifies ownership and obeys the phase/readiness deadline.
+Reply diagnostics retain both closed state fields without message content.
+CLI transport bounds allow default `cancel --wait`'s 10 s acknowledgement
+window and 60 s cleanup window, plus the existing 10 s reply margin. Close
+allows the CLI's default 10 s deadline plus 30 s terminal allowance and the
+same margin; a foreground spawn uses the reviewed 180 s wait ceiling plus
+that margin. Every bound remains clipped to the phase deadline; timeout never
+resends a mutation. Typed envelope checks distinguish nullable `unavailable`
+provenance from the three C1 scopes and require a nonnegative `revision`.
+Close checks its used members (`session_id`, closed state, turn-address list,
+cleanup); Store-derived close replays may omit the unused `leftovers` member,
+so its omission proves no cleanup or leftovers property.
+The public cancellation prompt names the exact project-relative command
+`/usr/bin/python3 .opencode/tool-helper.py`; no private absolute path is sent
+to the public provider. The hash-verified 2.0.22 embedded source defaults
+`Shell.create`'s cwd to `Location.directory` (byte offset 145237309); the shell
+tool forwards its optional `workdir` as cwd. Thus the default is the case's
+session/project location (§5). Its foreground timeout defaults to 120,000 ms
+(offsets 145733777 and 145738014); the prompt explicitly requests 180,000 ms
+in the foreground. The helper's own barrier lasts 180 s, and cancellation
+follows the bounded 30 s readiness wait without another model request.
+The pinned shell launches detached (offset 145237865). A helper already
+leading its own session preserves that session; it calls `setsid()` only
+otherwise, avoiding `EPERM` before publishing readiness. Offline fixtures
+cover both an already detached shell and a helper that creates its session.
+For that cancellation session only, native shell-part projections additionally
+retain two Booleans: `command_equals_expected` and `mentions_tool_helper`.
+These compare E7's `state.input.command` in memory; command text is never
+retained. Other public-free prompts ask only for fixed replies or conversation
+recall; they require no fixture discovery. Mock scripts remain unchanged.
+The minimal PATH links the exact checked system `rg`; fake LSP/local helpers
+avoid vendor installs. Inventory still covers all private HOME/XDG, namespace
+and fixture `.opencode` roots. Credential files remain existence/mode only;
+package/binary additions still block except the reviewed exceptions below.
+Inventory skips an ENOENT/ESRCH entry only when the exception's filename names
+that exact entry. Loss of the pinned executable, a template dependency or an
+unidentified file inside an acceptance check blocks rather than hiding a binary.
+
+**Qualification inventory amendment (owner, 2026-10-07):** OpenCode 2.0.22's
+Bun executable extracts multiple embedded runtime objects as its native
+modules initialize. This exception allows no downloaded code: the accepted
+bytes must already be part of the pinned, hash-verified executable.
+It applies only directly inside the exact TMPDIR handed to an owned private
+vendor serve or version-probe launch, under the verified private daemon recipe
+or L11 direct launch. The candidate must be a regular file owned by VIA's uid,
+with link count one and no symlink. Its name must match
+`.bun-<uid>-<16 hex>.(so|node)`, with the uid equal to VIA's uid.
+Each run verifies the pinned executable SHA-256
+`32cf5aa0a69a650e36277e3315d189835ddc79fb9aa1d0aef5025be5af5ad122`.
+Before accepting an object, a bounded search must find its exact bytes verbatim
+in that executable, returning the observed offset. The executable and object
+are each bounded to 256 MiB; the search uses 1 MiB windows with a prefix overlap
+of at most 255 bytes, at most 1,024 full candidate comparisons and a 30 s bound
+clipped to the enclosing phase/bootstrap/observation deadline. Stable file
+identities are checked throughout, and the executable stays immutable through
+the final rehash. Hash verification and search-offset caches never cross runs;
+an offset reused within one run is rechecked against the exact candidate bytes.
+Accepted extractions are evidence labelled `embedded runtime extraction`,
+with Bun name class, vendor-private path class, serve/probe TMPDIR provenance,
+size, SHA-256 and offset; they never count as a passed gate. The three observed
+objects remain sanitized test fixtures containing only sizes, hashes and offsets,
+not executable bytes. All registered states' vendor
+trees remain inventoried, including earlier namespaces and version probes.
+Any other new or changed binary, another copy outside those handed-off
+TMPDIRs, nested copy, name/uid mismatch, bytes absent from the pinned executable
+or unverifiable ownership still blocks.
+
+**Qualification inert Git template amendment (owner, 2026-10-07):** OpenCode's
+private snapshot Git repositories copy the system Git templates at initialization.
+An inventory executable is accepted only as a regular, uid-owned file with link
+count one, no symlink, directly inside such a repository's `hooks/`, below a
+registered private vendor snapshot root. The name must end in `.sample`; Git
+never executes these inert sample names. Preflight resolves the template directory
+from the verified system Git, hashes each same-named template, and verifies a
+private default Git initialization produces exactly those bytes. Unresolvable
+defaults block preflight. On older relocatable Git builds, the compiled
+`share/git-core/templates` suffix and builtin exec-path prefix resolve the default;
+the copied-byte proof confirms it. The manifest is bounded to 128 files, each
+at most 1 MiB, and each synchronous Git command to 10 s. The private probe's
+children are reaped before its directory is removed. Neither OpenCode's nor
+VIA's environment changes; no `GIT_TEMPLATE_DIR` override is used.
+Each candidate is verified byte-for-byte against the preflight template, with
+stable file identity checks. Evidence records the resolved system template dir,
+per-file hashes, and each `inert git template copy` with name, size and SHA-256;
+these records never pass a gate. A non-sample hook, changed byte, no matching
+template, symlink, hard link, copy elsewhere or outside the private snapshot
+roots still blocks. All other package and binary controls remain in force.
+
+L14 persists a stopped daemon's identity before SIGSTOP and verifies pid plus
+start ticks before SIGCONT, including recovery on the next runner start. Missing
+recovery parents are created privately without changing existing common
+parents. A definitively exited old identity clears its journal with a record
+and no signal; a reused pid never authorizes signalling its new identity.
+SIGINT, SIGTERM, SIGHUP and SIGQUIT are deferred through continuation and
+cleanup. Run under tmux or nohup; SIGKILL cannot run cooperative cleanup.
+Providers are shut down in `finally`, even if process cleanup fails. A
+death sample can also be caused by SIGPIPE on stderr; the runner records this
+limitation, rather than claiming a unique signal cause. OC03 proves only that
+history still exists. Inheritance is frozen by daemon configuration: requested
+states use fresh private daemons, two locations with the same fixed inheritance
+share one server, and the cross-request same-server case retains OC02 fake
+proof. No daemon reload command or new per-request CLI setting is introduced.
+
+A configured fake LSP receives a custom fixture extension and an attempted
+native file-read tool call through the mock provider. Served config, the actual
+read attempt and mock receipt establish the probe; a bounded absence of its
+spawn marker records
+`lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)`.
+That exception skips only L5/L14 LSP checks. A positive probe requires a read and observed LSP spawn
+in the L5 fixture and each L14 LSP sample. Missing read-attempt evidence blocks
+the probe. Other lifecycle points come from observed process/API/config evidence. An absent
+reload/disposal API is a labelled limitation; an offered but unsampled path
+cannot pass. Synthetic compaction and cache observations carry the `FAKE` label.
+The current runner defers L1 collision observations, L6 alternate field forms
+and L12 other shapes until a bounded trigger exists, without turning an empty
+observation into a pass. The summary lists these declared deferrals alongside
+L10, counts all four separately from record-only observations, and keeps any
+recorded deferral reason. This count does not change the verdict.
+
+Each turn keeps the supported `full` bound: C1 advertises only `full` (§5), so
+this runner cannot select a narrower network bound without a separate public
+contract change. Incremental phase records survive a later infrastructure
+failure, with the same password/bearer checks as the final evidence sink. SSE
+handshakes use a bounded timeout; accepted streams clear that socket timeout
+and retain the absolute phase watchdog.
+
+On a qualification catalogue decoding block, or a spending-guard refusal
+after a catalogue read, retain a `catalog-block` record projected from the same
+`GET /api/model` reply used by the check. It names the checked provider/model and evidence-relative location,
+HTTP status, allow-listed provider/model IDs, numeric cost fields and fixed model
+statuses. It distinguishes an absent model, unverified prices and explicit zero
+prices. Missing prices remain unavailable and never imply free. URLs, headers,
+settings, tokens and vendor error text are discarded; known password, bearer and
+synthetic forms are redacted even in identifier fields. This record diagnoses a
+refusal and never admits spending or counts as a passed gate.
+
+Every qualification block while evaluating a vendor or VIA reply retains a
+`reply-block` record through one shared diagnostic projector. HTTP config,
+integration, catalogue, session, message, OpenAPI and `/api/info` replies, CLI
+stdout/stderr and native SSE events enter it before schema or verdict checks.
+Rejected redirects and consumed partial HTTP/CLI replies are included, labelled
+incomplete. A stream handshake records status without reading its body. The
+record retains byte count/hash, status, allow-listed IDs, fixed enums, numeric
+fields and loopback origin classes (`host:port` only). URLs, paths from replies,
+headers, credentials, bearer handles and arbitrary vendor text are discarded;
+known protected forms and fresh private-field values are redacted even when
+mirrored into IDs or across foreground spawn's receipt/envelope lines.
+
+Diagnostic traversal is bounded at 16 MiB of consumed reply, 2,048 nodes,
+depth 12 and 64 collection items; each projection is at most 64 KiB. Exceeding
+a projection bound records explicit truncation and no projected values. Up to
+32 scoped/recent projections accompany the sanitized blocking reason and its
+case/phase/verb. A recent-context association is labelled, rather than claiming
+one reply caused the block. Phase/summary blocking records link the retained
+file; failed retention preserves the initiating block and marks retention
+unavailable. Projection exceptions produce a fixed `projection_failed` record
+without replacing a transport result or its original block. Non-string origins
+are unverifiable; identifiers admit at most the single provider/model slash.
+CLI routes use fixed verbs or `unknown`. Blocking reasons are screened against
+password, bearer and synthetic forms. SSE observers stash sanitized failure
+context in memory and only the main thread writes it, including during cleanup.
+Transport captures carry `identity_verified: false`: they precede the post-read
+ownership verification and are never identity proof. This evidence never admits
+spending or counts as a gate pass.
+
+The qualification observer treats an HTTP 200, decoded catalogue as pending
+when empty or when an approved checked model identity is absent: provider loading can
+publish several staged updates. It repeats the location read 200 ms apart
+(§2.2), within one 30 s readiness deadline clipped to the enclosing phase or bootstrap deadline,
+re-verifying owned PID/start-ticks and Host generation before and after each
+read. A present model proceeds immediately to the unchanged explicit-zero
+price check; missing or nonzero prices block at once. Schema errors, ownership
+changes and absence at deadline expiry block, with the last sanitized catalogue
+record retained. Reset the diagnostic observation before each read so a failed
+read does not present the previous poll as current. An unapproved identity sets
+the spending stop latch and blocks immediately, before acquisition or a catalogue
+wait; only the frozen public-free and fixture-mock identities may wait. Read
+integration facts after catalogue and effective-config readiness, immediately before admission.
+This observation wait admits no
+model request and does not change §5's fresh, no-retry effort check in VIA.
+
+After the runner writes a fixture config, its effective-endpoint observation
+may wait only while the served provider map is empty or exactly matches the
+previous fixture map verified for that location and owned process generation.
+Compare the same provider IDs and owned loopback host:port; an unverified prior
+map cannot justify a retry. Poll the config read 200 ms apart within the existing
+30 s readiness ceiling, clipped to phase/bootstrap deadlines, checking signals
+and re-verifying PID/start-ticks and Host generation before and after every read.
+Any other map (including an unknown provider, foreign/non-loopback endpoint or
+third port) blocks immediately. Schema errors and explicit selector drift still
+block immediately. The expected map proceeds only with all frozen selectors
+verified; reaching it clears the reload allowance. Deadline expiry blocks with
+the last sanitized reply retained. Read integration after both catalogue and
+effective-config readiness, immediately before the spending guard. This wait
+admits no model request and requires no config.updated event as proof.
+
+**Qualification mock admission amendment (coordinator, 2026-10-07):**
+Derive the preflight request ceiling from its actual turn pattern: one labelled
+bootstrap plus each repository sentinel, times the observed two requests per
+mock turn. The current three sentinels yield eight mock requests and zero
+public requests. The bound deliberately allows one preflight daemon generation:
+an idle exit within preflight requires another two-request bootstrap charged
+to the same eight-request ceiling, which can block that phase. The runner does
+not replenish or enlarge a phase ceiling when a daemon restarts; later phases
+use their existing finite ceilings and count every re-bootstrap request.
+Persist each sentinel's received count even if its turn blocks;
+the bootstrap has its own labelled receipt. A sentinel receipt explicitly
+includes any re-bootstrap traffic during its spawn and records that bootstrap
+count, so it is not a pure sentinel-only request count. Receipt publication
+failure has a distinct `mock_receipt_failed` flag and never replaces the first
+block or claims a reply-retention failure. Refresh the HTTP phase deadline
+before every admission read, including when a generation survives a phase.
+After stopping providers, retain
+the aggregate physical received count, including rejected requests, rather than
+reporting it unavailable. Crossing the derived ceiling still sets the stop latch
+and blocks. Receipts and the bootstrap are diagnostic records, never gates.
+
+**Seams mock ceiling (coordinator ruling, 2026-10-10):** the seams phase's
+physical mock-request ceiling is derived like the preflight, hostile and anchor
+ceilings, not fixed. Each case contributes its own physical requests plus the
+re-acquisitions it causes, at two bootstrap requests each; the phase adds one
+initial acquisition (2) and the fixed margin (2):
+
+| Case | Own requests | Re-acquisitions | Total |
+|---|---|---|---|
+| write_cancel | 6: two setup turns (primary and title), the partial prompt stopped at its body prefix (0), the response prompt's tool step and interrupted continuation (2) | 2: each mode's cancelled generation drains and retires | 10 |
+| foreign | 11: setup 2, foreign tool step and continuation 2, successor 1, near-limit inbox 6 | 2: seeding stops VIA, and the cleanup successor starts another generation | 15 |
+| transport_loss | 4: setup 2, tool step 1, post-loss continuation 1 | 1: the loss retires the generation | 6 |
+| identity | 3: first turn 2, reopen 1 | 1: idle retirement's successor | 5 |
+| error_shapes | 57: up to three attempts of rate_limit (1 + 10 retries, two titles: 13), quota (3) and context (3) | 9: at most one per shape turn | 75 |
+
+The deferred collision, forms and other rows make no request. The ceiling is
+115 requests. The own counts match the observed requests in diag-all-final-4
+and the earlier identity and error-shape diagnostics; the 32-request ceiling it
+replaces was exhausted by the identity case's re-acquisition. The mocks are
+local and free; the ceiling bounds runaway behaviour, and the margin stays
+small. A runner test counts each seams case's model-capable call sites,
+multiplied by its literal loop bounds, and fails when that pattern changes
+without its declared budget. Every other spending rule is unchanged: any
+request beyond the derived ceiling latches the stop and blocks.
+
+**L4 retry-budget derivation (2026-10-08):** The pinned binary's primary retry
+schedule at byte 145,631,595 allows ten retries (eleven attempts), with nominal
+delays 2, 4, 8, then seven 10-second waits and 0.8–1.2 jitter (at most 100.8
+seconds total scheduled delay). Local fixtures supply no retry hints; the
+vendor otherwise caps such a hint at 15 minutes. HTTP 500 is retryable;
+authentication 401/403 is not. Invalid provider output is retryable only for
+`incomplete-stream`; transport errors generally retry, with only three retries
+for timeouts. Native title generation makes at most two separate attempts
+(selected model then primary fallback when the model references differ), with
+no title retry schedule; this accounts for thirteen observed physical requests
+in a retryable hostile fixture.
+
+Malformed fixtures now deliver a delimited invalid SSE JSON event; oversized
+fixtures exceed the pinned provider parser's 10,485,760-character pending-event cap
+(the fixture is ASCII, so its byte count is identical)
+(byte 144,448,787) without a delimiter. Both produce nonretryable native decode
+or size failures instead of only an incomplete-stream failure. Reserve per
+provider its allowed primary attempts, two title attempts, two bootstrap
+requests and a fixed two-request margin: seventeen for HTTP 500 and truncated
+transport, seven for malformed/oversized and authentication. The eight L4
+providers sum to `2 × (17 + 7 + 7 + 17) = 96` physical requests with zero public
+admission. Per-provider and shared phase latches both enforce these ceilings;
+phase deadlines still apply. VIA's separate 1 MiB malformed/oversized HTTP/SSE
+matrix remains fake OC12b proof. These are finite fixed-fixture bounds, not a
+general bound on user-supplied retry hooks.
+
+**Mock-fixture control corrections (2026-10-08):** L2 keeps the original
+HTTP exchange paused through the observation: releasing it first can let the
+vendor finish normally. Its positive drain proof has a phase-clipped 40-second
+ceiling (30-second prompt HTTP deadline, three-second exit classification,
+five-second retirement and two seconds fixed margin), verifies vendor/anchor
+absence and committed Host retirement, and then discards the old SSE client.
+The near-limit reopen fixture cancels its unsent held claim and verifies
+`cancelled` with quiescent cleanup before restarting. Crash recovery would
+leave an `unknown` predecessor and C1 P6 would correctly cancel the successor
+before native reopen, so it cannot test this adapter cleanup path.
+
+The never-ask fixture's project plugin requests `ask` only for an actual
+scripted child shell action; VIA's rejected native permission reply must be
+observed. The marker control kills the verified vendor alone, preserving the
+anchor's control channel so Host can positively report server loss; L14 still
+kills the anchor alone. A matching entry in Host's incomplete leftover report
+is positive evidence for that particular process, while incompleteness still
+qualifies the full set and cannot prove absence. The LSP probe joins the read
+tool's started/called/success events by session, assistant message and tool ID;
+the called event itself has no tool-name field. Configuration is read from
+the served top-level config array.
+
+The missing-ID control verifies a native 404 after acquiring the successor,
+then checks the mock fixture's served configuration, catalogue and integration
+without demanding readback from the deleted session. Only its exact resume
+command receives the metadata refusal fence; every provider request during
+that control is rejected and latches a hard stop. The native-session baseline
+is taken after bootstrap, so bootstrap sessions are not replacement sessions.
+
+L14's maximum implemented mock budget is derived separately: fourteen fresh
+points each reserve two bootstrap, two primary/title and two successor
+bootstrap requests; `tool_after` and the two LSP reads add three requests;
+the retained L9 successor adds two; a cold capability probe adds six; a fixed
+two-request margin yields `14 × 6 + 3 + 2 + 6 + 2 = 97`. Unoffered points
+remain limitations and consume no requests. Every physical request counts.
+L9's existing 32-request ceiling covers sixteen primary calls, eight fresh
+session titles and two bootstrap calls (26), with six remaining; successful
+resumed sessions do not generate a new title (pinned bytes 146,057,477 and
+139,304,790). A fail-I/O transport seam has no pause to release; its helper
+still receives cleanup independently.
+
+L8's quota mock uses HTTP 400 with the recognized `insufficient_quota` error
+code. The generic label `quota` is not recognized by the pinned provider
+classifier (bytes 144,457,358 and 144,459,955) and produces
+`provider.invalid-request`; the recognized code produces `provider.quota`
+(byte 145,110,279). HTTP 429 is reserved for the separate rate-limit control.
+
+L9 reserves the last 30 seconds of its existing 20-minute phase for final
+snapshot and generation proof. Sampling consumes the earlier bounded window;
+its elapsed duration is recorded. This prevents the phase watchdog from
+closing SSE at the same instant the final snapshot is read. Neither the
+phase deadline nor model/request ceilings increase.
+Its scripted shell call explicitly requests 1,800,000 ms, matching the
+30-minute helper barrier and outlasting sampling plus the first L14 sample.
+The pinned foreground shell default is only 120,000 ms (bytes 145,733,777
+and 145,738,014); omitting the timeout lets the shell finish long before L9.
+The held turn also explicitly sets VIA's positive per-turn `idle_ms` to
+1,800,000 (C1 §3.2); its silent helper otherwise hits the 600,000 ms default
+before the sample ends. The normal wall deadline and phase ceiling remain
+unchanged. This qualifies the intentional bounded fixture, not an idle
+deadline exemption.
+
+An inventory mismatch retains up to 128 closed difference rows: root index,
+hashed relative name, size and content hash, fixed name class, executable/ELF
+flags, uid/link facts, registered-TMPDIR and Git-template/marker booleans.
+It retains neither unknown local names nor file content and does not change
+the admission rule. Omitted rows are counted.
+The L14 descriptor scan inspects every readable same-uid process. The anchor,
+server and all descendants must be fully readable. An unreadable outsider may
+be excluded only when its verified start ticks strictly predate the first
+verified server generation and it is outside every registered anchor/server
+tree. The runner conservatively also requires birth before the runner itself,
+so an unreadable process born during the run blocks. Birth boundaries and owned
+roots remain fixed across generations and namespace rotations. Exclusions
+record PID, start ticks, fixed comm class and errno, as record-only findings.
+Unknown ancestry or liveness blocks; pidfd-proven absence can be skipped.
+A process directory disappearing before the uid snapshot is absent; a reused
+PID is rescanned once using the replacement identity, never omitted. That
+includes a replacement first noticed by the liveness check after a read error:
+liveness `False` is re-read, and only a saved identity that is gone, not
+replaced, counts as exit. A second identity change blocks. A `lock:` line
+matches only when its parsed `MAJ:MIN:INODE` field equals the complete device
+and inode of `server.lock`, never a substring; a `FLOCK` line without exactly
+one such field blocks. Readable outsiders
+holding the lock always fail: the first verified non-anchor `FLOCK` line is an
+immediate, irreversible case failure (`lock-scan-escape` record). A later read
+error, exit, exclusion or rescan of that process cannot discard it, and every
+later scan in the run fails the same way. Each scan checks the phase deadline
+(clipped to 60 s) and deferred interruption before every process, descriptor,
+liveness and ancestry read and recheck, including historical classification's
+`comm` read and final verifications, and again before it returns an exclusion,
+an absence or exit disposition, or success. All of these count toward 500,000
+reads; a scan that cannot finish blocks.
+
+L11 seeds the registered loopback mock integration, not an unknown integration
+ID: pinned `Integration.list` enumerates registered integrations (byte
+144,986,350), while credential creation alone does not register one. The
+namespace's persistent fixture config registers the mock before the direct
+seed server starts, so both that server and the subsequent VIA-owned server
+see the same integration. The integration read before credential creation must show no connections;
+the read afterwards must show exactly one new `oclive-mock` connection with
+`type: credential` and `label: VIA synthetic fixture`. Any pre-existing,
+additional or differently labelled connection blocks. The synthetic value must
+be absent from the raw response and from its decoded values, under the same
+representation-aware check as mock diagnostics. No model request is
+admitted in this phase.
+
+Cleanup's embedded-runtime provenance checks retain their own bounded search
+window after a phase expires. Expired admission and observation deadlines do
+not disable cleanup or extend any model-capable request deadline.
+
+The pinned binary exposes the promise plugin permission `evaluate` hook at
+byte 146,023,383; the evaluator invokes it at 145,097,933. The shell permission
+action is `shell` (constant at 145,733,769), not `bash`. L5 requires at least
+one actual child ask correlated with VIA's rejected native permission reply;
+denied actions without an ask cannot pass this gate.
+
+The private binary/package inventory validates every supplied root and scans
+only the outermost roots, counting each entry once when namespace and vendor
+roots overlap. Its 100,000-entry bound remains unchanged. A helper the runner
+writes into a fixture during a live L14 turn (the `tool_after` and shell
+points) is admitted only when it is the single difference, at its exact path
+and with the hash of the content the runner wrote; any other difference still
+blocks. A block raised after the cleanup stop request is retained, but the
+process and lock absence proof still runs, so the run root can be removed.
+
+Mock-only error projection accepts a stored message up to the existing 16 MiB
+native-message input bound, while retaining at most 1 MiB of redacted error/log
+text. Near-limit fixture text is discarded, never exported. Bootstrap records
+retain only the terminal state and fixed failure class; observer bound records
+retain line/frame/prior-data/total byte counts and line-completion Boolean.
+An oversized owned SSE frame's event facts keep a key name only on a reviewed
+schema path: the envelope (`id`, `type`, `durable.seq`, `data.sessionID`), the
+fields VIA's own event decoder reads for that event type, and
+`session.step.ended` `files`. Every other dictionary key, at any depth and in
+any unknown event type, is recorded as `*`.
+These diagnostic records do not change VIA's 1 MiB SSE line/event contract.
 
 ## 14. Owner questions and revisit items
 

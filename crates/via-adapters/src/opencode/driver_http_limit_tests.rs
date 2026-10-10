@@ -144,6 +144,89 @@ fn oc09_c2_setup_body_limit_fails_protocol_without_prompt() {
     });
 }
 
+/// §9: the exact inbox cap admits cleanup and a successor through the real driver.
+#[test]
+fn oc05_c2_inbox_exact_bound_accepts_cleanup_and_successor() {
+    run(async {
+        let rig = Rig::new(&json!({}));
+        let cwd = rig.root().to_str().unwrap().to_owned();
+        let mut scenario = fixture(&cwd, success());
+        replace(
+            &mut scenario,
+            route(
+                "GET",
+                &format!("/api/session/{SES}/inbox"),
+                &json!([{
+                    "status":200,"json":{"data":[]},"pad_to":2 * 1_048_576
+                }]),
+            ),
+        );
+        rig.fixture(&scenario);
+        row(&rig, 1, "unknown");
+        row(&rig, 2, "running");
+        let mut lane = Lane::open(&rig, true);
+        let (end, _) = lane.turn(2, None, Duration::from_secs(20)).await;
+        lane.close().await;
+        let requests = rig.requests();
+        rig.finish().await;
+        assert!(
+            end.outcome.is_ok(),
+            "exact cap permits the successor: {end:?}"
+        );
+        assert_eq!(
+            prompts(&requests).len(),
+            1,
+            "only the successor is submitted"
+        );
+    });
+}
+
+/// §9: one byte over guards the ceiling; the exact-bound case detects the old cap.
+#[test]
+fn oc05_c2_inbox_one_byte_over_bound_fails_protocol_and_drains_without_prompt() {
+    run(async {
+        let rig = Rig::new(&json!({}));
+        let cwd = rig.root().to_str().unwrap().to_owned();
+        let mut scenario = fixture(&cwd, success());
+        replace(
+            &mut scenario,
+            route(
+                "GET",
+                &format!("/api/session/{SES}/inbox"),
+                &json!([{
+                    "status":200,"json":{"data":[]},"pad_to":2 * 1_048_576 + 1
+                }]),
+            ),
+        );
+        rig.fixture(&scenario);
+        row(&rig, 1, "unknown");
+        row(&rig, 2, "running");
+        let mut lane = Lane::open(&rig, true);
+        let (end, _) = lane.turn(2, None, Duration::from_secs(5)).await;
+        let draining = matches!(lane.driver.prepare(), crate::Prepared::NeedsConnection);
+        lane.close().await;
+        let requests = rig.requests();
+        rig.finish().await;
+        assert_protocol(&end);
+        assert!(
+            draining,
+            "the oversized inbox listing drains its generation"
+        );
+        assert!(
+            prompts(&requests).is_empty(),
+            "cleanup failed before dispatch"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "DELETE")
+                .count(),
+            0,
+            "an oversized listing never supplies cancellation candidates"
+        );
+    });
+}
+
 /// §7.4 fixture setup: stop only the input whose delivered execution is observed.
 async fn execution_ready(lane: &Lane, by: tokio::time::Instant) -> bool {
     loop {

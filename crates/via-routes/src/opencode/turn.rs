@@ -8,9 +8,9 @@ use crate::Deadline;
 /// Wire-owned request evidence used by adapter cancellation (`opencode.md` §7.4, §8).
 pub use via_wire::http::{HttpClient, HttpError, HttpFailure, Sent, SentTracker};
 
-/// The inbox has the ordinary HTTP response limit (`opencode.md` §9).
-/// The packet grants a larger body only to `/api/model`, not echoed inboxes.
-const INBOX_BODY_BYTES: usize = BODY_BYTES;
+/// Reopen listing bound (`opencode.md` §9): one unresolved VIA prompt plus
+/// one foreign prompt, each with the admission limit and 8 KiB of framing.
+const INBOX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct PromptReply {
@@ -568,12 +568,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oc05_inbox_listing_obeys_the_packets_http_body_bound() {
+    async fn oc05_inbox_listing_accepts_exact_bound_and_rejects_one_byte_over() {
+        // §9: two admitted prompt echoes, each with 8 KiB framing allowance.
+        // Each plain ASCII prompt spends two JSON quote bytes; an empty cwd
+        // spends two more, so the text length subtracts four admission bytes.
+        const LISTING_BYTES: usize = 2 * 1_048_576;
         let body = serde_json::to_vec(&json!({"data":[
-            {"id":"msg_via0123456789abcdefghijkl","text":"a".repeat(600_000)},
-            {"id":"msg_viaabcdefghijkl0123456789","text":"b".repeat(600_000)}
+            {"id":"msg_via0123456789abcdefghijkl","text":"a".repeat(1_048_576 - 8_192 - 4)},
+            {"id":"msg_foreign","text":"b".repeat(1_048_576 - 8_192 - 4)}
         ]}))
         .unwrap();
+        assert!(body.len() < LISTING_BYTES);
+        let mut body = body;
+        body.resize(LISTING_BYTES, b' ');
+        assert_eq!(listing_response(body.clone()).await.unwrap().len(), 2);
+        body.push(b' ');
         let result = listing_response(body).await;
         assert!(matches!(
             result,

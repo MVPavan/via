@@ -941,3 +941,352 @@ async fn tracked_client_view_preserves_the_shared_general_gate() {
         Sent::No
     );
 }
+
+/// `OpenCode` §13 L2: subprocess isolation gives each test its own controller.
+#[cfg(feature = "test-failpoints")]
+fn qualification_child(name: &str) -> bool {
+    if std::env::var_os("VIA_WIRE_HTTP_CHILD").is_some() {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("http::tests::{name}"), "--nocapture"])
+        .env("VIA_WIRE_HTTP_CHILD", "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "isolated HTTP seam test failed: {name}");
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("isolated HTTP seam test exceeded its deadline: {name}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+struct QualificationPoints(std::path::PathBuf);
+
+#[cfg(feature = "test-failpoints")]
+impl QualificationPoints {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("via-wire-http-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        via_store::failpoint::activate(&dir, "wire-qualification-token").unwrap();
+        Self(dir)
+    }
+
+    fn arm(&self, point: &str, port: u16, target: &str, action: &str) {
+        let command = format!(
+            r#"{{"token":"wire-qualification-token","occurrence":1,"action":"{action}","target":{{"port":"{port}","request":"{target}"}}}}"#
+        );
+        std::fs::write(self.0.join(format!("{point}.json")), command).unwrap();
+    }
+
+    async fn entered(&self, point: &str, written: usize, body_length: usize) {
+        let path = self.0.join(format!("{point}.1.ack"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the intended HTTP boundary must acknowledge its barrier");
+        let ack = std::fs::read_to_string(path).unwrap();
+        assert!(!ack.contains(PASSWORD));
+        assert!(!ack.contains("wire-qualification-token"));
+        let (_, facts) = ack.split_once("\"facts\":").expect("numeric byte facts");
+        for (name, expected) in [("written", written), ("body_length", body_length)] {
+            let (_, value) = facts
+                .split_once(&format!("\"{name}\":"))
+                .expect("required actual byte fact");
+            let value = value.trim_start();
+            let end = value
+                .find(|character: char| !character.is_ascii_digit())
+                .unwrap();
+            assert_eq!(value[..end].parse::<usize>().unwrap(), expected);
+        }
+    }
+
+    fn release(&self, point: &str) {
+        std::fs::write(self.0.join(format!("{point}.1.release")), b"").unwrap();
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for QualificationPoints {
+    fn drop(&mut self) {
+        // Release armed pauses even when a test assertion unwinds.
+        for point in ["wire.http.body_after_prefix", "wire.http.before_response"] {
+            self.release(point);
+        }
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+fn qualification_prompt<'a>(target: &'a str, body: &'a [u8]) -> HttpRequest<'a> {
+    HttpRequest {
+        method: Method::Post,
+        target,
+        body: Some(body),
+        body_limit: BODY_BYTES,
+        pool: Pool::General,
+    }
+}
+
+/// L2: a real body prefix survives cancellation; its stop pool remains usable.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn qualification_body_prefix_cancel_preserves_offset_and_stop_pool() {
+    if !qualification_child("qualification_body_prefix_cancel_preserves_offset_and_stop_pool") {
+        return;
+    }
+    let points = QualificationPoints::new();
+    let (listener, client) = listener().await;
+    let target = "/api/session/owned/prompt";
+    let point = "wire.http.body_after_prefix";
+    points.arm(point, client.port(), target, "pause");
+    let body = vec![b'q'; 8192];
+    let tracker = SentTracker::new(|| {});
+    let (filled, full_pool) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut prompt, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            prompt.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let mut prefix = vec![0; 1024];
+        prompt.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(prefix, vec![b'q'; 1024]);
+        let mut occupied_sockets = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (head, _) = read_request(&mut stream).await;
+            assert!(head.starts_with("GET /occupy "));
+            occupied_sockets.push(stream);
+        }
+        filled.send(()).unwrap();
+        let (mut stop, _) = listener.accept().await.unwrap();
+        let (head, body) = read_request(&mut stop).await;
+        assert!(head.starts_with("POST /api/session/owned/interrupt "));
+        assert!(body.is_empty());
+        stop.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+        let mut tail = Vec::new();
+        prompt.read_to_end(&mut tail).await.unwrap();
+        assert!(
+            tail.is_empty(),
+            "cancellation must not resend or write the remaining body"
+        );
+        drop(occupied_sockets);
+    });
+    let mut held_requests = tokio::task::JoinSet::new();
+    {
+        let request =
+            client.request_tracked(qualification_prompt(target, &body), within(5), &tracker);
+        tokio::pin!(request);
+        // Cancellation drops this fresh socket and its permit; tracker evidence persists.
+        tokio::select! {
+            result = &mut request => panic!("body barrier did not hold: {result:?}"),
+            () = points.entered(point, 1024, body.len()) => {},
+        }
+        assert!(tracker.is_sent());
+        assert!(!tracker.withdraw_before_send());
+        for _ in 0..3 {
+            let client = client.clone();
+            held_requests.spawn(async move { client.request(get("/occupy"), within(5)).await });
+        }
+        tokio::time::timeout(Duration::from_secs(2), full_pool)
+            .await
+            .unwrap()
+            .unwrap();
+        let stop = HttpRequest {
+            method: Method::Post,
+            target: "/api/session/owned/interrupt",
+            body: None,
+            body_limit: BODY_BYTES,
+            pool: Pool::Stop,
+        };
+        assert_eq!(client.request(stop, within(2)).await.unwrap().status, 204);
+    }
+    points.release(point);
+    peer.await.unwrap();
+    while let Some(result) = held_requests.join_next().await {
+        assert_eq!(result.unwrap().unwrap_err().kind, HttpFailure::Truncated);
+    }
+    assert!(tracker.is_sent());
+}
+
+/// L2: the complete request is sent, but the response stays unread until release.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn qualification_before_response_holds_complete_request_and_stop_pool() {
+    if !qualification_child("qualification_before_response_holds_complete_request_and_stop_pool") {
+        return;
+    }
+    let points = QualificationPoints::new();
+    let (listener, client) = listener().await;
+    let target = "/api/session/owned/prompt";
+    let point = "wire.http.before_response";
+    points.arm(point, client.port(), target, "pause");
+    let tracker = SentTracker::new(|| {});
+    let (seen, complete) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut prompt, _) = listener.accept().await.unwrap();
+        let (_, body) = read_request(&mut prompt).await;
+        assert_eq!(body, b"synthetic-prompt");
+        prompt
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            .await
+            .unwrap();
+        seen.send(()).unwrap();
+        let (mut stop, _) = listener.accept().await.unwrap();
+        let (head, _) = read_request(&mut stop).await;
+        assert!(head.starts_with("GET /stop "));
+        stop.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let request = client.request_tracked(
+        qualification_prompt(target, b"synthetic-prompt"),
+        within(5),
+        &tracker,
+    );
+    tokio::pin!(request);
+    // Both waits retain the same exchange, including its sent evidence and socket.
+    tokio::select! {
+        result = &mut request => panic!("response barrier did not hold: {result:?}"),
+        () = points.entered(point, 16, 16) => {},
+    }
+    complete.await.unwrap();
+    assert!(tracker.is_sent());
+    let stop = HttpRequest {
+        pool: Pool::Stop,
+        ..get("/stop")
+    };
+    assert_eq!(client.request(stop, within(2)).await.unwrap().status, 204);
+    points.release(point);
+    let response = request.await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"{}");
+    peer.await.unwrap();
+}
+
+/// L2: injected failures keep `Sent::Maybe` and never reconnect or resubmit.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn qualification_http_failures_retain_sent_and_exact_body_offsets() {
+    if !qualification_child("qualification_http_failures_retain_sent_and_exact_body_offsets") {
+        return;
+    }
+    let points = QualificationPoints::new();
+    for (point, expected) in [
+        ("wire.http.body_after_prefix", 1024),
+        ("wire.http.before_response", 8192),
+    ] {
+        let (listener, client) = listener().await;
+        let target = "/api/session/owned/prompt";
+        points.arm(point, client.port(), target, "fail_io");
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            let at = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            assert_eq!(request.len() - at, expected);
+            assert!(request[at..].iter().all(|byte| *byte == b'q'));
+        });
+        let tracker = SentTracker::new(|| {});
+        let body = vec![b'q'; 8192];
+        let error = client
+            .request_tracked(qualification_prompt(target, &body), within(2), &tracker)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, HttpFailure::Io);
+        assert_eq!(error.sent, Sent::Maybe);
+        assert!(tracker.is_sent());
+        points.entered(point, expected, body.len()).await;
+        peer.await.unwrap();
+        std::fs::remove_file(points.0.join(format!("{point}.json"))).unwrap();
+    }
+}
+
+/// L2: stale origins, foreign requests and untracked traffic do not consume a hit.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn qualification_http_targeting_excludes_stale_foreign_and_untracked_requests() {
+    if !qualification_child(
+        "qualification_http_targeting_excludes_stale_foreign_and_untracked_requests",
+    ) {
+        return;
+    }
+    let points = QualificationPoints::new();
+    for point in ["wire.http.body_after_prefix", "wire.http.before_response"] {
+        let (listener, client) = listener().await;
+        let target = "/api/session/owned/prompt";
+        let stale = client.port().wrapping_add(1);
+        points.arm(point, stale, target, "fail_io");
+        let peer = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+        });
+        let tracker = SentTracker::new(|| {});
+        let body = vec![b'q'; 8192];
+        let response = client
+            .request_tracked(qualification_prompt(target, &body), within(2), &tracker)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 204);
+        points.arm(point, client.port(), target, "fail_io");
+        let response = client
+            .request_tracked(
+                qualification_prompt("/api/session/foreign/prompt", &body),
+                within(2),
+                &tracker,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 204);
+        let response = client
+            .request(qualification_prompt(target, &body), within(2))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 204);
+        assert!(!points.0.join(format!("{point}.1.ack")).exists());
+        let error = client
+            .request_tracked(qualification_prompt(target, &body), within(2), &tracker)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, HttpFailure::Io);
+        let written = if point == "wire.http.body_after_prefix" {
+            1024
+        } else {
+            body.len()
+        };
+        points.entered(point, written, body.len()).await;
+        peer.await.unwrap();
+        std::fs::remove_file(points.0.join(format!("{point}.json"))).unwrap();
+    }
+}

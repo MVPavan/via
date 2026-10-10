@@ -192,8 +192,18 @@ impl Sandbox {
         let deadline = Instant::now() + timeout;
         loop {
             let output = self.run(&["result", session, "--json"], Duration::from_secs(5));
-            if output.status.success() {
-                return serde_json::from_slice(&output.stdout).unwrap();
+            let reply = serde_json::from_slice::<Value>(&output.stdout);
+            let exit_valid = match reply
+                .as_ref()
+                .ok()
+                .and_then(|value| value["state"].as_str())
+            {
+                Some("completed") => output.status.success(),
+                Some("failed" | "cancelled" | "unknown") => output.status.code() == Some(3),
+                _ => false,
+            };
+            if exit_valid {
+                return reply.unwrap();
             }
             if Instant::now() >= deadline {
                 std::panic::panic_any(ScenarioError::Timeout(format!(
