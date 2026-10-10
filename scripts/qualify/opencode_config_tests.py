@@ -130,7 +130,8 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='via-occonfig-') as root:
             d=reply_tests.ReplyTests().driver(root,{})
             d.namespace=d.ownership.register(d.evidence/'state/vendor/opencode/FAKE-namespace','vendor-private')
-            d.project=d.namespace;d.namespace.mkdir(parents=True,exist_ok=True)
+            d.namespace_project=d.ownership.register(d.evidence/'projects/state','vendor-private')
+            d.project=d.namespace_project;d.namespace_project.mkdir(parents=True,exist_ok=True)
             d.vendor_identity=safety.Identity(71,123);d.proc=mock.Mock()
             d.mock_origins={safety.loopback_origin(value) for value in (OLD,NEW)}
             d.provider_endpoints={'oclive-mock':OLD}
@@ -138,7 +139,7 @@ class ConfigTests(unittest.TestCase):
                 'Config.InfoEncoded':{'properties':{'model':{},'agents':{},'providers':{}}}}}})
             d._http.request.return_value=reply(config(OLD))
             d._auxiliary_bindings(safety.MOCK_IDENTITY)
-            (d.namespace/'opencode.json').write_text(json.dumps(config(OLD)))
+            (d.namespace_project/'opencode.json').write_text(json.dumps(config(OLD)))
             d._refresh_inventory=mock.Mock()
             def materialize(name,project,description):
                 control=name=='ancestor-control'
@@ -149,7 +150,7 @@ class ConfigTests(unittest.TestCase):
                 return config(NEW)
             def turn(project,_prompt):
                 d.project=project
-                if project==d.namespace:
+                if project==d.namespace_project:
                     d._http.request.side_effect=[reply(config(OLD)),reply(config(NEW))]
                     d._last_auxiliary_bindings=d._auxiliary_bindings(safety.MOCK_IDENTITY)
             d._materialize_fixture=mock.Mock(side_effect=materialize)

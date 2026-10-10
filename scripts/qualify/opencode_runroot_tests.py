@@ -232,7 +232,7 @@ class RunRootTests(unittest.TestCase):
             d._locks_owned=mock.Mock(return_value=True)
             with mock.patch.object(safety,'verify_binary'), \
                     mock.patch.object(safety,'verify_daemon_program'):
-                d.start('release',d.namespace)
+                d.start('release',d.namespace_project)
             import json
             config=json.loads((d.state/'daemon.json').read_text())
             self.assertEqual(config.get('disk',{}).get('free_floor'),1024*1024*1024)
@@ -321,8 +321,8 @@ class RunRootTests(unittest.TestCase):
     def test_bootstrap_rechecks_ancestors_before_any_static_or_submit_work(self):
         with private_runtime() as base:
             d = self.driver(base); (base / 'AGENTS.md').touch()
-            d.namespace = d.work / 'namespace'
-            d._namespace_bootstraps = {d.namespace: ({}, mock.Mock(requests=0))}
+            d.namespace = d.work / 'namespace'; d.namespace_project = d.work / 'projects' / 'state'
+            d._namespace_bootstraps = {d.namespace_project: ({}, mock.Mock(requests=0))}
             d.fixtures = {}
             d._bootstrap_static = mock.Mock(side_effect=AssertionError('FAKE admission reached'))
             d.via = mock.Mock()

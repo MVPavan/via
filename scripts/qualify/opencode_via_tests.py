@@ -463,10 +463,10 @@ class RealViaTests(unittest.TestCase):
             # Exactly the namespace sentinel's registration/write/start shape.
             # Selecting local config is a runner precondition; the fake's
             # immutable served config is not a vendor reload simulation.
-            config=d._materialize_fixture('namespace-boundary',d.namespace,{'provider':'mock'})
-            (d.namespace/'opencode.json').write_text(json.dumps(config))
-            d.fixtures['namespace-boundary']={'path':d.namespace,'config':config}
-            d.start('release',d.namespace)
+            config=d._materialize_fixture('namespace-boundary',d.namespace_project,{'provider':'mock'})
+            (d.namespace_project/'opencode.json').write_text(json.dumps(config))
+            d.fixtures['namespace-boundary']={'path':d.namespace_project,'config':config}
+            d.start('release',d.namespace_project)
             with mock.patch.object(d,'_auxiliary_bindings',return_value=[safety.MOCK_IDENTITY]*9):
                 d.spending_check(args=['spawn','--model',safety.MOCK_IDENTITY])
             self.assertEqual(d.provider_endpoints,d._validate_provider_config(config))

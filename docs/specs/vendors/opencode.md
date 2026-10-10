@@ -1303,8 +1303,18 @@ observations are labelled separately. No network-destination sampling can establ
 **Qualification plan amendment (owner ruling):** `via models` only lists
 models on an acquired server; it does not acquire one. For each required
 acquisition, the runner may submit one labelled
-`qualification-bootstrap-mock-only` turn to its owned loopback mock. Before
-the spawn it verifies the namespace configuration's credential-free provider
+`qualification-bootstrap-mock-only` turn to its owned loopback mock. The
+bootstrap, the namespace repository sentinel and the L11 metadata attempt use
+the state's small namespace project, `projects/<state name>` in the run root,
+as their `--cwd`. It is a private Git fixture outside every vendor HOME/XDG
+root, VIA state and runtime directory and other project; its creation and
+every `start` check that separation and block if it is violated. A vendor
+storage directory is never a turn's cwd, so step snapshots never include the
+vendor's own database, logs or snapshot store (an earlier runner used the
+namespace directory and produced `session.step.ended` `files` lists over the
+1 MiB event bound). VIA's own server still starts in the namespace directory
+(§3.2), and L11's direct seed server mirrors that. Before
+the spawn it verifies the namespace project configuration's credential-free provider
 shape, loopback-only endpoints, private environment allow-list and frozen mock
 model/auxiliary selectors. Every mock response (including an error) is held
 until pid/start-tick identity, the owned listener and §2 handshake are verified,
@@ -1380,7 +1390,7 @@ a failed write keeps the block and never interrupts process cleanup.
 **Qualification run-root amendment (owner, 2026-10-07; isolation ruling 2026-10-08):**
 Every vendor/VIA-visible controlled path lives under one fresh, owned 0700
 `via-oc-qual.*` root directly inside the invoking user's `XDG_RUNTIME_DIR`:
-fixture projects, namespace cwd, HOME/XDG/TMPDIR, all VIA states/runtime,
+fixture and namespace projects, HOME/XDG/TMPDIR, all VIA states/runtime,
 vendor namespaces, helpers, prompt/failpoint files and private copies of both
 VIA builds and the pinned vendor executable. No repository path is handed to
 them. System tools remain verified system executables. Only sanitized evidence

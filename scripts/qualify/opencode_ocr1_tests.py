@@ -1,4 +1,4 @@
-"""Review ocr1 regressions: lock evidence, diagnostic capture, spending latch (§13)."""
+"""Review ocr1 regressions: lock evidence, diagnostic capture, spending latch, layout (§13)."""
 import errno
 import json
 from pathlib import Path
@@ -276,6 +276,49 @@ class EventRetentionTests(unittest.TestCase):
             d.via.assert_any_call(['daemon','stop','--force'])
             self.assertIs(d._retain_event_failure(),error)
             self.assertEqual(written,['native-event-bound'])
+
+
+class LayoutTests(unittest.TestCase):
+    def driver(self,folder):
+        d=runtime.Driver('release','fp','pin',Path(folder)/'evidence')
+        for directory in (d.home,d.state,d.helpers):safety.private_directory(directory)
+        d.namespace,d.namespace_env=d._create_namespace()
+        return d
+
+    def test_namespace_project_is_separate_from_every_private_storage_root(self):
+        with tempfile.TemporaryDirectory() as folder:
+            d=self.driver(folder)
+            project=d._create_namespace_project()
+            self.assertEqual(project,d.namespace_project)
+            self.assertTrue((project/'.git').is_dir())
+            for root in (d.state,d.namespace,d.home,d.runtime,*map(Path,d.namespace_env.values())):
+                self.assertFalse(project.is_relative_to(root) or root.is_relative_to(project),root)
+            for overlap in (d.namespace,d.namespace/'project',Path(d.namespace_env['HOME'])/'p',
+                            d.state/'project',d.home/'project',d.work):
+                with self.subTest(overlap=overlap),self.assertRaisesRegex(safety.Blocked,'private storage'):
+                    d._check_project_separation(overlap)
+
+    def test_namespace_is_never_a_turn_cwd(self):
+        with tempfile.TemporaryDirectory() as folder:
+            d=self.driver(folder);d._create_namespace_project()
+            d.build=mock.Mock(side_effect=AssertionError('FAKE build reached'))
+            with self.assertRaisesRegex(safety.Blocked,'outside initialized private fixtures'):
+                d.start('release',d.namespace)
+            provider=mock.Mock(requests=0,admission_blocked=False,model_matches=True)
+            d._namespace_bootstraps[d.namespace_project]=({},provider)
+            d._bootstrap_static=mock.Mock(return_value={});d._verify=mock.Mock()
+            d._http=mock.Mock();d._observe_vendor=mock.Mock();d._host_record=mock.Mock(return_value={'owned':True})
+            d._vendor_sid=mock.Mock(return_value='ses_FAKE');d.spending_check=mock.Mock()
+            commands=[]
+            def via(args):
+                commands.append(args)
+                if args[0]=='spawn':return {'session_id':'s_FAKE','turn':'s_FAKE/1'}
+                return {'state':'completed'} if args[0]=='wait' else {}
+            d.via=mock.Mock(side_effect=via)
+            with self.assertRaises(safety.Blocked):d._bootstrap_vendor()
+            self.assertEqual(d.mock_providers,{})  # The cached namespace-project provider was reused.
+            spawn=next(args for args in commands if args[0]=='spawn')
+            self.assertEqual(spawn[spawn.index('--cwd')+1],str(d.namespace_project))
 
 
 if __name__=='__main__':

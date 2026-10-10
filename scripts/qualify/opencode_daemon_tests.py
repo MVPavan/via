@@ -310,7 +310,7 @@ class RealDaemonTests(unittest.TestCase):
             # A fresh FAKE provider creates the audit's loopback test peer;
             # the scripted vendor itself is not an HTTP model client.
             d._namespace_bootstraps.clear()
-            (d.namespace/'opencode.json').unlink()
+            (d.namespace_project/'opencode.json').unlink()
             replies.clear()
             try: d.ensure_vendor()
             finally:

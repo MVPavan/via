@@ -522,9 +522,10 @@ class ReadinessTests(unittest.TestCase):
 
     def test_bootstrap_store_ambiguity_blocks_instead_of_retrying(self):
         self.driver.namespace = Path(self.root.name)
+        self.driver.namespace_project = Path(self.root.name) / 'project'
         config = {}
         hold = mock.Mock(endpoint='http://127.0.0.1:1234/v1', requests=0)
-        self.driver._namespace_bootstraps[self.driver.namespace] = (config, hold)
+        self.driver._namespace_bootstraps[self.driver.namespace_project] = (config, hold)
         self.driver._bootstrap_static = mock.Mock(return_value={})
         self.driver.via = mock.Mock(side_effect=lambda args: {
             'session_id': 's_owned', 'turn': 's_owned/1'} if args[0]=='spawn' else {})

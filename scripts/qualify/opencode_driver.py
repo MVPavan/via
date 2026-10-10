@@ -327,6 +327,7 @@ class Driver:
         if self.pinned.is_relative_to(self.evidence):
             self.ownership.register(self.pinned,'helper',directory=False)
         self.env={}; self.namespace=None; self.namespace_env={}; self.inventory=None
+        self.namespace_project=None
         self.journal=safety.StopJournal(self.evidence.parent/'stopped-daemon.json',self.proc)
         self.mock_providers={}; self.last_model=None; self.last_request=None; self.last_cancel=None
         self._event_generation=None; self._sigkill_at=None; self._last_rotation=None
@@ -523,14 +524,40 @@ class Driver:
                   for key,part in safety.PRIVATE_PARTS.items()}
         self.env.update(PATH=path,LANG='C.UTF-8',VIA_STATE_DIR=str(self.state),
                         VIA_RUNTIME_DIR=str(self.runtime))
+        self._create_namespace_project()
         self._record('rg',rg_proof)
         # Inventory excludes helper rg's reviewed symlink; it covers Bun's HOME cache too.
-        self.inventory=safety.Inventory([self.namespace.parent,self.home,
+        self.inventory=safety.Inventory([self.namespace.parent,self.home,self.namespace_project,
                                         *(Path(value) for value in self.env.values()
                                           if value.startswith(str(self.work/'daemon-')))],
                                         embedded_runtime=self.embedded_runtime,git_templates=self.git_templates,
                                         record=lambda row:self._record('inventory-block',row))
         self.recover_stopped()
+
+    def _create_namespace_project(self):
+        """§13: the small project for bootstrap and other non-fixture turns.
+
+        It lies outside every vendor HOME/XDG, VIA state and runtime root, so no
+        session snapshot can include vendor or VIA storage."""
+        root=self._directory(self.work/'projects','vendor-private')
+        project=root/self.state.name
+        self._check_project_separation(project,projects=[row['path'] for row in self.fixtures.values()])
+        project=self.ownership.register(project,'vendor-private')
+        safety.init_fixture_repo(project,self.home)
+        self.namespace_project=project
+        return project
+
+    def _check_project_separation(self,project,*,projects=()):
+        """§13: a turn cwd never contains or lies in private storage; violation blocks."""
+        project=Path(project)
+        storage=[self.state,self.home,self.runtime,self.helpers,
+                 *(root.path for root in self.ownership.ordered() if root.state),
+                 *(Path(value) for key,value in self.env.items() if key in safety.PRIVATE_PARTS),
+                 *(Path(value) for value in self.namespace_env.values()),
+                 *([self.namespace] if self.namespace is not None else []),*map(Path,projects)]
+        for root in storage:
+            if project==root or project.is_relative_to(root) or root.is_relative_to(project):
+                raise Blocked('project overlaps private storage or another project')
 
     def _copy_programs(self):
         """Execute only private copies bound to the admitted source/build hashes (§13)."""
@@ -590,7 +617,8 @@ class Driver:
         return project
 
     def _refresh_inventory(self,extra=()):
-        roots=[self.namespace,self.home,*[Path(value) for key,value in self.env.items()
+        roots=[self.namespace,self.home,*([self.namespace_project] if self.namespace_project else []),
+               *[Path(value) for key,value in self.env.items()
                                          if key in safety.PRIVATE_PARTS],*extra]
         roots += [row['path']/'.opencode' for row in self.fixtures.values()]
         roots += [root.path/'vendor' for root in self.ownership.ordered()
@@ -619,15 +647,17 @@ class Driver:
         if self.daemon is not None: self._refresh_daemon(restart=False)
         if self.daemon is not None and self.phase_kind==kind:
             self._verify(self.daemon)
-            if project not in [row['path'] for row in self.fixtures.values()] and project!=self.namespace:
+            if project not in [row['path'] for row in self.fixtures.values()] and project!=self.namespace_project:
                 raise Blocked('project is outside initialized private fixtures')
+            self._check_project_separation(project)
             self.project=project
             item=next((row for row in self.fixtures.values() if row['path']==project),None)
             self.provider_endpoints={} if item is None else self._validate_provider_config(item['config'])
             return
         if self.daemon is not None: self.stop()
-        if project not in [item['path'] for item in self.fixtures.values()] and project!=self.namespace:
+        if project not in [item['path'] for item in self.fixtures.values()] and project!=self.namespace_project:
             raise Blocked('project is outside initialized private fixtures')
+        self._check_project_separation(project)
         self.build('release'); self.build('failpoints')
         safety.verify_binary(self.pinned)
         safety.validate_path(self.env['PATH'],self.helpers)
@@ -1443,7 +1473,7 @@ class Driver:
         if set(agents)!=required or any(row!={'model':safety.MOCK_IDENTITY} for row in agents.values()):
             raise Blocked('bootstrap auxiliary model selectors are not frozen')
         endpoints=self._validate_provider_config(config)
-        path=self.namespace/'opencode.json'
+        path=self.namespace_project/'opencode.json'
         if path.is_symlink() or not path.is_file() or path.stat().st_size>OBSERVATION_BYTES \
                 or self._json(path.read_bytes())!=config:
             raise Blocked('bootstrap namespace configuration drift')
@@ -1465,12 +1495,14 @@ class Driver:
         self._bootstrap_count+=1
         name='bootstrap-'+str(self._bootstrap_count)
         try:
-            cached=self._namespace_bootstraps.get(self.namespace)
+            project=self.namespace_project
+            if project is None: raise Blocked('bootstrap namespace project absent')
+            cached=self._namespace_bootstraps.get(project)
             # The sentinel may intentionally replace the namespace project
             # config. Reuse that registered fixture's provider; bootstrap
             # bookkeeping must never mask the case's effective configuration.
             namespace_fixture=next((row for row in self.fixtures.values()
-                                    if row['path']==self.namespace),None)
+                                    if row['path']==project),None)
             if namespace_fixture is not None:
                 config=namespace_fixture['config']
                 endpoints=self._validate_provider_config(config)
@@ -1478,21 +1510,21 @@ class Driver:
                          if value.endpoint==endpoints.get('oclive-mock')]
                 if len(matches)!=1: raise Blocked('bootstrap namespace mock provider ambiguous')
                 cached=(config,matches[0])
-                self._namespace_bootstraps[self.namespace]=cached
+                self._namespace_bootstraps[project]=cached
             if cached is None:
-                config=self._materialize_fixture(name,self.namespace,{'provider':'mock','response_hold':hold})
+                config=self._materialize_fixture(name,project,{'provider':'mock','response_hold':hold})
                 provider=self.mock_providers[name]
-                self._write_fixture_config(self.namespace,config,exclusive=True)
-                self._namespace_bootstraps[self.namespace]=(config,provider)
+                self._write_fixture_config(project,config,exclusive=True)
+                self._namespace_bootstraps[project]=(config,provider)
             else:
                 config,provider=cached
                 provider.response_hold=hold
                 requests_before=provider.requests
-            self.project=self.namespace
+            self.project=project
             self._bootstrap_config=config
             self.provider_endpoints=self._bootstrap_static(config)
             command=['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
-                     '--cwd',str(self.namespace),'--bound','full','--network','--background',
+                     '--cwd',str(project),'--bound','full','--network','--background',
                      '--label','qualification-bootstrap-mock-only','--prompt','Reply BOOTSTRAP.']
             self.last_model=safety.MOCK_IDENTITY
             self._bootstrap_command=command; self._bootstrap_active=True
@@ -3403,6 +3435,7 @@ def fail_closed(error,reached):
             self.namespace,self.namespace_env=self._create_namespace()
             safety.init_fixture_repo(self.namespace,self.home)
             self.env['VIA_STATE_DIR']=str(self.state)
+            self._create_namespace_project()
             self._refresh_inventory()
             return str(self.namespace)
         if kind=='fresh_max_steps': return self._fresh_max_steps(args['max_steps'])
@@ -3948,7 +3981,7 @@ def fail_closed(error,reached):
         safety.init_fixture_repo(nested,self.home)
         control=self._directory(outer/'walk-up-control','vendor-private')
         boundary_results=[]
-        projects=dict(zip(REPOSITORY_SENTINELS,(nested,control,self.namespace)))
+        projects=dict(zip(REPOSITORY_SENTINELS,(nested,control,self.namespace_project)))
         for name in REPOSITORY_SENTINELS:
             project=projects[name]
             self._directory(project/'.opencode','vendor-private')
@@ -4236,13 +4269,13 @@ def fail_closed(error,reached):
         return {'attempts':1,'observations':rows}
 
     def _credential_refusal(self):
-        self.start('release',self.namespace)
+        self.start('release',self.namespace_project)
         before=self._anchor_rows()
         # C1 §3.13 models only lists. A spawn runs §4.3's credential
         # handshake; the deliberately unoffered effort is a second, pre-native
         # refusal fence should the known-credential check unexpectedly admit.
         command=['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
-                 '--cwd',str(self.namespace),'--bound','full','--network',
+                 '--cwd',str(self.namespace_project),'--bound','full','--network',
                  '--effort',METADATA_EFFORT,'--background','--prompt','VIA FENCE ONLY','--json']
         def attempt():
             self._check_ancestors('metadata')

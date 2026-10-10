@@ -29,8 +29,9 @@ class Round44Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             d=runtime.Driver('release','fp','pin',Path(folder)/'evidence')
             d.namespace=Path(folder)/'namespace';d.namespace.mkdir()
+            d.namespace_project=Path(folder)/'project';d.namespace_project.mkdir()
             provider=mock.Mock(requests=0,admission_blocked=False,model_matches=True)
-            d._namespace_bootstraps[d.namespace]=({},provider)
+            d._namespace_bootstraps[d.namespace_project]=({},provider)
             d._bootstrap_static=mock.Mock(return_value={});d._verify=mock.Mock()
             d._http=mock.Mock();d._observe_vendor=mock.Mock();d._host_record=mock.Mock(return_value={'owned':True})
             d._vendor_sid=mock.Mock(return_value='ses_FAKE');d.spending_check=mock.Mock()

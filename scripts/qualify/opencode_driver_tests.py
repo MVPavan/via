@@ -587,7 +587,7 @@ class DriverTests(unittest.TestCase):
                     return config
                 original=d._bootstrap_static
                 def drift(config):
-                    if changed=='disk': (d.namespace/'opencode.json').write_text('{}')
+                    if changed=='disk': (d.namespace_project/'opencode.json').write_text('{}')
                     return original(config)
                 try:
                     with mock.patch.object(d,'_materialize_fixture',side_effect=mutated), \
