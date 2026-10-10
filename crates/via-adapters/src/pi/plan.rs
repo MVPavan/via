@@ -17,9 +17,9 @@ use crate::plan::{
     VersionStatus, effective_inherit,
 };
 
-/// Versions the maintainers' live check passed (C2 §5): none yet; every
+/// Versions the maintainers' live check passed (C2 §5); every other
 /// version is `untested` (packet §3, owner OD1).
-pub(crate) const CHECKED: &[&str] = &[];
+pub(crate) const CHECKED: &[&str] = &["1.0.2"];
 
 /// The values `--thinking` takes (packet §4.5, help 1.0.2).
 const EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -619,6 +619,16 @@ mod tests {
         for key in ["zz-option", "verbose", "pilot"] {
             assert!(!reserved_key(key), "{key}");
         }
+    }
+
+    /// C2 §5: a checked version is `tested`; any other, or none, is
+    /// `untested`.
+    #[test]
+    fn checked_versions_are_tested() {
+        assert_eq!(version_status(Some("1.0.2")), VersionStatus::Tested);
+        assert_eq!(version_status(Some("1.0.0")), VersionStatus::Untested);
+        assert_eq!(version_status(Some("1.0.3")), VersionStatus::Untested);
+        assert_eq!(version_status(None), VersionStatus::Untested);
     }
 
     /// Packet §4.5: only `provider/id` launches.
