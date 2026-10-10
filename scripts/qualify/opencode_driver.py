@@ -355,6 +355,7 @@ class Driver:
         self._phase_public_used=0
         self._timeline_lock=threading.RLock(); self._timelines=[]
         self.helper_channels={}; self.helper_generations={}; self.lifecycle_counter=0
+        self.helper_digests={}  # Content hash of each runner-written helper (§13 inventory).
         self.helper_origins={}; self.server_identities=set()
         self._server_roots=set();self._first_server_ticks=None;self._run_start_ticks=None
         self._lock_scan_exclusions=set(); self._lock_escape=None
@@ -2683,7 +2684,7 @@ class Driver:
         if point=='tool_after':
             # A second script step holds the live turn while the first helper's
             # observed post-spawn state supplies the after-point evidence.
-            helper=self._helper_fixture(project,'completed')
+            helper=self._live_helper(project,'completed')
             provider=self.mock_providers['l14-'+str(self.lifecycle_counter)+'-'+point]
             provider.script.append({'name':'shell','arguments':{'command':'/usr/bin/python3 '+str(helper)}})
             self._operation('helper_release',{'helper':'tool'})
@@ -2693,7 +2694,7 @@ class Driver:
             return
         if point.startswith(('location_shell_','session_shell_')):
             helperkind='location_shell' if point.startswith('location_') else 'session_shell'
-            helper=self._helper_fixture(project,helperkind)
+            helper=self._live_helper(project,helperkind)
             sid=self._vendor_sid(receipt['session_id'])
             path='/api/shell' if helperkind=='location_shell' else '/api/session/'+sid+'/shell'
             template='/api/shell' if helperkind=='location_shell' else '/api/session/{sessionID}/shell'
@@ -3021,8 +3022,13 @@ class Driver:
                         self._bootstrap_cleanup=False
                 # A close reply can prove this generation's clean idle end.
                 if self.daemon is not None:
-                    reply=self.via(['daemon','stop','--force'])
-                    if reply.get('exit_code'): raise Blocked('private daemon stop refused')
+                    try: reply=self.via(['daemon','stop','--force'])
+                    except Blocked as error:
+                        # §13: a block raised after the stop request (for example an
+                        # inventory difference) is kept, never skips the absence proof.
+                        close_error=close_error or error
+                    else:
+                        if reply.get('exit_code'): raise Blocked('private daemon stop refused')
         deadline=time.monotonic()+CLEANUP_SECONDS
         while time.monotonic()<deadline:
             locks=[self._lock_free(path) for path in self._lock_paths()]
@@ -3315,6 +3321,16 @@ def fail_closed(error,reached):
         code=code.replace('KIND',repr(kind)).replace('SEPARATE',repr(separate_group)).replace('OBSERVATIONS',repr(str(observations)))
         code=code.replace('BARRIER_SECONDS',str(barrier_seconds))
         path.write_text(code); path.chmod(0o500)
+        self.helper_digests[path]=hashlib.sha256(code.encode()).hexdigest()
+        return path
+
+    def _live_helper(self,project,kind):
+        """§13: a helper written during a live turn lands in an inventory root;
+        it is admitted by exact path and written content, and any other change
+        still blocks."""
+        if self.inventory is None: raise Blocked('private inventory unavailable')
+        path=self._helper_fixture(project,kind)
+        self.inventory.admit(path,self.helper_digests[path])
         return path
 
     def _helper_failure(self,row):

@@ -1946,7 +1946,12 @@ denied actions without an ask cannot pass this gate.
 
 The private binary/package inventory validates every supplied root and scans
 only the outermost roots, counting each entry once when namespace and vendor
-roots overlap. Its 100,000-entry bound remains unchanged.
+roots overlap. Its 100,000-entry bound remains unchanged. A helper the runner
+writes into a fixture during a live L14 turn (the `tool_after` and shell
+points) is admitted only when it is the single difference, at its exact path
+and with the hash of the content the runner wrote; any other difference still
+blocks. A block raised after the cleanup stop request is retained, but the
+process and lock absence proof still runs, so the run root can be removed.
 
 Mock-only error projection accepts a stored message up to the existing 16 MiB
 native-message input bound, while retaining at most 1 MiB of redacted error/log

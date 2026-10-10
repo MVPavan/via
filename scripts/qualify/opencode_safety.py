@@ -1386,6 +1386,24 @@ class Inventory:
             raise Blocked("new or changed binary appeared in private roots")
         return True
 
+    def admit(self, path, digest):
+        """§13: admit one helper the runner itself just wrote, by exact path and
+        content hash. Any other difference blocks exactly as check() does."""
+        after = self._snapshot()
+        changed = [key for key in self.before.keys() | after.keys()
+                   if self.before.get(key) != after.get(key)]
+        if len(changed) == 1:
+            key, = changed
+            value = after.get(key)
+            if key not in self.before and value is not None and value[0] != "metadata-only" \
+                    and value[-1] == digest \
+                    and self.roots[key[0]].absolute() / key[1] == Path(path).absolute():
+                self.before = after
+                self.before_metadata = dict(self.snapshot_metadata)
+                return True
+        self.check()
+        raise Blocked("runner helper admission unverifiable")
+
 
 class SpendingGuard:
     """Structural controls before every model-capable request; missing cost is null."""

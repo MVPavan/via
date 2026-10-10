@@ -488,7 +488,7 @@ class ReadinessTests(unittest.TestCase):
         self.driver.start = mock.Mock(); self.driver.ensure_vendor = mock.Mock()
         self.driver.via = mock.Mock(return_value={'session_id': 's_owned'})
         self.driver._operation = mock.Mock(return_value={'started': True, 'owned': True})
-        self.driver._helper_fixture = mock.Mock(return_value=project / 'helper')
+        self.driver._live_helper = mock.Mock(return_value=project / 'helper')
         self.driver._helper_folder = mock.Mock(return_value=folder)
         self.driver.mock_providers['l14-1-tool_after'] = mock.Mock(script=[])
         self.driver.helper_ledger[Identity(14, 4)] = {'kind': 'tool'}
