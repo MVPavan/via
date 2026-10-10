@@ -1467,7 +1467,8 @@ fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, Scenari
 /// running after the Store's bounded drain is pending work, so final
 /// shutdown is `incomplete` (exit 4) and its summary counts the step. A
 /// prompt over 256 KiB stalls its first blob step (`blob.step.stall`, the
-/// second of the run: the small turn's folder creation is the first);
+/// third of the run: the small spawn's `cwd` check and its turn's folder
+/// creation are the first two);
 /// the spawn fails `not_committed` at the 2 s bound; an idle stop then
 /// drops the Store with the step still held. A first small turn completes,
 /// so the run has turn evidence.
@@ -1491,8 +1492,9 @@ fn s1_daemon_stop_stalled_blob_step_is_not_a_clean_exit() -> TestResult {
                 .ok_or_else(|| infra("the state directory has no parent"))?;
             let failpoints = failpoints::Failpoints::new(root).map_err(infra)?;
             let point = "blob.step.stall";
-            // Step 1 creates the small turn's evidence folder (T4-fix).
-            failpoints.arm(point, 2, "pause").map_err(infra)?;
+            // Step 1 checks the small spawn's `cwd`; step 2 creates its
+            // turn's evidence folder (T4-fix).
+            failpoints.arm(point, 3, "pause").map_err(infra)?;
             let mut daemon =
                 Daemon::start_with(paths, evidence, |command| failpoints.activate(command))?;
             let receipted = paths.run(
@@ -1516,7 +1518,7 @@ fn s1_daemon_stop_stalled_blob_step_is_not_a_clean_exit() -> TestResult {
             let spawn = json!({"harness":"fake","model":"fake","prompt":"p".repeat(256 * 1024 + 1),"handle":format!("h_{}", "A".repeat(43))});
             let refused = raw.request("spawn", &spawn)?;
             failpoints
-                .wait_ack(point, 2, "pause", daemon.child.id(), FINAL_SHUTDOWN)
+                .wait_ack(point, 3, "pause", daemon.child.id(), FINAL_SHUTDOWN)
                 .map_err(infra)?;
             check(
                 refused["error"]["data"]["kind"] == "store_error"
@@ -1655,11 +1657,12 @@ fn stalled_step_is_counted(
 
 /// T4-fix (design §7.2): the turn folder's creation is an owned blob step.
 /// Held past 2 s, the second turn fails `store` before launch, and the
-/// held step is counted at shutdown. The first turn's folder is step 1.
+/// held step is counted at shutdown. The first spawn's `cwd` check and its
+/// turn's folder are steps 1 and 2.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_blob_stalled_evidence_folder_is_owned_until_shutdown() -> TestResult {
-    stalled_step_is_counted("s1_blob_stalled_evidence_folder", 2, |_, raw, _| {
+    stalled_step_is_counted("s1_blob_stalled_evidence_folder", 3, |_, raw, _| {
         let spawn = json!({"harness":"fake","model":"fake","prompt":"hello",
             "handle":format!("h_{}", "A".repeat(43))});
         let receipt = raw.request("spawn", &spawn)?;
@@ -1681,11 +1684,12 @@ fn s1_blob_stalled_evidence_folder_is_owned_until_shutdown() -> TestResult {
 
 /// T4-fix (design §4.4): `logs`'s `lstat`s are an owned blob step. Held
 /// past 2 s, `logs` answers `store_error`, and the held step is counted at
-/// shutdown. The first turn's folder is step 1.
+/// shutdown. The first spawn's `cwd` check and its turn's folder are steps
+/// 1 and 2.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_blob_stalled_logs_step_is_owned_until_shutdown() -> TestResult {
-    stalled_step_is_counted("s1_blob_stalled_logs", 2, |_, raw, session| {
+    stalled_step_is_counted("s1_blob_stalled_logs", 3, |_, raw, session| {
         let logs = raw.request("logs", &json!({"session":session}))?;
         check(logs["error"]["data"]["kind"] == "store_error", || {
             format!("a held logs step must answer store_error: {logs}")
@@ -1700,8 +1704,8 @@ fn s1_blob_stalled_logs_step_is_owned_until_shutdown() -> TestResult {
 /// never reaching a blob step; a `daemon/status` reports `free_bytes` and
 /// `below_free_floor` `null` without a free-space read
 /// (`store.statvfs.free_bytes`, counted). With both held, a new turn still
-/// gets its evidence folder and completes. The first turn's folder is
-/// step 1.
+/// gets its evidence folder and completes. The first spawn's `cwd` check
+/// and its turn's folder are steps 1 and 2.
 #[cfg(feature = "test-failpoints")]
 #[test]
 #[expect(
@@ -1758,7 +1762,7 @@ fn s1_blob_stalled_logs_are_capped_and_turns_still_start() -> TestResult {
             let mut raw = Raw::connect(&paths.runtime.join("via.sock"))?;
             let mut replies = Vec::new();
             let outcome = (|| {
-                for occurrence in [2, 3] {
+                for occurrence in [3, 4] {
                     failpoints.arm(point, occurrence, "pause").map_err(infra)?;
                     let held = raw.request("logs", &json!({"session":session}))?;
                     failpoints
@@ -1776,9 +1780,9 @@ fn s1_blob_stalled_logs_are_capped_and_turns_still_start() -> TestResult {
                     replies.push(held);
                 }
                 // Over the cap: refused before any blob step is admitted.
-                failpoints.arm(point, 4, "pause").map_err(infra)?;
+                failpoints.arm(point, 5, "pause").map_err(infra)?;
                 let over = raw.request("logs", &json!({"session":session}))?;
-                let reached = failpoints.ack_bytes(point, 4).is_ok();
+                let reached = failpoints.ack_bytes(point, 5).is_ok();
                 failpoints.disarm(point).map_err(infra)?;
                 replies.push(over.clone());
                 check(
@@ -1804,7 +1808,7 @@ fn s1_blob_stalled_logs_are_capped_and_turns_still_start() -> TestResult {
                     format!("a turn during held logs exited {}", second.status)
                 })
             })();
-            for occurrence in [2, 3, 4] {
+            for occurrence in [3, 4, 5] {
                 failpoints.release(point, occurrence).map_err(infra)?;
             }
             evidence

@@ -44,8 +44,9 @@ fn fixture(scripts: &[Value]) -> Value {
     json!({"scripts":scripts})
 }
 
-fn spawn_params(prompt: &str, handle: &str, key: &str) -> Value {
-    json!({"harness":"fake","model":"fake","prompt":prompt,"handle":handle,"idempotency_key":key})
+/// Keyed `spawn` params; `cwd` is explicit, as the CLI always sends one.
+fn spawn_params(prompt: &str, handle: &str, key: &str, cwd: &str) -> Value {
+    json!({"harness":"fake","model":"fake","prompt":prompt,"handle":handle,"idempotency_key":key,"cwd":cwd})
 }
 
 fn session_of(receipt: &Value) -> Result<String, ScenarioError> {
@@ -163,7 +164,11 @@ fn s1_f13_spawn_retry_after_lost_reply_replays_one_session() -> TestResult {
         evidence,
         |evidence| {
             let _daemon = Daemon::start(&sandbox, evidence)?;
-            let params = spawn_params("p1", HANDLE, "k-13");
+            let cwd = sandbox
+                .sync
+                .to_str()
+                .ok_or_else(|| failure("sync dir is not UTF-8"))?;
+            let params = spawn_params("p1", HANDLE, "k-13", cwd);
             Raw::open(&sandbox)?.send_and_drop(&request(7, "spawn", &params))?;
             await_count(&sandbox, "SELECT count(*) FROM sessions", 1)?;
             let retried = cli(
@@ -182,6 +187,8 @@ fn s1_f13_spawn_retry_after_lost_reply_replays_one_session() -> TestResult {
                     "k-13",
                     "--handle",
                     HANDLE,
+                    "--cwd",
+                    cwd,
                     "--background",
                     "--json",
                 ],
@@ -201,11 +208,11 @@ fn s1_f13_spawn_retry_after_lost_reply_replays_one_session() -> TestResult {
             for (name, line) in [
                 (
                     "changed_prompt",
-                    request(9, "spawn", &spawn_params("p2", HANDLE, "k-13")),
+                    request(9, "spawn", &spawn_params("p2", HANDLE, "k-13", cwd)),
                 ),
                 (
                     "other_handle",
-                    request(10, "spawn", &spawn_params("p1", OTHER_HANDLE, "k-13")),
+                    request(10, "spawn", &spawn_params("p1", OTHER_HANDLE, "k-13", cwd)),
                 ),
                 // Byte-identical params (C1 P4): whitespace alone is another request.
                 (
