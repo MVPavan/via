@@ -51,6 +51,57 @@ class LiveHelperTests(unittest.TestCase):
             self.assertTrue(d.inventory.check())
 
 
+class BootstrapProviderTests(unittest.TestCase):
+    """Each vendor acquisition's bootstrap has its own provider (64-connection ceiling)."""
+    def driver(self,folder):
+        d=runtime.Driver('release','fp','pin',Path(folder)/'evidence')
+        d.namespace=Path(folder)/'namespace';d.namespace.mkdir()
+        d.namespace_project=Path(folder)/'project';d.namespace_project.mkdir()
+        d._bootstrap_static=mock.Mock(return_value={});d._verify=mock.Mock()
+        d._http=mock.Mock();d._observe_vendor=mock.Mock();d._host_record=mock.Mock(return_value={'owned':True})
+        d._vendor_sid=mock.Mock(return_value='ses_FAKE');d.spending_check=mock.Mock()
+        d._write_fixture_config=mock.Mock()
+        d._validate_provider_config=lambda config:{'oclive-mock':config['endpoint']}
+        self.used=[]
+        def materialize(name,project,description):
+            provider=mock.Mock(requests=0,admission_blocked=False,model_matches=True,endpoint='FAKE-'+name)
+            d.mock_providers[name]=provider
+            return {'endpoint':provider.endpoint}
+        d._materialize_fixture=mock.Mock(side_effect=materialize)
+        def via(args):
+            if args[0]=='spawn':return {'session_id':'s_FAKE','turn':'s_FAKE/1'}
+            if args[0]=='wait':
+                provider=next(row for row in d.mock_providers.values()
+                              if row.endpoint==d._bootstrap_config['endpoint'])
+                provider.requests+=2;self.used.append(provider.endpoint)
+                return {'state':'completed'}
+            return {}
+        d.via=mock.Mock(side_effect=via)
+        return d
+
+    def sentinel(self,d):
+        provider=mock.Mock(requests=0,admission_blocked=False,model_matches=True,endpoint='FAKE-sentinel')
+        d.mock_providers['namespace-boundary']=provider
+        config={'endpoint':provider.endpoint}
+        d.fixtures['namespace-boundary']={'path':d.namespace_project,'config':config}
+        return config,provider
+
+    def test_bootstraps_after_the_namespace_sentinel_use_fresh_providers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            d=self.driver(folder);self.sentinel(d)
+            for _ in range(3):d._bootstrap_vendor();d._bootstrap_session=None
+            self.assertEqual(self.used,['FAKE-bootstrap-1','FAKE-bootstrap-2','FAKE-bootstrap-3'])
+            # The registered namespace configuration follows what is on disk.
+            self.assertEqual(d.fixtures['namespace-boundary']['config'],{'endpoint':'FAKE-bootstrap-3'})
+
+    def test_sentinel_prepared_provider_serves_only_its_own_acquisition(self):
+        with tempfile.TemporaryDirectory() as folder:
+            d=self.driver(folder);config,provider=self.sentinel(d)
+            d._namespace_bootstraps[d.namespace_project]=(config,provider)
+            for _ in range(2):d._bootstrap_vendor();d._bootstrap_session=None
+            self.assertEqual(self.used,['FAKE-sentinel','FAKE-bootstrap-2'])
+
+
 class CleanupAfterStopBlockTests(unittest.TestCase):
     def test_block_after_daemon_stop_request_keeps_the_absence_proof(self):
         import opencode_daemon_tests as daemontests

@@ -1303,7 +1303,11 @@ observations are labelled separately. No network-destination sampling can establ
 **Qualification plan amendment (owner ruling):** `via models` only lists
 models on an acquired server; it does not acquire one. For each required
 acquisition, the runner may submit one labelled
-`qualification-bootstrap-mock-only` turn to its owned loopback mock. The
+`qualification-bootstrap-mock-only` turn to its owned loopback mock. Each
+acquisition's bootstrap has its own mock provider, written into the namespace
+project configuration, so no provider's 64-connection transport ceiling spans
+the run; only an acquisition for the namespace sentinel's own turn reuses that
+fixture's provider. The
 bootstrap, the namespace repository sentinel and the L11 metadata attempt use
 the state's small namespace project, `projects/<state name>` in the run root,
 as their `--cwd`. It is a private Git fixture outside every vendor HOME/XDG

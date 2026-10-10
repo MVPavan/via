@@ -1520,25 +1520,19 @@ class Driver:
         try:
             project=self.namespace_project
             if project is None: raise Blocked('bootstrap namespace project absent')
-            cached=self._namespace_bootstraps.get(project)
-            # The sentinel may intentionally replace the namespace project
-            # config. Reuse that registered fixture's provider; bootstrap
-            # bookkeeping must never mask the case's effective configuration.
+            # §13: each vendor acquisition's bootstrap has its own provider, so
+            # no provider's 64-connection transport ceiling spans the run. A
+            # provider prepared for the next acquisition (the namespace
+            # sentinel's fixture) serves that one acquisition only.
+            cached=self._namespace_bootstraps.pop(project,None)
             namespace_fixture=next((row for row in self.fixtures.values()
                                     if row['path']==project),None)
-            if namespace_fixture is not None:
-                config=namespace_fixture['config']
-                endpoints=self._validate_provider_config(config)
-                matches=[value for value in self.mock_providers.values()
-                         if value.endpoint==endpoints.get('oclive-mock')]
-                if len(matches)!=1: raise Blocked('bootstrap namespace mock provider ambiguous')
-                cached=(config,matches[0])
-                self._namespace_bootstraps[project]=cached
             if cached is None:
                 config=self._materialize_fixture(name,project,{'provider':'mock','response_hold':hold})
                 provider=self.mock_providers[name]
-                self._write_fixture_config(project,config,exclusive=True)
-                self._namespace_bootstraps[project]=(config,provider)
+                self._write_fixture_config(project,config)
+                # The registered namespace configuration follows what is on disk.
+                if namespace_fixture is not None: namespace_fixture['config']=config
             else:
                 config,provider=cached
                 provider.response_hold=hold
@@ -4030,6 +4024,9 @@ def fail_closed(error,reached):
             config=self._materialize_fixture(name,project,{'provider':'mock'})
             self._write_fixture_config(project,config)
             self.fixtures[name]={'path':project,'config':config}
+            if project==self.namespace_project:
+                # An acquisition for this sentinel turn must not replace its config.
+                self._namespace_bootstraps[project]=(config,self.mock_providers[name])
             self._refresh_inventory([project/'.opencode'])
             self._mock_turn(project,'Read the project instructions and reply READY.')
             provider=self.mock_providers[name]
