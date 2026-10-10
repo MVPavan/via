@@ -45,8 +45,20 @@ CC_x86_64_unknown_linux_musl=musl-gcc \
 # binary: target/x86_64-unknown-linux-musl/release/via (static-pie, no shared libraries)
 ```
 
-Copy the binary anywhere on your `PATH`. One binary contains both the CLI and
-the daemon.
+`scripts/build-release.sh` (run from the repository root) does this build,
+checks the binary is static, runs `scripts/check-release-features.py` (no
+test failpoints in the release), checks `via --version` against the crate
+version, and writes `dist/via-<version>-x86_64-unknown-linux-musl` with a
+`.sha256` beside it.
+
+Install by copying the binary into a directory on your `PATH`, for example:
+
+```bash
+install -m 755 dist/via-<version>-x86_64-unknown-linux-musl ~/.local/bin/via
+via --version
+```
+
+One binary contains both the CLI and the daemon.
 
 ## Prerequisites
 
@@ -124,7 +136,7 @@ between stdin/stdout and the daemon socket.
 | Claude Code | `claude` | `claude-cli` | `sonnet` (default), `opus`, `haiku`, or a Claude model ID passed through unchanged | 2.1.285, 2.1.289, 2.1.290 |
 | Codex | `codex` | `codex-app-server` | a Codex model name, e.g. `gpt-6-luna`; judged against the catalog the Codex server reports | 0.159.2, 0.160.0, 0.160.1 |
 | OpenCode | `opencode` | `opencode-serve` | `provider/id` as OpenCode names it; no default | 2.0.22 (the only version that runs) |
-| Pi | `pi` | `pi-rpc` | `provider/id`, e.g. `openai/gpt-6-luna`; a bare `gpt-6-luna` is refused | none yet: every run warns `vendor_version_untested` |
+| Pi | `pi` | `pi-rpc` | `provider/id`, e.g. `openai/gpt-6-luna`; a bare `gpt-6-luna` is refused | 1.0.2 |
 
 - `via spawn` requires `--model`. `via describe` accepts `--model` alone and
   picks the harness whose catalog lists it (`--model openai/gpt-6-luna`
@@ -502,7 +514,7 @@ Warnings appear in receipts, envelopes and `status`. None of them stops a turn.
 
 | Code | Meaning and action |
 |---|---|
-| `vendor_version_untested` | the installed vendor version is not in the checked set (always on Pi in this release). It runs; prefer a checked version if you see odd behaviour |
+| `vendor_version_untested` | the installed vendor version is not in the checked set. It runs; prefer a checked version if you see odd behaviour |
 | `config_switch_unverified` | VIA could not apply or verify an inherited-configuration setting (hooks, MCP servers, plugins, skills, agents, instruction files). `data.categories` lists `{category, requested, effective}`; your own vendor configuration may apply |
 | `vendor_passthrough` | the session passes raw vendor arguments after `--`; VIA's guarantees depend on them |
 | `instructions_partial` | the route prepended `--instructions` to the prompt instead of using a native system prompt |

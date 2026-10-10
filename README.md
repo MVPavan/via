@@ -37,7 +37,8 @@ cargo build --release --locked
 # binary: target/release/via
 ```
 
-A fully static binary (musl) is described in the [user guide](docs/usage.md#install).
+A fully static binary (musl) is built and verified by `scripts/build-release.sh`;
+see the [user guide](docs/usage.md#install).
 Install and log in to each harness CLI you want to use; VIA never handles
 credentials.
 
