@@ -197,7 +197,7 @@ class ReadinessTests(unittest.TestCase):
         self.driver.via.assert_called_once()
         self.assertEqual(self.clock[0],0)
 
-    def publication(self,die):
+    def publication(self,die,killed=False):
         d=self.driver; current=Identity(13,4)
         if die: d.vendor_identity=current
         provider=SimpleNamespace(); threads=[]; errors=[]; verified=threading.Event()
@@ -226,6 +226,14 @@ class ReadinessTests(unittest.TestCase):
         try:
             d._prepare_lifecycle('publication')
             self.assertTrue(verified.wait(1))
+            if killed:
+                # L14 SIGKILLed this generation's anchor; its dying vendor is
+                # neither verifiable nor yet proven gone.
+                d._killed_anchor=d.anchor
+                d.proc.verify.side_effect=Blocked('FAKE dying vendor')
+                d.proc.gone=mock.Mock(return_value=False)
+                threads[0].join(1)
+                self.assertFalse(threads[0].is_alive())
             if die:
                 d.proc.alive.return_value=False
                 threads[0].join(1)
@@ -243,6 +251,9 @@ class ReadinessTests(unittest.TestCase):
 
     def test_publication_intentional_vendor_death_ends_hold_without_refusal(self):
         self.publication(True)
+
+    def test_publication_hold_ends_without_refusal_once_its_anchor_is_killed(self):
+        self.publication(False,killed=True)
 
     def setUp(self):
         self.root = tempfile.TemporaryDirectory(prefix='via-ocreadiness-')

@@ -2652,7 +2652,10 @@ class Driver:
                     # Publish only that completed observation, never a stale
                     # field left over from the retired predecessor.
                     if not verified.is_set(): continue
-                    identity=generation[0]
+                    identity,anchor=generation[0]
+                    # L14 SIGKILLed this generation's anchor: its vendor is dying
+                    # with it, so its checks can fail before exit is proven.
+                    if anchor is not None and self._killed_anchor==anchor: return
                     alive=self.proc.alive(identity)
                     if alive is False: return  # L14 intentionally killed this generation.
                     if alive is None: raise safety.process_block('vendor',None,'publication vendor identity unverifiable')
@@ -2670,7 +2673,7 @@ class Driver:
         self.ensure_vendor()
         if point=='publication':
             if self.vendor_identity is None: raise Blocked('publication verified vendor identity absent')
-            generation.append(self.vendor_identity); verified.set()
+            generation.append((self.vendor_identity,self.anchor)); verified.set()
             self._await_owned(lambda:True if self._publication_entered.is_set() else None,
                               'publication model request unobserved')
             return
