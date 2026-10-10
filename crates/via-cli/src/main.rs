@@ -657,9 +657,15 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     if let Some(path) = args.instructions {
         params["instructions"] = json!({"path":absolute(&path, "instructions")?});
     }
-    if let Some(cwd) = args.cwd {
-        params["cwd"] = json!(absolute(&cwd, "cwd")?);
-    }
+    // A new session without `--cwd` runs in the caller's directory, not
+    // the daemon's.
+    let cwd = match args.cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| client::RequestError::invalid_params("cwd", error.to_string()))?,
+    };
+    params["cwd"] = json!(absolute(&cwd, "cwd")?);
     if !args.require.is_empty() {
         params["require"] = json!(args.require);
     }

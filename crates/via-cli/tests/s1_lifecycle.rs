@@ -1227,6 +1227,65 @@ fn foreground_spawn_waits_past_one_wait_bound() -> TestResult {
     })
 }
 
+/// C1 §4 `cwd`: a `spawn` without `--cwd` runs in the caller's directory,
+/// canonicalised, not the daemon's. The daemon is started from one
+/// directory; the session is spawned from a symlink to another.
+#[test]
+fn spawn_without_cwd_uses_the_callers_directory() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&completes("here", 1))?;
+        let [daemon_dir, caller_dir] =
+            ["daemon-dir", "caller-dir"].map(|name| sandbox.root.path().join(name));
+        for dir in [&daemon_dir, &caller_dir] {
+            fs::DirBuilder::new().mode(0o700).create(dir)?;
+        }
+        let link = sandbox.root.path().join("caller-link");
+        std::os::unix::fs::symlink(&caller_dir, &link)?;
+        let mut start = sandbox.command();
+        start.args(["list", "--json"]).current_dir(&daemon_dir);
+        let started = run_command(&mut start, Duration::from_secs(60))?;
+        check(started.status.success(), || {
+            format!("list exited {}", started.status)
+        })?;
+        let mut spawn = sandbox.command();
+        spawn
+            .args([
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "here",
+                "--background",
+                "--json",
+            ])
+            .current_dir(&link);
+        let spawned = run_command(&mut spawn, Duration::from_secs(60))?;
+        let receipt: Value = serde_json::from_slice(&spawned.stdout)?;
+        let session = receipt["session_id"]
+            .as_str()
+            .ok_or_else(|| format!("no receipt: {}", String::from_utf8_lossy(&spawned.stderr)))?;
+        let envelope = sandbox.wait(&format!("{session}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        let status = sandbox.ok(&["status", session, "--json"])?;
+        let expected = fs::canonicalize(&caller_dir)?;
+        check(
+            status["cwd"] == expected.to_str().ok_or("not UTF-8")?,
+            || {
+                format!(
+                    "session cwd {} is not {}",
+                    status["cwd"],
+                    expected.display()
+                )
+            },
+        )?;
+        let daemon = sandbox.status()?;
+        let pid = u32::try_from(daemon["pid"].as_u64().ok_or("status has no pid")?)?;
+        sandbox.stop_auto(sandbox.command(), pid)
+    })
+}
+
 /// F1 (design §6.1): two auto-starts at once make one daemon. The first
 /// CLI's daemon holds `daemon.lock` at `daemon.startup.after_lock`; a
 /// daemon started meanwhile exits 75 after one line; the second CLI's own
