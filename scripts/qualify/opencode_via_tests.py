@@ -123,6 +123,7 @@ class ViaFixture:
             return result
         self.driver.execute=observed
         self.patches = contextlib.ExitStack()
+        self.expect_spending_latch = False
 
     def __enter__(self):
         digest = safety.sha256(self.program)
@@ -154,7 +155,14 @@ class ViaFixture:
     def __exit__(self, *_args):
         try:
             if self.driver.daemon is not None:
-                proof = self.driver.finish()
+                try: proof = self.driver.finish()
+                except safety.Blocked as error:
+                    # §13: a test that deliberately latched spending control
+                    # still requires the same completed stop proof.
+                    if not self.expect_spending_latch or self.driver.guard.stopped is not True \
+                            or str(error) != 'spending control latched during qualification':
+                        raise
+                    proof = self.driver.stop_result
                 if proof['processes_gone'] is not True:
                     raise AssertionError('FAKE audit processes not proven gone')
             else:
@@ -489,6 +497,7 @@ class RealViaTests(unittest.TestCase):
                 self.assertTrue(d.guard.stopped)
                 self.assertEqual(d.phase_public_left,0)
                 self.assertEqual(d.phase_mock_left,31)
+                fixture.expect_spending_latch=True
 
     def test_models_only_lists_and_unoffered_effort_retires_the_acquisition(self):
         for kind in ('release','failpoints'):

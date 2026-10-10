@@ -5,7 +5,7 @@ ANCESTRY_ROWS=1000  # §13 L14: bounded, re-verified metadata lineage; no enviro
 COMM_BYTES=64  # §13 L14: export a fixed class, never an arbitrary process name.
 
 
-def historical_exception(proc,identity,roots,first_server_ticks,run_start_ticks):
+def historical_exception(proc,identity,roots,first_server_ticks,run_start_ticks,guard=None):
     """Prove strict pre-run birth and exclusion from every registered server tree (§13)."""
     if type(first_server_ticks) is not int or type(run_start_ticks) is not int \
             or identity.start_ticks>=min(first_server_ticks,run_start_ticks):
@@ -14,6 +14,7 @@ def historical_exception(proc,identity,roots,first_server_ticks,run_start_ticks)
     proc.verify(identity)
     rows=[];seen=set();pid=identity.pid
     for _ in range(ANCESTRY_ROWS):
+        if guard is not None:guard()  # §13: deadline, interruption and aggregate work.
         if pid in seen:raise safety.Blocked('historical lock-scan ancestry cycle')
         seen.add(pid)
         row=proc.stat(pid)

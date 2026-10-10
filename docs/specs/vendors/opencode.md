@@ -1369,7 +1369,13 @@ are included. Each provider also has at most 64 handled connections (16 active,
 5 s header/body deadline), and exceeding that transport ceiling blocks closure.
 Final receipts distinguish received, admitted, refused and admitted responses
 left unreleased by the bootstrap barrier. Retries never become completed-turn
-or gate evidence and never consume the public free-turn budget.
+or gate evidence and never consume the public free-turn budget. A latched
+spending stop (ceiling exhaustion, an unexpected mock identity, a request after
+the phase deadline or during metadata acquisition), or any provider refusal or
+admission failure, fails cleanup after all processes and providers are stopped,
+whatever the case outcomes: such a run is blocked, never `pass` or
+`diagnostic_pass`. Evidence for an owned SSE bound failure is written once;
+a failed write keeps the block and never interrupts process cleanup.
 
 **Qualification run-root amendment (owner, 2026-10-07; isolation ruling 2026-10-08):**
 Every vendor/VIA-visible controlled path lives under one fresh, owned 0700
@@ -1433,9 +1439,21 @@ providers, helpers/authentication, the VIA seams, the bounded long run, anchor
 lifetimes and credential seeding; public free/result/continuity/cancel cases
 cannot be selected. No diagnostic selection qualifies the route.
 Only enrolled mock sessions may export bounded native error names
-and messages and relevant private vendor log lines. Replace the private run-root
-path and every password/bearer representation before the protected evidence
-write, then run the ordinary whole-root secrecy scan. Public-free sessions
+and messages and relevant private vendor log lines. Errors come only from the
+documented native locations, the message `error` and a tool part's
+`state.error`, never from arguments, outputs or other payloads; at most 1,024
+are exported. Message `seq` must be an integer. Sizes are read with SQL
+`octet_length()` before a body is fetched (16 MiB each, 256 MiB aggregate),
+rows are streamed, and the discovery walk is bounded (100,000 entries, 1,024
+sources). Each log is read once up to the size observed when it was opened
+(16 MiB each, 128 MiB aggregate); later vendor growth is not read. A log is
+named only by a hashed `vendor-log-<16 hex>` identifier. Replace the private
+run-root path and every password/bearer representation before the protected
+evidence write. One shared check then searches each text and the whole
+assembled record, case-folded, in raw, repeatedly percent-decoded, JSON-escaped
+and `\u`-escaped views, for the run root and the raw, Base64 and hex forms of
+every protected value; a residual or a view still changing after eight rounds
+blocks. Then run the ordinary whole-root secrecy scan. Public-free sessions
 retain only closed projections, never this text. Diagnostic runs retain the
 ordinary identity, ancestor, spending and cleanup proofs and report
 `diagnostic_pass` separately from qualification (exit 4, versus qualification
@@ -1443,7 +1461,9 @@ pass exit 0 or block/failure exit 1). Every diagnostic summary records the exact
 runner source manifest/hash. Mock diagnostics check case-folded URL-decoded
 text for any remaining private run root after redaction; ambiguity blocks.
 Error log lines associated only by an enrolled location boot are labelled
-`location-context`, rather than claiming session attribution.
+`location-context`, rather than claiming session attribution. The boot line's
+`directory` field must equal an enrolled location exactly; a prefix does not
+match.
 The usage/cache fixture uses a 32,768-token mock context to measure its scripted
 tool steps without triggering automatic compaction first. L7's separate mock
 fixture retains its small context. The first mock-only usage diagnostic showed
@@ -1842,8 +1862,16 @@ roots remain fixed across generations and namespace rotations. Exclusions
 record PID, start ticks, fixed comm class and errno, as record-only findings.
 Unknown ancestry or liveness blocks; pidfd-proven absence can be skipped.
 A process directory disappearing before the uid snapshot is absent; a reused
-PID is rescanned once using the replacement identity, never omitted. A second
-identity change blocks. Readable outsiders holding the lock always fail.
+PID is rescanned once using the replacement identity, never omitted. That
+includes a replacement first noticed by the liveness check after a read error:
+liveness `False` is re-read, and only a saved identity that is gone, not
+replaced, counts as exit. A second identity change blocks. Readable outsiders
+holding the lock always fail: the first verified non-anchor `FLOCK` line is an
+immediate, irreversible case failure (`lock-scan-escape` record). A later read
+error, exit, exclusion or rescan of that process cannot discard it, and every
+later scan in the run fails the same way. Each scan checks the phase deadline
+(clipped to 60 s) and deferred interruption at every process, descriptor and
+ancestry read, within 500,000 such reads; a scan that cannot finish blocks.
 
 L11 seeds the registered loopback mock integration, not an unknown integration
 ID: pinned `Integration.list` enumerates registered integrations (byte
@@ -1853,7 +1881,9 @@ seed server starts, so both that server and the subsequent VIA-owned server
 see the same integration. The integration read before credential creation must show no connections;
 the read afterwards must show exactly one new `oclive-mock` connection with
 `type: credential` and `label: VIA synthetic fixture`. Any pre-existing,
-additional or differently labelled connection blocks. No model request is
+additional or differently labelled connection blocks. The synthetic value must
+be absent from the raw response and from its decoded values, under the same
+representation-aware check as mock diagnostics. No model request is
 admitted in this phase.
 
 Cleanup's embedded-runtime provenance checks retain their own bounded search

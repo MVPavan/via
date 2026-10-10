@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import opencode_cases as cases
 import opencode_driver as runtime
 import opencode_safety as safety
 
@@ -73,5 +74,5 @@ class LockScopeTests(unittest.TestCase):
 
     def test_readable_old_process_cannot_hold_the_lock(self):
         d,anchor,listing=self.fixture_scan(readable=True,holds_lock=True)
-        with mock.patch.object(Path,'iterdir',listing),self.assertRaisesRegex(safety.Blocked,'escaped anchor'):
+        with mock.patch.object(Path,'iterdir',listing),self.assertRaisesRegex(cases.QualificationFailure,'escaped anchor'):
             d._lock_holders(anchor)

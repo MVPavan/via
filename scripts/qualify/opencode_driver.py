@@ -44,6 +44,12 @@ from opencode_c1 import (TERMINAL_STATES, SCOPES, CANCEL_OUTCOMES, CLEANUP_STATE
 from opencode_runroot import ANCHOR_SOCKET_TAIL, SOCKET_BYTES
 
 Blocked = safety.Blocked
+
+
+class _LockScanStop(Blocked):
+    """§13 L14: lock-scan deadline, interruption or work bound; never a process fact."""
+
+
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
 OBSERVATION_BYTES = 16 * 1024 * 1024
 EVIDENCE_BYTES = 256 * 1024 * 1024
@@ -58,6 +64,8 @@ CLOSE_REPLY_SECONDS = 40  # CLI close: default 10 s close + 30 s terminal read a
 FOREGROUND_WAIT_SECONDS = 180  # §13: same ceiling as this runner's explicit wait calls.
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
 IDLE_RETIREMENT_SECONDS = 90  # §13: natural exit of each process, clipped to its phase.
+LOCK_SCAN_SECONDS = 60  # §13 L14: one same-uid lock scan, clipped to its phase deadline.
+LOCK_SCAN_WORK = 500000  # §13 L14: process, descriptor and ancestry reads per scan.
 CLEANUP_SECONDS = 180  # §13: bounded mock abort/retries, then natural daemon idle shutdown.
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
@@ -299,6 +307,7 @@ class Driver:
         self.identities=set(); self.uncertain=[]; self.build_hashes={}; self.handles={}
         self.bearer_forms=set()
         self.events=[]; self.events_error=None; self._event_failure=None; self._event_stop=threading.Event()
+        self._event_retention_error=None
         self._event_thread=None; self._event_conn=None; self._events_lock=threading.Lock()
         self.counter=0; self.owned_replies=[]; self.secret_forms=[]; self._armed={}
         self._record_lock=threading.RLock()
@@ -330,7 +339,7 @@ class Driver:
         self.helper_channels={}; self.helper_generations={}; self.lifecycle_counter=0
         self.helper_origins={}; self.server_identities=set()
         self._server_roots=set();self._first_server_ticks=None;self._run_start_ticks=None
-        self._lock_scan_exclusions=set()
+        self._lock_scan_exclusions=set(); self._lock_escape=None
         self.fake_gate_manifest=None
         self._armed_history=set()
         self._seam_targets={}
@@ -1959,8 +1968,14 @@ class Driver:
         with self._events_lock: failure=self._event_failure
         if failure is not None:
             error,replies=failure
-            if hasattr(error,'event_bound'):
-                self._record('native-event-bound',error.event_bound)
+            if hasattr(error,'event_bound') and not getattr(error,'event_bound_retained',False):
+                # Idempotent: one attempt per failure. A failed write keeps the
+                # block for the caller and never interrupts process cleanup.
+                error.event_bound_retained=True
+                try: self._record('native-event-bound',error.event_bound)
+                except BaseException as publication:
+                    error.reply_retention_failed=True
+                    if self._event_retention_error is None: self._event_retention_error=publication
             self.reply_evidence.block(error,replies)
             return error
 
@@ -2383,12 +2398,37 @@ class Driver:
 
     def _lock_holders(self,anchor):
         """Read same-uid fdinfo lock metadata only, never unrelated environments."""
+        from opencode_cases import QualificationFailure
+        if self._lock_escape is not None:
+            raise QualificationFailure('namespace lock escaped anchor')  # Irreversible (§13 L14).
         path=self.namespace/'server.lock'
         try: row=path.stat()
         except OSError as error: raise Blocked('namespace lock missing') from error
         lockid=f'{os.major(row.st_dev):02x}:{os.minor(row.st_dev):02x}:{row.st_ino}'
+        deadline=min(self.phase_deadline or float('inf'),time.monotonic()+LOCK_SCAN_SECONDS)
+        work=0
+        def tick():
+            # §13: an exhaustive proof that cannot finish within its bounds blocks.
+            nonlocal work
+            work+=1
+            try:
+                if work>LOCK_SCAN_WORK: raise Blocked('lock scan work bound')
+                if self.signals: self.signals.guard()
+                if time.monotonic()>=deadline: raise Blocked('lock scan deadline')
+            except Blocked as error:
+                raise _LockScanStop(str(error)) from error
+        def escaped(identity):
+            # A verified non-anchor FLOCK holder is positive evidence: it fails
+            # at once, and no later read error, exit or rescan can discard it.
+            self._lock_escape=identity.report()
+            failure=QualificationFailure('namespace lock escaped anchor')
+            try: self._record('lock-scan-escape',{**identity.report(),'role':self._process_role(identity)})
+            except Blocked: failure.retention_failed=True
+            return failure
         holders=[]
+        tick()
         for directory in self.proc.root.iterdir():
+            tick()
             if not directory.name.isdigit(): continue
             for scan_attempt in range(2):
                 identity=None
@@ -2397,8 +2437,9 @@ class Driver:
                     before=self.proc.stat(int(directory.name))
                     if before is None: break
                     identity=safety.Identity(before['pid'],before['start_ticks'])
-                    found=[]
+                    found=False
                     for fdinfo in (directory/'fdinfo').iterdir():
+                        tick()
                         name='fdinfo/'+fdinfo.name
                         try: raw=self.proc.read(identity,name)
                         except (OSError,Blocked) as error:
@@ -2409,24 +2450,25 @@ class Driver:
                                 continue  # A verified closed descriptor cannot retain the lock.
                             raise
                         if any(lockid.encode() in line and b'FLOCK' in line for line in raw.splitlines()):
-                            found.append(identity.report())
+                            if identity!=anchor: raise escaped(identity)
+                            found=True
                     self.proc.verify(identity)
-                    holders.extend(found)
+                    if found: holders.append(identity.report())
                     break
                 except (OSError,Blocked) as error:
+                    if isinstance(error,_LockScanStop): raise
                     # A present stat can describe an exited process. Only pidfd-
                     # grounded False permits skipping; hidden/live directories block.
                     cause=error if isinstance(error,OSError) else error.__cause__
                     if identity is None and isinstance(cause,OSError) and cause.errno in {errno.ENOENT,errno.ESRCH} \
                             and cause.filename==str(directory):
                         break  # Process directory disappeared before the uid snapshot.
-                    if identity is not None:
-                        current=self.proc.stat(identity.pid)
-                        if current is not None and current['start_ticks']!=identity.start_ticks:
-                            if scan_attempt==0:continue  # Inspect the replacement once; never omit its descriptors.
-                            raise Blocked('lock descriptor process identity changed twice') from error
-                    alive=self.proc.alive(identity) if identity is not None else None
-                    if alive is False:break
+                    state=self._saved_identity_state(identity) if identity is not None else None
+                    if state=='replaced':
+                        if scan_attempt==0:continue  # Inspect the replacement once; never omit its descriptors.
+                        raise Blocked('lock descriptor process identity changed twice') from error
+                    if state=='exited':break
+                    alive=True if state=='alive' else None
                     role=self._process_role(identity) if identity is not None else 'host'
                     os_error=safety.os_error_record(error)
                     if identity is not None and alive is True and role=='host' and os_error is not None:
@@ -2434,8 +2476,9 @@ class Driver:
                         try:
                             outside=historical_exception(self.proc,identity,
                                 self._server_roots|{anchor}|({self.vendor_identity} if self.vendor_identity else set()),
-                                self._first_server_ticks,self._run_start_ticks)
-                        except Blocked:
+                                self._first_server_ticks,self._run_start_ticks,guard=tick)
+                        except Blocked as lineage:
+                            if isinstance(lineage,_LockScanStop): raise
                             outside=None  # Ambiguous lineage never permits an unreadable process.
                         if outside is not None:
                             key=(identity,os_error['errno'])
@@ -2450,9 +2493,23 @@ class Driver:
                     raise safety.process_block(role,alive,'same-uid lock descriptor scan unverifiable') from error
         unique={tuple(sorted(row.items())) for row in holders}
         holders=[dict(row) for row in unique]
-        if holders!=[anchor.report()]: raise Blocked('namespace lock escaped anchor')
+        if holders!=[anchor.report()]: raise Blocked('namespace lock not held by anchor')
         self._verify(anchor,'anchor')
         return holders
+
+    def _saved_identity_state(self,identity):
+        """Saved identity is alive, exited, replaced, or unknown (None) (§13 L14).
+
+        Liveness can return False because it observed a replacement; that is
+        re-read here so a replacement is rescanned rather than treated as exit."""
+        current=self.proc.stat(identity.pid)
+        if current is not None and current['start_ticks']!=identity.start_ticks: return 'replaced'
+        alive=self.proc.alive(identity)
+        if alive is True: return 'alive'
+        if alive is not False: return None
+        after=self.proc.stat(identity.pid)
+        if after is not None and after['start_ticks']!=identity.start_ticks: return 'replaced'
+        return 'exited'
 
     @reply_check
     def lifecycle(self,point):
@@ -2715,6 +2772,14 @@ class Driver:
             if status==200: return
             time.sleep(min(.02,max(0,deadline-time.monotonic())))
 
+    def _check_integration_secrecy(self,raw,integration):
+        """§13 L11: raw bytes and decoded response values, every representation."""
+        needles=safety.protected_needles(values=self.secret_forms)
+        if any(form and form in raw for form in self.secret_forms) \
+                or safety.protected_present(raw.decode('utf-8','replace'),needles) \
+                or safety.protected_present(json.dumps(integration,ensure_ascii=False),needles):
+            raise Blocked('L11 synthetic secret appeared in integration')
+
     @reply_check
     def direct_seed(self,namespace,mutation):
         """Direct credential-seeding server only while private VIA stopped (§13 L11)."""
@@ -2771,7 +2836,7 @@ class Driver:
             integration=self._json(raw)
             if status!=200:raise Blocked('L11 seeded integration unavailable')
             self._check_seed_connections(integration,seeded=True)
-            if any(form in raw for form in self.secret_forms): raise Blocked('L11 synthetic secret appeared in integration')
+            self._check_integration_secrecy(raw,integration)
             result={'complete':True,'exact_namespace_layout':True,'chain_0700':True,
                     'known_connection_shape':True,'secret_absent_from_integration':True,'model_requests':0}
             # Return is deliberately after finally's positive absence proof below.
@@ -2929,6 +2994,8 @@ class Driver:
             shutil.rmtree(self.runtime)
         if self.pinned.exists(): safety.verify_binary(self.pinned)
         if close_error is not None: raise close_error
+        retention,self._event_retention_error=self._event_retention_error,None
+        if retention is not None: raise Blocked('native event failure retention failed') from retention
         return self.stop_result
 
     def _materialize_fixture(self,name,project,description):
@@ -3727,7 +3794,7 @@ def fail_closed(error,reached):
             try:
                 receipts=[{'fixture':name,**{key:provider.receipt()[key] for key in (
                     'requests','admitted_requests','refused_requests','unreleased_responses',
-                    'connection_limit_reached','connection_limit')}}
+                    'connection_limit_reached','connection_limit','admission_blocked')}}
                     for name,provider in sorted(self.mock_providers.items())]
                 traffic={'received_requests':sum(row['requests'] for row in receipts),
                          'admitted_requests':sum(row['admitted_requests'] for row in receipts),
@@ -3741,10 +3808,16 @@ def fail_closed(error,reached):
                         'exchanges':usage_provider.exchange_records()})
                 if any(row['connection_limit_reached'] for row in receipts):
                     failures.append(Blocked('mock provider connection ceiling exhausted'))
+                if any(row['admission_blocked'] is not False or row['refused_requests']!=0 for row in receipts):
+                    failures.append(Blocked('spending control refused a mock provider request'))
             except BaseException as error:
                 failure=Blocked('mock received request aggregate unverified')
                 failure.__cause__=error;failures.append(failure)
             self.mock_providers.clear()
+            # §13: a latched spending stop (ceiling, identity, deadline or
+            # metadata-phase request) fails the run whatever the case outcomes.
+            if self.guard.stopped:
+                failures.append(Blocked('spending control latched during qualification'))
         try:self._timeline_flush('model-timelines')
         except BaseException as error:
             if diagnostic_error is None:diagnostic_error=error

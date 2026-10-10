@@ -1449,6 +1449,46 @@ class SpendingGuard:
                 "cost": cost, "cost_available": cost is not None}
 
 
+PROTECTED_DECODE_ROUNDS = 8  # §13: bounded decoding for the shared protected-material check.
+_JSON_ESCAPE = re.compile(r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])')
+_JSON_SIMPLE = {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
+
+
+def protected_needles(*, root=None, values=()):
+    """Raw, Base64 and hex forms of every protected value plus the private root (§13)."""
+    needles = set()
+    if root is not None:
+        needles.add(str(root))
+    for value in values:
+        if not value:
+            continue
+        for form in (value, base64.b64encode(value), base64.b64encode(b"opencode:" + value),
+                     value.hex().encode()):
+            needles.add(form.decode("utf-8", "replace"))
+    return tuple(sorted(needle.casefold() for needle in needles if needle))
+
+
+def protected_present(text, needles):
+    """Search raw, JSON/Unicode-escaped and repeatedly percent-encoded views (§13).
+
+    Each round percent-decodes, then JSON-unescapes, until a fixed point. Text
+    that is still changing after the bound is unverifiable and blocks."""
+    if type(text) is not str:
+        raise Blocked("protected-material check input invalid")
+    view = text
+    for _ in range(PROTECTED_DECODE_ROUNDS):
+        folded = view.casefold()
+        if any(needle in folded for needle in needles):
+            return True
+        following = _JSON_ESCAPE.sub(lambda match: chr(int(match.group(1)[1:], 16))
+                                     if match.group(1)[0] == "u" else _JSON_SIMPLE[match.group(1)],
+                                     urllib.parse.unquote(view))
+        if following == view:
+            return False
+        view = following
+    raise Blocked("protected-material decoding unverifiable")
+
+
 def loopback_origin(value):
     parts = urllib.parse.urlsplit(value)
     try:
