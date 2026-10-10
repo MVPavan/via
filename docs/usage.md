@@ -182,15 +182,9 @@ turn and later ones; an omitted bound is inherited.
 
 - **Background** (`via spawn --background`): prints the spawn receipt and
   exits 0 at once. Collect the result with `via wait` or `via result`.
-- **Foreground** (no `--background`): prints the receipt line, waits, then
-  prints the envelope line. Ctrl-C stops waiting (exit 130) but leaves the
-  turn running.
-
-  **Limitation:** the foreground wait uses the default 30 s `wait` bound. A
-  turn that runs longer ends the CLI with a `wait_timeout` error (exit 2) or,
-  if the connection read times out first, `daemon_unreachable` (exit 4),
-  while the turn keeps running. For real agent work, use `--background` and
-  `via wait <turn> --timeout-ms N`.
+- **Foreground** (no `--background`): prints the receipt line, waits until
+  the turn ends however long it runs, then prints the envelope line. Ctrl-C
+  stops waiting (exit 130) but leaves the turn running.
 
 `via resume` always returns as soon as the turn is accepted (it prints a turn
 receipt); wait for it the same way.
@@ -226,9 +220,8 @@ Main flags:
   `--prompt-file F` (`-` reads the prompt from stdin; a file may be up to
   16 MiB).
 - Session settings, fixed for the session's life: `--cwd D` (made
-  absolute; **always pass it**: when omitted, the daemon's own working
-  directory is used, which is wherever the command that started the daemon
-  ran), `--instructions F` (a file whose text becomes the
+  absolute; when omitted, the directory you run `via spawn` in, with
+  symlinks resolved), `--instructions F` (a file whose text becomes the
   session's system instructions, up to 1 MiB), `--label L` (up to 120
   characters, filterable in `list`), `--allow-untested` (accepted for
   compatibility; no effect).
@@ -331,8 +324,9 @@ via wait s_7f3k9q2mzr4c/2 --timeout-ms 900000
 
 Prints the result envelope once the turn is terminal. The default bound is
 30,000 ms; at the bound it fails with `wait_timeout` (exit 2) and the turn
-keeps running, so just wait again. Ctrl-C exits 130 without affecting the
-turn.
+keeps running, so just wait again. Exit 3 if the turn ended `failed`,
+`cancelled` or `unknown` (the envelope is still printed). Ctrl-C exits 130
+without affecting the turn.
 
 ### `result`: the envelope, now
 
@@ -341,11 +335,12 @@ via result s_7f3k9q2mzr4c/2
 ```
 
 Returns the envelope of a finished turn, or `turn_not_finished` (exit 2).
+Exit 3 if the turn ended `failed`, `cancelled` or `unknown`.
 
 ### `list`: sessions, newest first
 
 ```bash
-via list --state idle --harness claude --label refactor-auth --since 2026-10-01T00:00:00.000Z --limit 20
+via list --state idle --harness claude --label refactor-auth --since 2026-10-01T00:00:00Z --limit 20
 ```
 
 ```json
@@ -354,9 +349,10 @@ via list --state idle --harness claude --label refactor-auth --since 2026-10-01T
 ```
 
 Pass `next_cursor` back as `--cursor` for the next page. `--since` matches
-`last_active_at` and takes a UTC timestamp with milliseconds, as VIA prints
-them (`2026-10-01T00:00:00.000Z`); `2026-10-01T00:00:00Z` is refused as
-`invalid_params`. Session states are `idle`, `active` and `closed`.
+`last_active_at` and takes any RFC 3339 timestamp: `2026-10-01T00:00:00Z`,
+with fractional seconds (`2026-10-01T00:00:00.000Z`, as VIA prints them) or
+with an offset (`2026-10-01T02:00:00+02:00`). Session states are `idle`,
+`active` and `closed`.
 
 ### `events`: durable lifecycle events
 
@@ -468,13 +464,15 @@ it; `failure.data.reason` says why, e.g. `handshake_refused`,
 
 | Exit | Meaning |
 |---|---|
-| 0 | success: the command printed its result. For `wait` and `result` this includes an envelope whose `state` is `failed`, `cancelled` or `unknown`: check `state` |
+| 0 | success: the command printed its result; for `spawn` (foreground), `wait` and `result`, the turn `completed` |
 | 2 | request error: a JSON-RPC error object on stderr (`{code, message, data: {kind, …}}`), including CLI argument errors (`invalid_params` with `data.field`) |
-| 3 | foreground `via spawn` only: the turn ended `failed`, `cancelled` or `unknown` (the envelope is still printed) |
+| 3 | foreground `spawn`, `wait` or `result`: the turn ended `failed`, `cancelled` or `unknown` (the envelope is still printed) |
 | 4 | daemon unreachable: it could not be started or reached (`data.kind: daemon_unreachable`) |
 | 130 | interrupted while a foreground `spawn`, `wait` or `events --follow` was waiting; the turn keeps running |
 
-`--help` and `--version` exit 0. Bare `via` prints help on stderr and exits 2.
+Exit 3 from `wait` and `result` applies from this release; earlier builds
+exited 0 for those envelopes. `--help` and `--version` exit 0. Bare `via`
+prints help on stderr and exits 2.
 
 Common errors (`data.kind`) and what to do:
 
@@ -557,9 +555,6 @@ are refused (the daemon will not start). Example:
 - **Linux x86_64 only.** macOS, ARM64 Linux and Windows are not supported in
   this release.
 - **No `steer`** on any route; cancel and resume instead.
-- **Foreground `spawn` waits at most about 30 s** (see
-  [Background and foreground turns](#background-and-foreground-turns)); use
-  `--background` and `via wait --timeout-ms`.
 - **OpenCode change-set overflow.** OpenCode's per-step changed-files event
   can exceed VIA's 1 MiB event limit when one step creates thousands of
   non-ignored files; the turn then fails with `overflow`. Deferred (bead

@@ -45,8 +45,9 @@ credentials.
 
 ```bash
 umask 077
-# Start a turn in the background; the receipt carries the session handle.
-via spawn --harness claude --model haiku --bound full --network --cwd . \
+# Start a turn in the background, in this directory (or pass --cwd D);
+# the receipt carries the session handle.
+via spawn --harness claude --model haiku --bound full --network \
   --prompt "List the files in this directory and summarise the README." \
   --background > receipt.json
 jq -r .handle receipt.json > handle      # needed for resume/cancel/close
