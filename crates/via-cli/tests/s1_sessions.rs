@@ -157,6 +157,10 @@ fn await_count(sandbox: &Sandbox, sql: &str, expected: i64) -> Result<(), Scenar
 /// params replay the stored receipt and create no second session; any other
 /// handle or byte of params is `idempotency_conflict`.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario replays a lost reply, then refuses three variants"
+)]
 fn s1_f13_spawn_retry_after_lost_reply_replays_one_session() -> TestResult {
     let sandbox = Sandbox::new(&fixture(&[turn_script(1, "p1", None)]))?;
     let evidence = Evidence::new("s1_f13_spawn_retry", &sandbox.fake, &sandbox.fixture)?;
