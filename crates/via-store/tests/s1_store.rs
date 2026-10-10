@@ -272,6 +272,7 @@ async fn assert_closed_result(client: &StoreClient, result: &Value) {
         "state": "closed",
         "cancelled_turns": [format!("{SESSION}/1"), format!("{SESSION}/2")],
         "cleanup": "quiescent",
+        "leftovers": null,
     });
     assert_eq!(*result, expected);
     assert_eq!(
@@ -339,7 +340,8 @@ fn close_cleanup_is_uncertain_with_an_unproven_group() {
         };
         assert_eq!(result["cleanup"], "uncertain");
 
-        // Closed by the force closure pass instead: derived the same way.
+        // Closed by the force closure pass instead: derived the same way,
+        // on read (no stored result), `leftovers` present and null (C1 §3.6).
         spawn(&client, OTHER).await;
         let other = SessionId::try_from(OTHER).unwrap();
         client
@@ -362,6 +364,7 @@ fn close_cleanup_is_uncertain_with_an_unproven_group() {
                 "state": "closed",
                 "cancelled_turns": [],
                 "cleanup": "quiescent",
+                "leftovers": null,
             }))
         );
     });

@@ -1968,7 +1968,8 @@ fn commit_closed(
 /// C1 §3.6 close result from durable rows only [r1.6, r1.8]: the turns a
 /// close cancelled, in turn order (state `cancelled` with cause `close`:
 /// a close-stopped `unknown` turn counts once revised to `cancelled`), and
-/// `quiescent` cleanup only when [`session_cleanup_uncertain`] is false.
+/// `quiescent` cleanup only when [`session_cleanup_uncertain`] is false;
+/// `leftovers` always present, null.
 fn derive_close_result(conn: &Connection, session: &SessionId) -> Result<Value, StoreError> {
     let mut query = conn
         .prepare_cached(
@@ -1990,6 +1991,8 @@ fn derive_close_result(conn: &Connection, session: &SessionId) -> Result<Value, 
         "state": "closed",
         "cancelled_turns": cancelled,
         "cleanup": if unproven { "uncertain" } else { "quiescent" },
+        // No close here reports a stopped server yet (via-jm4.28).
+        "leftovers": Value::Null,
     }))
 }
 

@@ -688,7 +688,7 @@ fn pi_version_read() {
             ],
         );
         let mut wanted = unaccepted(Some("protocol"), None, Some(1));
-        wanted["instance"] = json!({"vendor_version": "1.0.2", "version_status": "untested"});
+        wanted["instance"] = json!({"vendor_version": "1.0.2", "version_status": "tested"});
         (replay, case(name, 1, vec![turn("Say READY.", wanted)]))
     };
     // A package laid out as npm installs Pi: `<pkg>/package.json`,
@@ -1549,7 +1549,7 @@ fn pi_version_survives_a_state_failure() {
             completed_steps(&State::default(), "Say READY.", "READY"),
         );
         let mut wanted = unaccepted(None, Some(error), None);
-        wanted["instance"] = json!({"vendor_version": "1.0.2", "version_status": "untested"});
+        wanted["instance"] = json!({"vendor_version": "1.0.2", "version_status": "tested"});
         let mut expect = case(&name, 0, vec![turn("Say READY.", wanted)]);
         expect["sessions"]["main"]["instructions"] = json!("Always answer carefully.");
         let outcome = drive_built(
