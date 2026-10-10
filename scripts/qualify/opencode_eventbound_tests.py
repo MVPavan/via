@@ -31,11 +31,12 @@ class EventBoundFactsTests(unittest.TestCase):
     def test_known_type_and_fixture_field_sizes_without_content(self):
         facts = self.facts(enqueued('x' * PROMPT))
         self.assertEqual(facts['event_type'], 'session.inbox.enqueued')
-        self.assertEqual(facts['fixture_fields'], [{'path': 'data.item.payload.text',
+        # The inbox item schema is not reviewed, so its keys are wildcards.
+        self.assertEqual(facts['fixture_fields'], [{'path': 'data.*.*.*',
                          'field_bytes': PROMPT, 'x_run_bytes': PROMPT, 'equals': True}])
         paths = {row['path']: row for row in facts['field_bytes']}
-        self.assertGreater(paths['data.item.payload.metadata']['json_bytes'], len(SECRET) * 40)
-        self.assertIn('data.item.payload.metadata.*', paths)
+        self.assertEqual(paths['data.*.*.*']['count'], 2)  # The prompt and its metadata.
+        self.assertIn('data.*.*.*.*', paths)
         self.assertNotIn(SECRET, json.dumps(facts))
 
     def test_field_that_contains_the_prompt_reports_its_wrapping(self):

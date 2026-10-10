@@ -1454,11 +1454,9 @@ _JSON_ESCAPE = re.compile(r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])')
 _JSON_SIMPLE = {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
 
 
-def protected_needles(*, root=None, values=()):
-    """Raw, Base64 and hex forms of every protected value plus the private root (§13)."""
+def protected_needles(*, values=()):
+    """Raw, Base64 and hex forms of every protected value (§13)."""
     needles = set()
-    if root is not None:
-        needles.add(str(root))
     for value in values:
         if not value:
             continue

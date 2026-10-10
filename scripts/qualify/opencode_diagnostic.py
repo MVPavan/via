@@ -52,7 +52,10 @@ def selection(names):
 
 
 def redact(text,root,replacements=()):
-    """Remove private-root and all protected representations before the sink (§13)."""
+    """Remove protected representations before the sink (§13).
+
+    Exact run-root forms are replaced cosmetically; the run root is not
+    protected material in mock-only local diagnostics (coordinator ruling)."""
     if type(text) is not str or len(text.encode())>DIAGNOSTIC_BYTES:
         raise safety.Blocked('mock diagnostic text bound')
     raw=text.encode()
@@ -70,14 +73,15 @@ def redact(text,root,replacements=()):
     for value,replacement in sorted(pairs,key=lambda pair:(-len(pair[0]),pair[0])):
         raw=raw.replace(value,replacement)
     result=raw.decode('utf-8','replace')
-    _check_protected(result,root,replacements)
+    _check_protected(result,replacements)
     return result
 
 
-def _check_protected(text,root,replacements):
-    """§13: one shared representation-aware check; any residual form blocks."""
-    if safety.protected_present(text,safety.protected_needles(root=root,values=replacements)):
-        raise safety.Blocked('mock diagnostic run root or protected material remains after redaction')
+def _check_protected(text,replacements):
+    """§13: one shared representation-aware check for passwords, handles and
+    synthetic secrets; any residual form blocks."""
+    if safety.protected_present(text,safety.protected_needles(values=replacements)):
+        raise safety.Blocked('mock diagnostic protected material remains after redaction')
 
 
 def _discover(root):
@@ -206,6 +210,6 @@ def capture(root,ownership,sessions,*,replacements=()):
                                  'association':'session-id' if ids else 'location-context'})
                 if len(log_rows)>DIAGNOSTIC_ROWS:raise safety.Blocked('mock diagnostic log row bound')
         record={'mode':'mock-only','sessions':rows,'log_lines':log_rows}
-        _check_protected(json.dumps(record),root,replacements)  # The whole assembled record.
+        _check_protected(json.dumps(record),replacements)  # The whole assembled record.
         return record
     return read()

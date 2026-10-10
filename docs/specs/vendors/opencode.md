@@ -1308,7 +1308,9 @@ bootstrap, the namespace repository sentinel and the L11 metadata attempt use
 the state's small namespace project, `projects/<state name>` in the run root,
 as their `--cwd`. It is a private Git fixture outside every vendor HOME/XDG
 root, VIA state and runtime directory and other project; its creation and
-every `start` check that separation and block if it is violated. A vendor
+every `start` check that separation against every registered state and
+runtime root and every other distinct fixture or namespace project, and block
+if it is violated; fixture creation checks it too. A vendor
 storage directory is never a turn's cwd, so step snapshots never include the
 vendor's own database, logs or snapshot store (an earlier runner used the
 namespace directory and produced `session.step.ended` `files` lists over the
@@ -1457,20 +1459,26 @@ are exported. Message `seq` must be an integer. Sizes are read with SQL
 rows are streamed, and the discovery walk is bounded (100,000 entries, 1,024
 sources). Each log is read once up to the size observed when it was opened
 (16 MiB each, 128 MiB aggregate); later vendor growth is not read. A log is
-named only by a hashed `vendor-log-<16 hex>` identifier. Replace the private
-run-root path and every password/bearer representation before the protected
-evidence write. One shared check then searches each text and the whole
-assembled record, case-folded, in raw, repeatedly percent-decoded, JSON-escaped
-and `\u`-escaped views, for the run root and the raw, Base64 and hex forms of
-every protected value; a residual or a view still changing after eight rounds
-blocks. Then run the ordinary whole-root secrecy scan. Public-free sessions
+named only by a hashed `vendor-log-<16 hex>` identifier. Replace every
+password/bearer representation before the protected evidence write. One shared
+check then searches each text and the whole assembled record, case-folded, in
+raw, repeatedly percent-decoded, JSON-escaped and `\u`-escaped views, for the
+raw, Base64 and hex forms of every protected value (passwords, handles and
+synthetic secrets); a residual or a view still changing after eight rounds
+blocks. Then run the ordinary whole-root secrecy scan. **Run-root ruling
+(coordinator, 2026-10-10):** the private run root
+(`/run/user/<uid>/via-oc-qual.<random>`) is not secret or personal data,
+diagnostic evidence is local and gitignored, and diagnostic capture is
+mock-only. So the run root is not protected material in diagnostic capture or
+the assembled-record check: its exact raw, URL-encoded and JSON-escaped forms
+are replaced with `<private-run-root>` as a cosmetic step, and encoded forms are
+neither proven absent nor blocked. Public-turn protections are unchanged. Public-free sessions
 retain only closed projections, never this text. Diagnostic runs retain the
 ordinary identity, ancestor, spending and cleanup proofs and report
 `diagnostic_pass` separately from qualification (exit 4, versus qualification
 pass exit 0 or block/failure exit 1). Every diagnostic summary records the exact
-runner source manifest/hash. Mock diagnostics check case-folded URL-decoded
-text for any remaining private run root after redaction; ambiguity blocks.
-Error log lines associated only by an enrolled location boot are labelled
+runner source manifest/hash. Error log lines associated only by an enrolled
+location boot are labelled
 `location-context`, rather than claiming session attribution. The boot line's
 `directory` field must equal an enrolled location exactly; a prefix does not
 match.
@@ -1899,13 +1907,19 @@ A process directory disappearing before the uid snapshot is absent; a reused
 PID is rescanned once using the replacement identity, never omitted. That
 includes a replacement first noticed by the liveness check after a read error:
 liveness `False` is re-read, and only a saved identity that is gone, not
-replaced, counts as exit. A second identity change blocks. Readable outsiders
+replaced, counts as exit. A second identity change blocks. A `lock:` line
+matches only when its parsed `MAJ:MIN:INODE` field equals the complete device
+and inode of `server.lock`, never a substring; a `FLOCK` line without exactly
+one such field blocks. Readable outsiders
 holding the lock always fail: the first verified non-anchor `FLOCK` line is an
 immediate, irreversible case failure (`lock-scan-escape` record). A later read
 error, exit, exclusion or rescan of that process cannot discard it, and every
 later scan in the run fails the same way. Each scan checks the phase deadline
-(clipped to 60 s) and deferred interruption at every process, descriptor and
-ancestry read, within 500,000 such reads; a scan that cannot finish blocks.
+(clipped to 60 s) and deferred interruption before every process, descriptor,
+liveness and ancestry read and recheck, including historical classification's
+`comm` read and final verifications, and again before it returns an exclusion,
+an absence or exit disposition, or success. All of these count toward 500,000
+reads; a scan that cannot finish blocks.
 
 L11 seeds the registered loopback mock integration, not an unknown integration
 ID: pinned `Integration.list` enumerates registered integrations (byte
@@ -1939,6 +1953,11 @@ native-message input bound, while retaining at most 1 MiB of redacted error/log
 text. Near-limit fixture text is discarded, never exported. Bootstrap records
 retain only the terminal state and fixed failure class; observer bound records
 retain line/frame/prior-data/total byte counts and line-completion Boolean.
+An oversized owned SSE frame's event facts keep a key name only on a reviewed
+schema path: the envelope (`id`, `type`, `durable.seq`, `data.sessionID`), the
+fields VIA's own event decoder reads for that event type, and
+`session.step.ended` `files`. Every other dictionary key, at any depth and in
+any unknown event type, is recorded as `*`.
 These diagnostic records do not change VIA's 1 MiB SSE line/event contract.
 
 ## 14. Owner questions and revisit items

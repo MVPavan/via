@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import selectors
 import shutil
@@ -47,7 +48,22 @@ Blocked = safety.Blocked
 
 
 class _LockScanStop(Blocked):
-    """§13 L14: lock-scan deadline, interruption or work bound; never a process fact."""
+    """§13 L14: lock-scan deadline, interruption, work bound or an unparseable
+    lock record; never a process fact, so no exclusion or rescan absorbs it."""
+
+
+def _flock_ids(raw):
+    """Complete (major, minor, inode) of each FLOCK record in one fdinfo (§13 L14).
+
+    The kernel writes `lock:` records as whitespace-separated fields with a
+    `MAJ:MIN:INODE` identity field; a FLOCK record without exactly one blocks."""
+    for line in raw.splitlines():
+        fields=line.split()
+        if not fields or fields[0]!=b'lock:' or b'FLOCK' not in fields: continue
+        found=[match for match in map(_LOCK_ID.fullmatch,fields) if match]
+        if len(found)!=1: raise _LockScanStop('lock descriptor record unparseable')
+        major,minor,inode=found[0].groups()
+        yield int(major,16),int(minor,16),int(inode)
 
 
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
@@ -66,6 +82,7 @@ HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a succes
 IDLE_RETIREMENT_SECONDS = 90  # §13: natural exit of each process, clipped to its phase.
 LOCK_SCAN_SECONDS = 60  # §13 L14: one same-uid lock scan, clipped to its phase deadline.
 LOCK_SCAN_WORK = 500000  # §13 L14: process, descriptor and ancestry reads per scan.
+_LOCK_ID = re.compile(rb'([0-9a-f]+):([0-9a-f]+):([0-9]+)')
 CLEANUP_SECONDS = 180  # §13: bounded mock abort/retries, then natural daemon idle shutdown.
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
@@ -541,20 +558,24 @@ class Driver:
         session snapshot can include vendor or VIA storage."""
         root=self._directory(self.work/'projects','vendor-private')
         project=root/self.state.name
-        self._check_project_separation(project,projects=[row['path'] for row in self.fixtures.values()])
+        self._check_project_separation(project)
         project=self.ownership.register(project,'vendor-private')
         safety.init_fixture_repo(project,self.home)
         self.namespace_project=project
         return project
 
-    def _check_project_separation(self,project,*,projects=()):
-        """§13: a turn cwd never contains or lies in private storage; violation blocks."""
+    def _check_project_separation(self,project):
+        """§13: a turn cwd never contains or lies in private storage or another
+        project; checked at creation and every start, a violation blocks."""
         project=Path(project)
+        projects={Path(row['path']) for row in self.fixtures.values()}
+        if self.namespace_project is not None: projects.add(Path(self.namespace_project))
         storage=[self.state,self.home,self.runtime,self.helpers,
-                 *(root.path for root in self.ownership.ordered() if root.state),
+                 *(root.path for root in self.ownership.ordered() if root.state or root.runtime),
                  *(Path(value) for key,value in self.env.items() if key in safety.PRIVATE_PARTS),
                  *(Path(value) for value in self.namespace_env.values()),
-                 *([self.namespace] if self.namespace is not None else []),*map(Path,projects)]
+                 *([self.namespace] if self.namespace is not None else []),
+                 *(other for other in projects if other!=project)]
         for root in storage:
             if project==root or project.is_relative_to(root) or root.is_relative_to(project):
                 raise Blocked('project overlaps private storage or another project')
@@ -604,6 +625,7 @@ class Driver:
         if not name or not name.replace('-','').replace('_','').isalnum() or name in self.fixtures:
             raise Blocked('unsafe or duplicate fixture name')
         root=self._directory(self.work/'fixtures','vendor-private')
+        self._check_project_separation(root/name)
         project=self.ownership.register(root/name,'vendor-private')
         safety.init_fixture_repo(project,self.home)
         opencode=self._directory(project/'.opencode','vendor-private')
@@ -2436,7 +2458,7 @@ class Driver:
         path=self.namespace/'server.lock'
         try: row=path.stat()
         except OSError as error: raise Blocked('namespace lock missing') from error
-        lockid=f'{os.major(row.st_dev):02x}:{os.minor(row.st_dev):02x}:{row.st_ino}'
+        lockid=(os.major(row.st_dev),os.minor(row.st_dev),row.st_ino)
         deadline=min(self.phase_deadline or float('inf'),time.monotonic()+LOCK_SCAN_SECONDS)
         work=0
         def tick():
@@ -2465,8 +2487,9 @@ class Driver:
             for scan_attempt in range(2):
                 identity=None
                 try:
+                    tick()
                     if directory.stat().st_uid!=os.getuid(): break
-                    before=self.proc.stat(int(directory.name))
+                    tick();before=self.proc.stat(int(directory.name))
                     if before is None: break
                     identity=safety.Identity(before['pid'],before['start_ticks'])
                     found=False
@@ -2478,13 +2501,13 @@ class Driver:
                             cause=error if isinstance(error,OSError) else error.__cause__
                             if isinstance(cause,OSError) and cause.errno in {errno.ENOENT,errno.ESRCH} \
                                     and cause.filename==name:
-                                self._verify(identity)
+                                tick();self._verify(identity)
                                 continue  # A verified closed descriptor cannot retain the lock.
                             raise
-                        if any(lockid.encode() in line and b'FLOCK' in line for line in raw.splitlines()):
+                        if lockid in set(_flock_ids(raw)):
                             if identity!=anchor: raise escaped(identity)
                             found=True
-                    self.proc.verify(identity)
+                    tick();self.proc.verify(identity)
                     if found: holders.append(identity.report())
                     break
                 except (OSError,Blocked) as error:
@@ -2495,7 +2518,7 @@ class Driver:
                     if identity is None and isinstance(cause,OSError) and cause.errno in {errno.ENOENT,errno.ESRCH} \
                             and cause.filename==str(directory):
                         break  # Process directory disappeared before the uid snapshot.
-                    state=self._saved_identity_state(identity) if identity is not None else None
+                    state=self._saved_identity_state(identity,tick) if identity is not None else None
                     if state=='replaced':
                         if scan_attempt==0:continue  # Inspect the replacement once; never omit its descriptors.
                         raise Blocked('lock descriptor process identity changed twice') from error
@@ -2523,23 +2546,26 @@ class Driver:
                         'role':role,'liveness':alive if type(alive) is bool else None,
                         'os_error':os_error})
                     raise safety.process_block(role,alive,'same-uid lock descriptor scan unverifiable') from error
+            tick()  # Each absence, exit or exclusion disposition is bounded too.
         unique={tuple(sorted(row.items())) for row in holders}
         holders=[dict(row) for row in unique]
         if holders!=[anchor.report()]: raise Blocked('namespace lock not held by anchor')
-        self._verify(anchor,'anchor')
+        tick();self._verify(anchor,'anchor')
+        tick()  # Success is returned only inside the scan's bounds.
         return holders
 
-    def _saved_identity_state(self,identity):
+    def _saved_identity_state(self,identity,guard):
         """Saved identity is alive, exited, replaced, or unknown (None) (§13 L14).
 
         Liveness can return False because it observed a replacement; that is
-        re-read here so a replacement is rescanned rather than treated as exit."""
-        current=self.proc.stat(identity.pid)
+        re-read here so a replacement is rescanned rather than treated as exit.
+        `guard` bounds every observation (deadline, interruption, work)."""
+        guard();current=self.proc.stat(identity.pid)
         if current is not None and current['start_ticks']!=identity.start_ticks: return 'replaced'
-        alive=self.proc.alive(identity)
+        guard();alive=self.proc.alive(identity)
         if alive is True: return 'alive'
         if alive is not False: return None
-        after=self.proc.stat(identity.pid)
+        guard();after=self.proc.stat(identity.pid)
         if after is not None and after['start_ticks']!=identity.start_ticks: return 'replaced'
         return 'exited'
 

@@ -1,13 +1,13 @@
 """§13 closed facts for an owned SSE frame over the C1 §9 1 MiB line bound.
 
-Only closed event types, schema-shaped key paths and byte counts leave this
-module; string values, IDs and unrecognised keys are never retained.
+Only closed event types, reviewed key paths and byte counts leave this
+module; string values, IDs and every unreviewed dictionary key (`*`) are never
+retained.
 """
 import json
 import re
 
 from opencode_c1 import EVENT_TYPES
-from opencode_reply import PRIVATE
 
 # Pinned 2.0.22 native event definitions: every `type:"..."` literal passed to
 # the binary's durable (Po) and bus (et) event constructors.
@@ -49,14 +49,46 @@ FIXTURE_RUN_BYTES = 64 * 1024  # Near-limit fixture prompts are 'x' runs far abo
 FIELD_MIN_BYTES = 512  # Smaller subtrees are summed into their parent.
 FIELD_DEPTH = 8
 FIELD_ROWS = 128
-_KEY = re.compile(r'[a-z][A-Za-z]{0,39}')
 _RUN = re.compile(r'x{%d,}' % FIXTURE_RUN_BYTES)
 _RUN_BYTES = re.compile(rb'x{%d,}' % FIXTURE_RUN_BYTES)
 _TYPE = re.compile(rb'"type"\s*:\s*"([a-z][a-z0-9._-]{0,63})"')
 
 
-def _key(name):
-    return name if _KEY.fullmatch(name) and name.lower() not in PRIVATE else '*'
+# Reviewed schema paths: the fields VIA's own 2.0.22 event decoder reads
+# (crates/via-routes/src/opencode/events.rs) plus `session.step.ended` `files`,
+# recorded by an earlier bound failure (§13). Every other key is `*`.
+_ENVELOPE = frozenset({'id', 'type', 'durable', 'durable.seq', 'data', 'data.sessionID'})
+_TOKENS = ('tokens', 'tokens.input', 'tokens.output', 'tokens.reasoning', 'tokens.cache',
+           'tokens.cache.read', 'tokens.cache.write')
+_ERROR = ('error', 'error.type', 'error.status')
+_STEP = ('assistantMessageID', 'finish', 'cost', 'files', *_TOKENS, *_ERROR)
+_TEXT = ('assistantMessageID', 'ordinal', 'delta', 'text')
+_TOOL = ('assistantMessageID', 'id', 'name', *_ERROR)
+_DATA = {
+    **{kind: ('inboxID',) for kind in ('session.inbox.enqueued', 'session.inbox.delivered',
+                                       'session.inbox.cancelled', 'session.inbox.delivery.changed')},
+    'session.execution.started': (), 'session.execution.succeeded': (),
+    'session.execution.failed': _ERROR, 'session.execution.interrupted': ('reason',),
+    **{kind: _STEP for kind in ('session.step.started', 'session.step.ended', 'session.step.failed',
+                                'session.step.streamed')},
+    **{kind: _TEXT for kind in ('session.text.started', 'session.text.delta', 'session.text.ended',
+                                'session.reasoning.started', 'session.reasoning.delta',
+                                'session.reasoning.ended')},
+    **{kind: _TOOL for kind in ('session.tool.input.started', 'session.tool.called', 'session.tool.success',
+                                'session.tool.failed', 'session.tool.input.ended', 'session.tool.progress')},
+    **{kind: ('inputID', 'cost', *_TOKENS, *_ERROR) for kind in ('session.compaction.ended',
+                                                                 'session.compaction.failed')},
+    'permission.asked': ('id', 'action', 'source', 'source.messageID', 'source.id'),
+    'permission.replied': ('requestID',),
+    'form.cancelled': ('id',), 'form.replied': ('id',),
+    'form.created': ('form', 'form.id', 'form.sessionID'),
+    'session.created': ('parentID',),
+}
+REVIEWED_PATHS = {kind: _ENVELOPE | {'data.' + path for path in paths} for kind, paths in _DATA.items()}
+
+
+def _key(reviewed, parent, name):
+    return name if (parent + '.' if parent else '') + name in reviewed else '*'
 
 
 def _json_bytes(value):
@@ -80,6 +112,7 @@ def event_bound_facts(payload):
         return facts
     kind = value.get('type') if type(value) is dict else None
     facts['event_type'] = kind if type(kind) is str and kind in KNOWN_TYPES else 'other'
+    reviewed = REVIEWED_PATHS.get(facts['event_type'], _ENVELOPE)
     sizes = {}
     stack = [(value, '', 0)]
     while stack:
@@ -99,7 +132,7 @@ def event_bound_facts(payload):
             row = sizes.setdefault(path or '$', {'path': path or '$', 'json_bytes': 0, 'count': 0})
             row['json_bytes'] += size; row['count'] += 1
         if type(node) is dict:
-            stack.extend((item, (path + '.' if path else '') + _key(name), depth + 1)
+            stack.extend((item, (path + '.' if path else '') + _key(reviewed, path, name), depth + 1)
                          for name, item in node.items())
         elif type(node) is list:
             stack.extend((item, path + '[]', depth + 1) for item in node)

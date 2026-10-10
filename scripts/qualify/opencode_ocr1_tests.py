@@ -110,14 +110,12 @@ class CaptureTests(unittest.TestCase):
         from opencode_diagnostic import capture
         return capture(self.work,self.owned,self.sessions,replacements=replacements)
 
-    def test_encoded_passwords_handles_and_root_never_reach_the_record(self):
+    def test_encoded_passwords_and_handles_never_reach_the_record(self):
+        # The run root is not protected material here (ocr2 ruling; opencode_ocr2_tests).
         password=b'FAKEpassword0123456789';handle=b'FAKEhandle0123456789'
-        root=str(self.work)
         def twice(value):  # Every byte percent-encoded, then the percent signs encoded again.
             return ''.join('%%%02X'%byte for byte in value).replace('%','%25')
-        encoded=(twice(password),twice(handle),
-                 root.replace('/','\\/'),root.replace('/','\\u002f'),
-                 urllib.parse.quote(urllib.parse.quote(root,safe=''),safe=''))
+        encoded=(twice(password),twice(handle))
         for value in encoded:
             for place in ('message','name'):
                 with self.subTest(value=value,place=place):

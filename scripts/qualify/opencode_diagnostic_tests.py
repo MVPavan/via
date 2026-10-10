@@ -53,15 +53,6 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(summary['runner_source'],opencode.runner_source_manifest())
             self.assertEqual(rc,4)
 
-    def test_redaction_blocks_casefolded_and_repeated_url_encoded_root_leftovers(self):
-        import urllib.parse
-        from opencode_diagnostic import redact
-        root=Path('/FAKE/private/run-root')
-        for text in (str(root).upper(),urllib.parse.quote(str(root),safe='').lower(),
-                     urllib.parse.quote(urllib.parse.quote(str(root),safe=''),safe='')):
-            with self.subTest(text=text),self.assertRaisesRegex(safety.Blocked,'run root'):
-                redact(text,root)
-
     def test_mock_log_lines_name_session_or_location_context_association(self):
         from opencode_diagnostic import capture
         from opencode_ownership import OwnershipRegistry
