@@ -1164,6 +1164,69 @@ fn s1_f29_ctrl_c_foreground_spawn_exits_130() -> TestResult {
     })
 }
 
+/// C1 P1: a foreground `spawn` waits until the turn is terminal, however
+/// long that takes, not just one `wait` bound. Test builds lower the CLI's
+/// per-request bound (`VIA_TEST_SPAWN_WAIT_MS`); the turn is held past
+/// several bounds, then released, and the CLI prints the receipt and the
+/// envelope and exits 0. The sleep only lets bounds elapse.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn foreground_spawn_waits_past_one_wait_bound() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&held("hold", 1))?;
+        let out = sandbox.root.path().join("spawn.stdout");
+        let mut command = sandbox.command();
+        command
+            .args([
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "hold",
+                "--json",
+            ])
+            .env("VIA_TEST_SPAWN_WAIT_MS", "200")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(File::create(&out)?)
+            .stderr(File::create(sandbox.root.path().join("spawn.stderr"))?);
+        let mut cli = command.spawn()?;
+        sandbox.await_file("hold.entered")?;
+        thread::sleep(Duration::from_millis(1000));
+        let early = cli.try_wait()?;
+        sandbox.release("hold")?;
+        let status = match early {
+            Some(status) => status,
+            None => wait_child(&mut cli, Duration::from_secs(20))?.ok_or("the CLI kept waiting")?,
+        };
+        let stdout = fs::read(&out)?;
+        let lines: Vec<Value> = stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<Result<_, _>>()?;
+        check(
+            early.is_none()
+                && status.code() == Some(0)
+                && lines.len() == 2
+                && lines[1]["state"] == "completed",
+            || {
+                format!(
+                    "foreground spawn ended {status} (early: {}) with {lines:?}; stderr {}",
+                    early.is_some(),
+                    fs::read_to_string(sandbox.root.path().join("spawn.stderr"))
+                        .unwrap_or_default()
+                )
+            },
+        )?;
+        let daemon = sandbox.status()?;
+        let pid = u32::try_from(daemon["pid"].as_u64().ok_or("status has no pid")?)?;
+        sandbox.stop_auto(sandbox.command(), pid)
+    })
+}
+
 /// F1 (design §6.1): two auto-starts at once make one daemon. The first
 /// CLI's daemon holds `daemon.lock` at `daemon.startup.after_lock`; a
 /// daemon started meanwhile exits 75 after one line; the second CLI's own
