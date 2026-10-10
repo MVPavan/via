@@ -101,6 +101,26 @@ class BootstrapProviderTests(unittest.TestCase):
             for _ in range(2):d._bootstrap_vendor();d._bootstrap_session=None
             self.assertEqual(self.used,['FAKE-sentinel','FAKE-bootstrap-2'])
 
+    def test_new_acquisition_config_is_not_a_reload_of_the_retired_generation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            d=self.driver(folder);del d._write_fixture_config
+            d._validate_provider_config=lambda config:{'oclive-mock':'http://127.0.0.1:%d/v1'%config['port']}
+            def materialize(name,project,description):
+                port=40000+len(d.mock_providers)
+                provider=mock.Mock(requests=0,admission_blocked=False,model_matches=True,
+                                   endpoint='http://127.0.0.1:%d/v1'%port)
+                d.mock_providers[name]=provider
+                return {'endpoint':provider.endpoint,'port':port}
+            d._materialize_fixture=mock.Mock(side_effect=materialize)
+            # The retired generation's identities are still recorded, with its served map.
+            d.daemon=safety.Identity(70,1);d.anchor=safety.Identity(71,2);d.vendor_identity=safety.Identity(72,3)
+            d._verified_endpoint_maps[d.namespace_project]={'identity':d._config_identity(),'endpoints':{}}
+            def retired():
+                raise safety.Blocked('owned process is not verified alive')
+            d._owned_observation_guard=mock.Mock(return_value=retired)
+            d._bootstrap_vendor()
+            self.assertEqual(self.used,['http://127.0.0.1:40000/v1'])
+
 
 class CleanupAfterStopBlockTests(unittest.TestCase):
     def test_block_after_daemon_stop_request_keeps_the_absence_proof(self):

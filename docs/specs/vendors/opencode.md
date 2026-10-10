@@ -1305,8 +1305,9 @@ models on an acquired server; it does not acquire one. For each required
 acquisition, the runner may submit one labelled
 `qualification-bootstrap-mock-only` turn to its owned loopback mock. Each
 acquisition's bootstrap has its own mock provider, written into the namespace
-project configuration, so no provider's 64-connection transport ceiling spans
-the run; only an acquisition for the namespace sentinel's own turn reuses that
+project configuration (a new acquisition's configuration, never checked as a
+reload against the retired generation's identities), so no provider's
+64-connection transport ceiling spans the run; only an acquisition for the namespace sentinel's own turn reuses that
 fixture's provider. The
 bootstrap, the namespace repository sentinel and the L11 metadata attempt use
 the state's small namespace project, `projects/<state name>` in the run root,

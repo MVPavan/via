@@ -1530,6 +1530,9 @@ class Driver:
             if cached is None:
                 config=self._materialize_fixture(name,project,{'provider':'mock','response_hold':hold})
                 provider=self.mock_providers[name]
+                # A new acquisition's configuration is not a reload of the
+                # retired generation's served map (its identities are gone).
+                self._verified_endpoint_maps.pop(project,None)
                 self._write_fixture_config(project,config)
                 # The registered namespace configuration follows what is on disk.
                 if namespace_fixture is not None: namespace_fixture['config']=config
