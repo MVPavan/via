@@ -201,7 +201,10 @@ between stdin/stdout and the daemon socket.
   server (`model/list`; once known, its last catalog is kept across
   restarts), OpenCode through VIA's own OpenCode server, Pi through one short
   `pi --mode rpc` process in VIA's private Pi directory. A server started
-  just for the listing is stopped again right after it. Claude Code has no
+  just for the listing is stopped again right after it, except a Codex
+  server still in its handshake when the 20 s bound passes: it keeps running,
+  holding its harness-process slot, until that handshake ends (within 60 s, or
+  300 s on a first start), and is stopped then. Claude Code has no
   model listing: `sonnet`, `opus` and `haiku` are listed, and any full Claude
   model ID also works. Each harness gets at most 20 s; `--harness H` asks
   only H. The result's `harnesses` array says how each harness went:

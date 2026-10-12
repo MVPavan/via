@@ -95,7 +95,7 @@ enum Command {
     Status(StatusArgs),
     /// List sessions, newest first
     List(ListArgs),
-    /// Check how a spawn would run, without starting anything
+    /// Check how a spawn would run, without starting an agent
     #[command(after_help = DESCRIBE_EXAMPLES)]
     Describe(DescribeArgs),
     /// List the models each harness offers

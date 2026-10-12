@@ -456,7 +456,8 @@ fn envelope(value: &Value) -> String {
         }
     }
     let mut out = fields.render();
-    if present(&value["structured_output"]) {
+    // Any value, even `{}` or `[]`; only `null` (none) is left out.
+    if !value["structured_output"].is_null() {
         out.push_str("\nstructured output:\n");
         out.push_str(&pretty(&value["structured_output"]));
     }
@@ -533,7 +534,40 @@ fn status(value: &Value) -> String {
     fields.opt("created", &value["created_at"]);
     fields.opt("updated", &value["updated_at"]);
     fields.warnings(&value["warnings"]);
-    fields.render()
+    let mut out = fields.render();
+    out.push_str(&steps(&value["steps"]));
+    out
+}
+
+/// The status reply's page of step history, after a blank line; nothing
+/// when the reply has no page.
+fn steps(page: &Value) -> String {
+    let Some(items) = page["items"].as_array() else {
+        return String::new();
+    };
+    let mut out = format!("\nsteps of turn {}:", text(&page["turn"]));
+    if items.is_empty() {
+        out.push_str(" none\n");
+    } else {
+        out.push('\n');
+        let rows: Vec<Vec<String>> = items
+            .iter()
+            .map(|item| {
+                ["step", "started_at", "ended_at", "tokens"]
+                    .iter()
+                    .map(|key| text(&item[*key]))
+                    .collect()
+            })
+            .collect();
+        out.push_str(&table(&["STEP", "STARTED", "ENDED", "TOKENS"], &rows));
+    }
+    if page["more"] == true {
+        append(
+            &mut out,
+            format_args!("More: --after-step {}\n", text(&page["next_after"])),
+        );
+    }
+    out
 }
 
 fn list(value: &Value) -> Option<String> {
@@ -759,10 +793,28 @@ fn models(value: &Value) -> Option<String> {
             .collect();
         table(&["HARNESS", "MODEL", "ALIASES", "SOURCE"], &rows)
     };
-    // Members besides `models`, such as a per-harness note.
+    // How each harness went: one line each.
+    let harnesses: Vec<Vec<String>> = value["harnesses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            vec![
+                text(&entry["harness"]),
+                text(&entry["status"]),
+                entry["message"].as_str().unwrap_or_default().to_owned(),
+            ]
+        })
+        .collect();
+    if !harnesses.is_empty() {
+        out.push('\n');
+        out.push_str(&table(&[], &harnesses));
+    }
+    // Other members, which this build does not know.
     let mut fields = Fields::default();
     for (key, member) in value.as_object().into_iter().flatten() {
-        if key != "models" && present(member) {
+        let shown = key == "models" || (key == "harnesses" && member.is_array());
+        if !shown && present(member) {
             let line = if member.is_object() || member.is_array() {
                 serde_json::to_string_pretty(member).unwrap_or_else(|_| member.to_string())
             } else {
@@ -1066,6 +1118,63 @@ mod tests {
         );
         assert!(text.contains("notes  {\n"), "{text}");
         assert!(text.contains("\"pi\": \"login needed\""), "{text}");
+    }
+
+    #[test]
+    fn models_lists_each_harness_outcome_after_the_table() {
+        let models = json!({"models":[
+            {"model":"sonnet","harness":"claude","aliases":[],"source":"bundled"}],
+            "harnesses":[
+                {"harness":"claude","status":"ok","message":"bundled aliases"},
+                {"harness":"opencode","status":"unavailable","message":"binary not found"},
+                {"harness":"codex","status":"ok"}]});
+        assert_eq!(
+            render(View::Models, &models),
+            "HARNESS  MODEL   ALIASES  SOURCE\n\
+             claude   sonnet  -        bundled\n\
+             \n\
+             claude    ok           bundled aliases\n\
+             opencode  unavailable  binary not found\n\
+             codex     ok\n"
+        );
+    }
+
+    #[test]
+    fn empty_structured_output_is_shown() {
+        for (output, shown) in [(json!({}), "{}"), (json!([]), "[]")] {
+            let envelope =
+                json!({"address":"s_a/1","state":"completed","structured_output":output});
+            let text = render(View::Envelope, &envelope);
+            assert!(
+                text.ends_with(&format!("\nstructured output:\n{shown}\n")),
+                "{text}"
+            );
+        }
+        let none = json!({"address":"s_a/1","state":"completed","structured_output":null});
+        assert!(!render(View::Envelope, &none).contains("structured output"));
+    }
+
+    #[test]
+    fn status_shows_the_steps_page() {
+        let status = json!({"session_id":"s_a","state":"idle","turns":[{"n":2,"state":"completed"}],
+            "steps":{"turn":2,"items":[
+                {"step":3,"started_at":"t0","ended_at":"t1","tokens":5100},
+                {"step":4,"started_at":"t1","ended_at":"t2","tokens":null}],
+                "next_after":4,"more":true}});
+        let text = render(View::Status, &status);
+        assert!(
+            text.ends_with(
+                "\nsteps of turn 2:\n\
+                 STEP  STARTED  ENDED  TOKENS\n\
+                 3     t0       t1     5100\n\
+                 4     t1       t2     -\n\
+                 More: --after-step 4\n"
+            ),
+            "{text}"
+        );
+        let empty = json!({"session_id":"s_a","state":"idle",
+            "steps":{"turn":1,"items":[],"next_after":0,"more":false}});
+        assert!(render(View::Status, &empty).ends_with("\nsteps of turn 1: none\n"));
     }
 
     #[test]
