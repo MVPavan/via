@@ -1768,10 +1768,15 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
                     == json!([{"model":"fake","harness":"fake","aliases":[],"source":"bundled"}]),
                 || format!("models: {models}"),
             )?;
-            let other = conn.call("models", &json!({"harness":"codex"}))?;
-            check(other["result"]["models"] == json!([]), || {
-                format!("models of another harness: {other}")
-            })?;
+            // Another harness's filter lists none of the fake's entries. A
+            // name no adapter serves, so nothing is discovered: a vendor
+            // harness would discover with its binary on the host's PATH
+            // (C1 §3.13, owner 2026-10-12).
+            let other = conn.call("models", &json!({"harness":"gemini"}))?;
+            check(
+                other["result"]["models"] == json!([]) && other["result"]["harnesses"] == json!([]),
+                || format!("models of another harness: {other}"),
+            )?;
             check(
                 setup.count("SELECT COUNT(*) FROM sessions")? == sessions + 1,
                 || "describe or models wrote".to_owned(),

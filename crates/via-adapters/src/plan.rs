@@ -679,7 +679,7 @@ pub(crate) enum Adapter<'a> {
 
 impl<'a> Adapter<'a> {
     /// The harness it serves.
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Fake(_) => FAKE,
             Self::Claude(_) => claude::HARNESS,
@@ -740,7 +740,7 @@ pub struct AdapterSet {
     pub(crate) pi: Option<Arc<PiAdapter>>,
     pub(crate) opencode: Option<Arc<OpenCodeAdapter>>,
     /// The rest of the start-time configuration (design §5.4).
-    config: AdapterConfig,
+    pub(crate) config: AdapterConfig,
     /// The Route runtime: Wire and Host, which own every connection.
     pub(crate) runtime: Arc<RouteRuntime>,
     /// Test builds: the sizes each `plan` and `check_turn` received, the

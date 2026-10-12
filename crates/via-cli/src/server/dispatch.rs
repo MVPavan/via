@@ -394,7 +394,7 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
         }
         // Task 4 design §4.6: nothing is written.
         "describe" => raw(&engine.describe(&typed::<DescribeParams>(params)?)?),
-        "models" => raw(&engine.models(&typed::<ModelsParams>(params)?)),
+        "models" => raw(&engine.models(&typed::<ModelsParams>(params)?).await),
         "spawn" | "resume" => {
             // Core enqueues the new turn with its session's dispatcher under
             // admission; a replayed retry enqueues nothing. The retry

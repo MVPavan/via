@@ -2,6 +2,7 @@
 //! session policy decisions or opens the Store.
 
 mod client;
+mod render;
 mod server;
 
 use std::{io, path::PathBuf, process::ExitCode, time::Duration};
@@ -10,8 +11,58 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 
+use render::{Output, View, write_json};
+
+const TOP_EXAMPLES: &str = "\
+Examples:
+  via models                     the harnesses and the models each offers
+  via spawn --harness <HARNESS> --model <MODEL> --prompt \"Summarize README.md\"
+  via spawn --harness <HARNESS> --model <MODEL> --prompt-file task.md --background
+  via wait s_7f3k9q2mzr4c        wait for the session's latest turn
+  via list                       recent sessions, newest first
+
+Output is readable text on a terminal and JSON (one object per line) when
+piped or redirected; --json always prints JSON.";
+
+const SPAWN_EXAMPLES: &str = "\
+Examples:
+  via spawn --harness <HARNESS> --model <MODEL> --prompt \"Fix the failing test\"
+  via spawn --harness <HARNESS> --model <MODEL> --bound workspace_write \\
+      --prompt-file task.md --label refactor --background > receipt.json
+  echo \"Explain this repo\" | via spawn --harness <HARNESS> --model <MODEL> --prompt-file -
+
+`via models` lists the harnesses and models. The receipt shows the
+session's handle once; keep it to resume, cancel or close the session.";
+
+const RESUME_EXAMPLES: &str = "\
+Examples:
+  via resume s_7f3k9q2mzr4c --handle-file handle --prompt \"Now run the tests\"
+  VIA_HANDLE=h_... via resume s_7f3k9q2mzr4c --prompt-file next.md --effort high";
+
+const WAIT_EXAMPLES: &str = "\
+Examples:
+  via wait s_7f3k9q2mzr4c               the session's latest turn
+  via wait s_7f3k9q2mzr4c/2 --timeout-ms 900000
+
+On timeout the turn keeps running; run wait again.";
+
+const MODELS_EXAMPLES: &str = "\
+Examples:
+  via models
+  via models --harness <HARNESS>";
+
+const DESCRIBE_EXAMPLES: &str = "\
+Examples:
+  via describe --harness <HARNESS> --model <MODEL>
+  via describe --harness <HARNESS> --model <MODEL> --bound full --network --require cancel";
+
 #[derive(Parser)]
-#[command(name = "via", version, about = "Run a coding agent through VIA")]
+#[command(
+    name = "via",
+    version,
+    about = "Run a prompt on any coding-agent harness and get a structured result",
+    after_help = TOP_EXAMPLES
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -19,26 +70,44 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Start a new session and run its first turn
+    #[command(after_help = SPAWN_EXAMPLES)]
     Spawn(SpawnArgs),
+    /// Run another turn in an existing session
+    #[command(after_help = RESUME_EXAMPLES)]
     Resume(ResumeArgs),
+    /// Send extra input to the running turn
     Steer(SteerArgs),
+    /// Stop the running turn or a queued one
     Cancel(CancelArgs),
+    /// End a session, cancelling any running or queued turns
     Close(CloseArgs),
+    /// Show the result of a finished turn
     Result(ReadArgs),
+    /// Wait for a turn to finish and show its result
+    #[command(after_help = WAIT_EXAMPLES)]
     Wait(WaitArgs),
+    /// Show a session's lifecycle events
     Events(EventsArgs),
+    /// Show where a turn's transcript and evidence files are
     Logs(ReadArgs),
+    /// Show a session's state and a turn's progress
     Status(StatusArgs),
+    /// List sessions, newest first
     List(ListArgs),
-    /// The route one set of parameters would take (Task 4 design §4.6).
+    /// Check how a spawn would run, without starting an agent
+    #[command(after_help = DESCRIBE_EXAMPLES)]
     Describe(DescribeArgs),
-    /// The models each harness offers (Task 4 design §4.6).
+    /// List the models each harness offers
+    #[command(after_help = MODELS_EXAMPLES)]
     Models(ModelsArgs),
-    /// Proxies C1 between stdio and the daemon socket, unchanged.
+    /// Relay the VIA JSON-RPC API between stdin/stdout and the daemon (for integrations)
     Serve {
+        /// Use stdin and stdout
         #[arg(long, required = true)]
         stdio: bool,
     },
+    /// Run the daemon in the foreground, or manage the running one
     Daemon {
         #[command(subcommand)]
         command: Option<DaemonCommand>,
@@ -46,111 +115,155 @@ enum Command {
 }
 
 #[derive(Args)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each bool is an independent CLI switch of C1 §3.2"
-)]
 struct SpawnArgs {
+    /// Coding-agent harness to run (`via models` lists them)
     #[arg(long)]
     harness: String,
+    /// Model name or alias (see `via models`)
     #[arg(long)]
     model: String,
     #[command(flatten)]
     prompt: PromptArgs,
-    /// A file whose path is sent as the session's `instructions`.
-    #[arg(long)]
+    /// File whose text becomes the session's system instructions
+    #[arg(long, value_name = "FILE")]
     instructions: Option<PathBuf>,
-    #[arg(long)]
+    /// Working directory for the agent (default: the current directory)
+    #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
-    /// Verbs the route must support, comma separated.
-    #[arg(long, value_delimiter = ',')]
+    /// Refuse unless the route supports these verbs, comma separated (e.g. cancel,steer:partial)
+    #[arg(long, value_delimiter = ',', value_name = "VERBS")]
     require: Vec<String>,
+    /// Accepted for compatibility; has no effect
     #[arg(long)]
     allow_untested: bool,
+    /// Label for the session, filterable in `via list`
     #[arg(long)]
     label: Option<String>,
-    #[arg(long)]
-    handle: Option<String>,
-    #[arg(long)]
-    handle_file: Option<PathBuf>,
-    #[arg(long)]
-    handle_stdin: bool,
-    #[arg(long)]
+    #[command(flatten)]
+    handle: HandleArgs,
+    /// Key that makes a retried spawn return the original receipt
+    #[arg(long, value_name = "KEY")]
     idempotency_key: Option<String>,
     #[command(flatten)]
     turn: TurnArgs,
+    /// Return after the receipt instead of waiting for the result
     #[arg(long)]
     background: bool,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
-    /// Raw vendor arguments after `--`, sent as `vendor_args` (C1 §3.2).
+    /// Raw arguments for the vendor CLI, after `--` (unverified by VIA)
     #[arg(last = true, value_name = "VENDOR_ARG")]
     vendor_args: Vec<String>,
 }
 
 #[derive(Args)]
 struct DescribeArgs {
+    /// Coding-agent harness
     #[arg(long)]
     harness: Option<String>,
+    /// Model name or alias
     #[arg(long)]
     model: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "Sandbox bound: read_only, workspace_write or full"
+    )]
     bound: Option<String>,
-    #[arg(long = "allow-dir", requires = "bound")]
+    /// Extra writable directory for the bound (repeatable)
+    #[arg(long = "allow-dir", requires = "bound", value_name = "DIR")]
     allow_dirs: Vec<String>,
+    /// Allow network access within the bound
     #[arg(long, requires = "bound")]
     network: bool,
-    /// Verbs the route must support, comma separated.
-    #[arg(long, value_delimiter = ',')]
+    /// Verbs the route must support, comma separated
+    #[arg(long, value_delimiter = ',', value_name = "VERBS")]
     require: Vec<String>,
-    #[arg(long)]
+    /// Working directory the session would use
+    #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
+    /// Accepted for compatibility; has no effect
     #[arg(long)]
     allow_untested: bool,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct ModelsArgs {
+    /// Only this harness's models
     #[arg(long)]
     harness: Option<String>,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct ResumeArgs {
+    /// Session ID (s_...)
     session: String,
     #[command(flatten)]
     prompt: PromptArgs,
-    #[arg(long)]
+    /// Key that makes a retried resume return the original receipt
+    #[arg(long, value_name = "KEY")]
     op_key: Option<String>,
     #[command(flatten)]
     turn: TurnArgs,
-    #[arg(long)]
-    handle: Option<String>,
-    #[arg(long)]
-    handle_file: Option<PathBuf>,
-    #[arg(long)]
-    handle_stdin: bool,
+    #[command(flatten)]
+    handle: HandleArgs,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
-    /// Sent as `vendor_args`, which the daemon refuses on resume (C1
-    /// §3.3): session policy is Core's, not the CLI's.
+    // Sent as `vendor_args`, which the daemon refuses on resume: vendor
+    // arguments are fixed for the session's life.
     #[arg(last = true, hide = true)]
     vendor_args: Vec<String>,
 }
 
-/// C1 §3.2: exactly one of `--prompt` and `--prompt-file F|-`.
+// Exactly one of `--prompt` and `--prompt-file F|-`.
 #[derive(Args)]
 #[group(required = true, multiple = false)]
 struct PromptArgs {
-    #[arg(long)]
+    /// The prompt text
+    #[arg(long, value_name = "TEXT")]
     prompt: Option<String>,
-    /// Sent as `prompt_file`, made absolute; `-` reads stdin into `prompt`.
-    #[arg(long)]
+    /// Read the prompt from a file (`-` reads stdin)
+    #[arg(long, value_name = "FILE")]
     prompt_file: Option<PathBuf>,
+}
+
+// The session handle: `--handle-file`, `--handle-stdin`, `VIA_HANDLE`, then
+// `--handle`, in that order.
+#[derive(Args)]
+struct HandleArgs {
+    #[arg(
+        long,
+        value_name = "HANDLE",
+        help = "Session handle (h_...); visible to other processes, so prefer --handle-file or VIA_HANDLE"
+    )]
+    handle: Option<String>,
+    /// Read the session handle from a file
+    #[arg(long, value_name = "FILE")]
+    handle_file: Option<PathBuf>,
+    /// Read the session handle from stdin
+    #[arg(long)]
+    handle_stdin: bool,
+}
+
+impl HandleArgs {
+    /// The handle from these flags or `VIA_HANDLE`; with `generate`, a new
+    /// one when none is given.
+    fn read(&self, generate: bool) -> anyhow::Result<String> {
+        client::read_handle(
+            self.handle_file.as_deref(),
+            self.handle_stdin,
+            self.handle.as_deref(),
+            generate,
+        )
+    }
 }
 
 impl PromptArgs {
@@ -193,28 +306,39 @@ fn absolute(path: &std::path::Path, field: &'static str) -> Result<String, clien
     })
 }
 
-/// C1 §3.2/§3.3 per-turn flags; the daemon validates them against the route.
+// Per-turn settings, inherited by later turns unless changed; the daemon
+// validates them against the route.
 #[derive(Args)]
 struct TurnArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "Sandbox bound: read_only, workspace_write or full"
+    )]
     bound: Option<String>,
-    #[arg(long = "allow-dir", requires = "bound")]
+    /// Extra writable directory for the bound (repeatable)
+    #[arg(long = "allow-dir", requires = "bound", value_name = "DIR")]
     allow_dirs: Vec<String>,
+    /// Allow network access within the bound
     #[arg(long, requires = "bound")]
     network: bool,
+    /// Reasoning effort: low ... max, or a vendor value
     #[arg(long)]
     effort: Option<String>,
-    /// A file holding the JSON Schema object, or `null` to clear.
-    #[arg(long)]
+    /// File holding a JSON Schema the final answer must match (`null` clears it)
+    #[arg(long, value_name = "FILE")]
     output_schema: Option<PathBuf>,
-    #[arg(long)]
+    /// Wall-clock limit for the turn, in milliseconds (default 3600000)
+    #[arg(long, value_name = "MS")]
     wall_ms: Option<u64>,
-    #[arg(long)]
+    /// Limit on time without agent activity, in milliseconds (default 600000)
+    #[arg(long, value_name = "MS")]
     idle_ms: Option<u64>,
-    #[arg(long)]
+    /// Maximum model steps for the turn
+    #[arg(long, value_name = "N")]
     max_steps: Option<u64>,
-    /// `harness.key=value`, repeatable.
-    #[arg(long = "vendor")]
+    /// Vendor option as harness.key=value (repeatable)
+    #[arg(long = "vendor", value_name = "HARNESS.KEY=VALUE")]
     vendor: Vec<String>,
 }
 
@@ -277,142 +401,194 @@ impl TurnArgs {
 
 #[derive(Args)]
 struct WaitArgs {
+    /// Turn address (s_.../N) or session ID (its latest turn)
     address: String,
-    #[arg(long)]
+    /// Give up after this many milliseconds (default 30000); the turn keeps running
+    #[arg(long, value_name = "MS")]
     timeout_ms: Option<u64>,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct SteerArgs {
+    /// Session ID (s_...)
     session: String,
+    /// Input to send to the running turn
     #[arg(long)]
     text: String,
-    #[arg(long)]
+    /// Key that makes a retried steer return the original outcome
+    #[arg(long, value_name = "KEY")]
     op_key: Option<String>,
-    #[arg(long)]
-    handle: Option<String>,
-    #[arg(long)]
-    handle_file: Option<PathBuf>,
-    #[arg(long)]
-    handle_stdin: bool,
+    #[command(flatten)]
+    handle: HandleArgs,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct CancelArgs {
+    /// Session ID (s_...)
     session: String,
-    #[arg(long)]
+    /// Turn number to cancel (default: the running turn, else the latest)
+    #[arg(long, value_name = "N")]
     turn: Option<u32>,
-    #[arg(long = "force-after")]
+    /// Milliseconds the agent gets to stop before VIA forces it (default 10000)
+    #[arg(long = "force-after", value_name = "MS")]
     force_after: Option<u64>,
+    /// Reply only once the turn has stopped
     #[arg(long)]
     wait: bool,
-    #[arg(long)]
-    handle: Option<String>,
-    #[arg(long)]
-    handle_file: Option<PathBuf>,
-    #[arg(long)]
-    handle_stdin: bool,
+    #[command(flatten)]
+    handle: HandleArgs,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct CloseArgs {
+    /// Session ID (s_...)
     session: String,
+    /// graceful lets the agent stop on its own; force stops running work at once
     #[arg(long, value_parser = ["graceful", "force"])]
     mode: Option<String>,
-    #[arg(long)]
+    /// How long a graceful close may take, in milliseconds
+    #[arg(long, value_name = "MS")]
     deadline_ms: Option<u64>,
-    #[arg(long)]
+    /// Key that makes a retried close return the original receipt
+    #[arg(long, value_name = "KEY")]
     op_key: Option<String>,
-    #[arg(long)]
-    handle: Option<String>,
-    #[arg(long)]
-    handle_file: Option<PathBuf>,
-    #[arg(long)]
-    handle_stdin: bool,
+    #[command(flatten)]
+    handle: HandleArgs,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
-/// C1 §3.7 `via status <session> [--turn N] [--after-step N] [--limit N]`.
 #[derive(Args)]
 struct StatusArgs {
+    /// Session ID (s_...)
     session: String,
-    #[arg(long)]
+    /// Turn number to describe (default: the running turn, else the latest)
+    #[arg(long, value_name = "N")]
     turn: Option<u32>,
-    #[arg(long)]
+    /// Show steps after this step number
+    #[arg(long, value_name = "N")]
     after_step: Option<u32>,
-    #[arg(long)]
+    /// Maximum steps to show (default 100, max 1000)
+    #[arg(long, value_name = "N")]
     limit: Option<u32>,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
-/// C1 §3.11 `via events <session|turn> [--after SEQ] [--limit N] [--types T,…]
-/// [--wait-ms N] [--follow]`.
 #[derive(Args)]
 struct EventsArgs {
+    /// Session ID (s_...) or turn address (s_.../N)
     address: String,
-    #[arg(long)]
+    /// Show events after this sequence number
+    #[arg(long, value_name = "SEQ")]
     after: Option<u64>,
-    #[arg(long)]
+    /// Maximum events to show (default 200, max 1000)
+    #[arg(long, value_name = "N")]
     limit: Option<u32>,
-    #[arg(long, value_delimiter = ',')]
+    /// Only these event types, comma separated (e.g. turn.ended,warning)
+    #[arg(long, value_delimiter = ',', value_name = "TYPES")]
     types: Option<Vec<String>>,
-    #[arg(long)]
+    /// Wait up to this many milliseconds for new events (max 30000)
+    #[arg(long, value_name = "MS")]
     wait_ms: Option<u64>,
+    /// Keep printing new events until Ctrl-C
     #[arg(long)]
     follow: bool,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
-/// C1 §3.10 `via list [--state S] [--harness H] [--label L] [--since T]
-/// [--limit N] [--cursor C]`.
 #[derive(Args)]
 struct ListArgs {
+    /// Only sessions in this state: idle, active or closed
     #[arg(long)]
     state: Option<String>,
+    /// Only sessions of this harness
     #[arg(long)]
     harness: Option<String>,
+    /// Only sessions with this label
     #[arg(long)]
     label: Option<String>,
-    #[arg(long)]
+    /// Only sessions active since this RFC 3339 time (e.g. 2026-10-01T00:00:00Z)
+    #[arg(long, value_name = "TIME")]
     since: Option<String>,
-    #[arg(long)]
+    /// Maximum sessions to show
+    #[arg(long, value_name = "N")]
     limit: Option<u32>,
+    /// Continue from a previous page's next cursor
     #[arg(long)]
     cursor: Option<String>,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct ReadArgs {
+    /// Turn address (s_.../N) or session ID (its latest turn)
     address: String,
+    /// Print JSON even on a terminal
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Subcommand)]
 enum DaemonCommand {
+    /// Show the daemon's version, sessions, health and storage
     Status {
+        /// Print JSON even on a terminal
         #[arg(long)]
         json: bool,
     },
+    /// Stop the daemon (refused while sessions are busy unless --drain or --force)
     Stop {
+        /// Refuse new work, let accepted turns finish, then stop
         #[arg(long)]
         drain: bool,
+        /// Force-close every session with unfinished work, then stop
         #[arg(long)]
         force: bool,
+        /// Print JSON even on a terminal
         #[arg(long)]
         json: bool,
     },
+}
+
+impl Command {
+    /// Whether `--json` was given. The entry points that never print a
+    /// result for people (`daemon`, `serve --stdio`) always use JSON.
+    fn json(&self) -> bool {
+        match self {
+            Self::Spawn(args) => args.json,
+            Self::Resume(args) => args.json,
+            Self::Steer(args) => args.json,
+            Self::Cancel(args) => args.json,
+            Self::Close(args) => args.json,
+            Self::Result(args) | Self::Logs(args) => args.json,
+            Self::Wait(args) => args.json,
+            Self::Events(args) => args.json,
+            Self::Status(args) => args.json,
+            Self::List(args) => args.json,
+            Self::Describe(args) => args.json,
+            Self::Models(args) => args.json,
+            Self::Daemon {
+                command: Some(DaemonCommand::Status { json } | DaemonCommand::Stop { json, .. }),
+            } => *json,
+            Self::Serve { .. } | Self::Daemon { command: None } => true,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -436,19 +612,26 @@ fn main() -> ExitCode {
             ) {
                 error.exit();
             }
+            // On a terminal, the parser's own message with its usage and tips.
+            if !render::wants_json(json_requested(), io::IsTerminal::is_terminal(&io::stderr())) {
+                // Safe to ignore: a failed write to stderr has no other outlet.
+                let _ = error.print();
+                return ExitCode::from(2);
+            }
             let _ = write_json(io::stderr(), &parse_error(&error).to_value());
             return ExitCode::from(2);
         }
     };
+    let json = cli.command.json();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = write_json(
-                io::stderr(),
+            let _ = render::error(
                 &json!({"code":4,"message":format!("runtime initialization failed: {error}"),"data":{"kind":"daemon_unreachable"}}),
+                json,
             );
             return ExitCode::from(4);
         }
@@ -458,11 +641,11 @@ fn main() -> ExitCode {
         Err(error) => {
             // Refused before sending: C1's request error.
             if let Some(request) = error.downcast_ref::<client::RequestError>() {
-                let _ = write_json(io::stderr(), &request.to_value());
+                let _ = render::error(&request.to_value(), json);
                 2
             } else {
                 let value = json!({"code": 4, "message": error.to_string(), "data": {"kind": "daemon_unreachable"}});
-                let _ = write_json(io::stderr(), &value);
+                let _ = render::error(&value, json);
                 4
             }
         }
@@ -471,6 +654,15 @@ fn main() -> ExitCode {
     // blocking task (such as a stalled Store join) it abandoned to process exit.
     runtime.shutdown_background();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+/// Whether `--json` is among the arguments before any `--`: the request
+/// for JSON when the parser refused the command line.
+fn json_requested() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json")
 }
 
 /// An argument the parser rejected, as C1's request error (review
@@ -554,25 +746,25 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
         Command::Daemon { command: None } => server::serve().await,
         Command::Daemon {
-            command: Some(DaemonCommand::Status { .. }),
-        } => client::call("daemon/status", &json!({}), true, true),
+            command: Some(DaemonCommand::Status { json }),
+        } => client::call(
+            "daemon/status",
+            &json!({}),
+            true,
+            Output::new(View::DaemonStatus, json),
+        ),
         Command::Daemon {
-            command: Some(DaemonCommand::Stop { drain, force, .. }),
+            command: Some(DaemonCommand::Stop { drain, force, json }),
         } => client::call(
             "daemon/stop",
             &json!({"drain": drain, "force": force}),
             // Stopping never starts a daemon.
             false,
-            true,
+            Output::new(View::DaemonStop, json),
         ),
         Command::Spawn(args) => spawn(args),
         Command::Resume(args) => {
-            let handle = client::read_handle(
-                args.handle_file.as_deref(),
-                args.handle_stdin,
-                args.handle.as_deref(),
-                false,
-            )?;
+            let handle = args.handle.read(false)?;
             let mut params = json!({"session":args.session,"handle":handle});
             args.prompt.apply(&mut params)?;
             if let Some(key) = args.op_key {
@@ -582,26 +774,27 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             if !args.vendor_args.is_empty() {
                 params["vendor_args"] = json!(args.vendor_args);
             }
-            client::call("resume", &params, true, true)
+            client::call(
+                "resume",
+                &params,
+                true,
+                Output::new(View::Resumed, args.json),
+            )
         }
         Command::Steer(args) => {
-            let handle = client::read_handle(
-                args.handle_file.as_deref(),
-                args.handle_stdin,
-                args.handle.as_deref(),
-                false,
-            )?;
+            let handle = args.handle.read(false)?;
             let mut params = json!({"session":args.session,"text":args.text,"handle":handle});
             if let Some(key) = args.op_key {
                 params["op_key"] = Value::String(key);
             }
-            client::call("steer", &params, true, true)
+            client::call("steer", &params, true, Output::new(View::Other, args.json))
         }
         Command::Cancel(args) => cancel(&args),
         Command::Close(args) => close(args),
         Command::Result(args) => {
             let response = client::request("result", &json!({"address":args.address}), true)?;
-            let Some(envelope) = client::emit_response(&response, true)? else {
+            let output = Output::new(View::Envelope, args.json);
+            let Some(envelope) = client::emit_response(&response, output)? else {
                 return Ok(2);
             };
             Ok(envelope_exit_code(&envelope))
@@ -609,7 +802,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Wait(args) => wait(&args),
         Command::Events(args) => events(args),
         Command::List(args) => list(args),
-        Command::Logs(args) => logs(&args.address),
+        Command::Logs(args) => logs(&args.address, args.json),
         Command::Status(args) => status(&args),
         Command::Describe(args) => describe(args),
         Command::Models(args) => {
@@ -617,7 +810,12 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             if let Some(harness) = args.harness {
                 params["harness"] = Value::String(harness);
             }
-            client::call("models", &params, true, true)
+            client::call(
+                "models",
+                &params,
+                true,
+                Output::new(View::Models, args.json),
+            )
         }
         Command::Serve { .. } => client::serve_stdio().await,
     }
@@ -645,17 +843,17 @@ fn describe(args: DescribeArgs) -> anyhow::Result<i32> {
     if args.allow_untested {
         params["allow_untested"] = Value::Bool(true);
     }
-    client::call("describe", &params, true, true)
+    client::call(
+        "describe",
+        &params,
+        true,
+        Output::new(View::Describe, args.json),
+    )
 }
 
 /// `via spawn` (C1 §3.2): foreground waits for the envelope.
 fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
-    let handle = client::read_handle(
-        args.handle_file.as_deref(),
-        args.handle_stdin,
-        args.handle.as_deref(),
-        true,
-    )?;
+    let handle = args.handle.read(true)?;
     let mut params = json!({"harness":args.harness,"model":args.model,"handle":handle});
     args.prompt.apply(&mut params)?;
     if let Some(path) = args.instructions {
@@ -692,7 +890,8 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
         result.insert("handle".to_owned(), Value::String(handle));
     }
-    let Some(receipt) = client::emit_response(&receipt, true)? else {
+    let Some(receipt) = client::emit_response(&receipt, Output::new(View::Receipt, args.json))?
+    else {
         return Ok(2);
     };
     if args.background {
@@ -712,7 +911,12 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
             break outcome;
         }
     };
-    let Some(envelope) = client::emit_response(&outcome, true)? else {
+    if !render::wants_json(args.json, io::IsTerminal::is_terminal(&io::stdout())) {
+        // Text: a blank line between the receipt and the result.
+        io::Write::write_all(&mut io::stdout().lock(), b"\n")?;
+    }
+    let output = Output::new(View::Envelope, args.json);
+    let Some(envelope) = client::emit_response(&outcome, output)? else {
         return Ok(2);
     };
     Ok(envelope_exit_code(&envelope))
@@ -743,7 +947,8 @@ fn wait(args: &WaitArgs) -> anyhow::Result<i32> {
     let read = read.saturating_add(Duration::from_secs(5));
     let _interrupt = exit_on_interrupt()?;
     let response = client::request_within("wait", &params, true, read)?;
-    let Some(envelope) = client::emit_response(&response, true)? else {
+    let output = Output::new(View::Envelope, args.json);
+    let Some(envelope) = client::emit_response(&response, output)? else {
         return Ok(2);
     };
     Ok(envelope_exit_code(&envelope))
@@ -769,17 +974,27 @@ fn status(args: &StatusArgs) -> anyhow::Result<i32> {
             params[member] = Value::from(value);
         }
     }
-    client::call("status", &params, true, true)
+    client::call(
+        "status",
+        &params,
+        true,
+        Output::new(View::Status, args.json),
+    )
 }
 
 /// `via logs` (C1 §3.12): exactly one of a session or a turn address.
-fn logs(address: &str) -> anyhow::Result<i32> {
+fn logs(address: &str, json: bool) -> anyhow::Result<i32> {
     let member = if address.contains('/') {
         "turn"
     } else {
         "session"
     };
-    client::call("logs", &json!({member: address}), true, true)
+    client::call(
+        "logs",
+        &json!({member: address}),
+        true,
+        Output::new(View::Logs, json),
+    )
 }
 
 /// `via events` (C1 §3.11): a session or a turn address, and the page's
@@ -801,12 +1016,18 @@ fn events(args: EventsArgs) -> anyhow::Result<i32> {
         params["types"] = Value::from(types);
     }
     if args.follow {
-        return follow(params, args.wait_ms);
+        return follow(params, args.wait_ms, args.json);
     }
     if let Some(wait) = args.wait_ms {
         params["wait_ms"] = Value::from(wait);
     }
-    client::call_within("events", &params, true, true, events_read(args.wait_ms))
+    client::call_within(
+        "events",
+        &params,
+        true,
+        Output::new(View::Events, args.json),
+        events_read(args.wait_ms),
+    )
 }
 
 /// Read bound of an `events` call: the daemon replies by `wait_ms`; allow
@@ -819,19 +1040,20 @@ fn events_read(wait_ms: Option<u64>) -> Duration {
 
 /// `via events --follow` (C1 §3.11): long-polls from each reply's
 /// `next_after` (`--wait-ms`, else the longest bound, per poll) and writes
-/// each page that has events as `via events` writes a page, until Ctrl-C
-/// (exit 130) or a request error (exit 2).
-fn follow(mut params: Value, wait_ms: Option<u64>) -> anyhow::Result<i32> {
+/// each page that has events as `via events` writes a page (as text rows
+/// on a terminal), until Ctrl-C (exit 130) or a request error (exit 2).
+fn follow(mut params: Value, wait_ms: Option<u64>, json: bool) -> anyhow::Result<i32> {
     let wait = wait_ms
         .filter(|wait| *wait > 0)
         .unwrap_or(via_core::EVENTS_WAIT_MAX_MS);
     params["wait_ms"] = Value::from(wait);
     let read = events_read(Some(wait));
+    let as_json = render::wants_json(json, io::IsTerminal::is_terminal(&io::stdout()));
     let _interrupt = exit_on_interrupt()?;
     loop {
         let response = client::request_within("events", &params, true, read)?;
         if response.get("error").is_some() {
-            client::emit_response(&response, true)?;
+            client::emit_response(&response, Output::new(View::Events, json))?;
             return Ok(2);
         }
         let page = response
@@ -846,7 +1068,11 @@ fn follow(mut params: Value, wait_ms: Option<u64>) -> anyhow::Result<i32> {
             // exits, so a page a reader drains is never cut; one a stalled
             // reader leaves blocked may end unfinished (C1 §3.11).
             let mut stdout = io::stdout().lock();
-            write_json(&mut stdout, page)?;
+            if as_json {
+                write_json(&mut stdout, page)?;
+            } else {
+                io::Write::write_all(&mut stdout, render::event_rows(page).as_bytes())?;
+            }
             io::Write::flush(&mut stdout)?;
         }
         params["after"] = page["next_after"].clone();
@@ -870,17 +1096,12 @@ fn list(args: ListArgs) -> anyhow::Result<i32> {
     if let Some(limit) = args.limit {
         params["limit"] = Value::from(limit);
     }
-    client::call("list", &params, true, true)
+    client::call("list", &params, true, Output::new(View::List, args.json))
 }
 
 /// `via cancel` (C1 §3.5).
 fn cancel(args: &CancelArgs) -> anyhow::Result<i32> {
-    let handle = client::read_handle(
-        args.handle_file.as_deref(),
-        args.handle_stdin,
-        args.handle.as_deref(),
-        false,
-    )?;
+    let handle = args.handle.read(false)?;
     let mut params = json!({"session":args.session,"handle":handle});
     if let Some(turn) = args.turn {
         params["turn"] = Value::from(turn);
@@ -896,17 +1117,18 @@ fn cancel(args: &CancelArgs) -> anyhow::Result<i32> {
     } else {
         Duration::from_secs(30)
     };
-    client::call_within("cancel", &params, true, true, read)
+    client::call_within(
+        "cancel",
+        &params,
+        true,
+        Output::new(View::Cancelled, args.json),
+        read,
+    )
 }
 
 /// `via close` (C1 §3.6).
 fn close(args: CloseArgs) -> anyhow::Result<i32> {
-    let handle = client::read_handle(
-        args.handle_file.as_deref(),
-        args.handle_stdin,
-        args.handle.as_deref(),
-        false,
-    )?;
+    let handle = args.handle.read(false)?;
     let mut params = json!({"session":args.session,"handle":handle});
     if let Some(mode) = args.mode {
         params["mode"] = Value::String(mode);
@@ -922,7 +1144,13 @@ fn close(args: CloseArgs) -> anyhow::Result<i32> {
     // The close replies once settled, within its deadline plus the
     // time a running turn's terminal takes.
     let read = read.saturating_add(Duration::from_secs(30));
-    client::call_within("close", &params, true, true, read)
+    client::call_within(
+        "close",
+        &params,
+        true,
+        Output::new(View::Closed, args.json),
+        read,
+    )
 }
 
 /// Exit status of a foreground `spawn`, `wait` or `events --follow` the
@@ -976,11 +1204,6 @@ impl Drop for Interrupt {
 /// Read bound of `cancel --wait`, whose reply waits for the turn's terminal.
 const CANCEL_WAIT_READ: Duration = Duration::from_hours(24);
 
-fn write_json(mut output: impl io::Write, value: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut output, value)?;
-    output.write_all(b"\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1217,41 @@ mod tests {
             assert_eq!(envelope_exit_code(&json!({"state": state})), 0, "{state}");
         }
         assert_eq!(envelope_exit_code(&json!({})), 0);
+    }
+
+    /// Every command and every visible argument has a description, and no
+    /// help text cites a specification.
+    #[test]
+    fn help_describes_everything_in_plain_language() {
+        let mut root = Cli::command();
+        root.build();
+        let mut commands = vec![(String::from("via"), root)];
+        let mut problems = Vec::new();
+        while let Some((path, mut command)) = commands.pop() {
+            if command.get_about().is_none() {
+                problems.push(format!("{path}: no description"));
+            }
+            for arg in command.get_arguments() {
+                let id = arg.get_id().as_str();
+                if !arg.is_hide_set()
+                    && arg.get_help().is_none()
+                    && !matches!(id, "help" | "version")
+                {
+                    problems.push(format!("{path} {id}: no description"));
+                }
+            }
+            let help = command.render_long_help().to_string();
+            for cited in ["C1", "§", "Task ", "design"] {
+                if help.contains(cited) {
+                    problems.push(format!("{path}: help cites {cited:?}"));
+                }
+            }
+            for sub in command.get_subcommands() {
+                if sub.get_name() != "help" {
+                    commands.push((format!("{path} {}", sub.get_name()), sub.clone()));
+                }
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
     }
 }

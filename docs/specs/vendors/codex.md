@@ -243,7 +243,10 @@ by a synced temporary file and atomic rename, within discovery's 1 MiB byte
 budget plus 4 KiB of snapshot header. Bootstrap reads it without following
 symlinks; absent, unsafe, oversized or corrupt files are cache misses.
 `models` and model resolution use a matching recipe's saved complete catalog
-after retirement or daemon restart. A complete live discovery replaces the
+after retirement or daemon restart. With neither a live nor a saved catalog
+for the default recipe, C1 `models` launches (or joins) that recipe's server
+through the registry, reads its handshake's catalog as a turn would, and
+releases it (owner 2026-10-12, C1 §3.13). A complete live discovery replaces the
 in-memory snapshot; failed or partial discovery never does. Persistence replaces
 an absent or corrupt private file. An unsafe target is never repaired and remains
 a bootstrap cache miss until removed (runtime §6.1). Effort validation still uses

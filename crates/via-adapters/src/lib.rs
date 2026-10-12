@@ -186,6 +186,7 @@ mod capabilities;
 mod claude;
 mod codex;
 mod config;
+mod discovery;
 mod driver;
 mod fake;
 mod harness;
@@ -206,6 +207,7 @@ pub use config::{
     AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ClaudeMode, CodexSettings, ConfigError,
     FakeFixture, HarnessConfig, HarnessSettings, HarnessesError, HarnessesRule,
 };
+pub use discovery::{CatalogStatus, HarnessCatalog, ModelsReport};
 #[cfg(feature = "test-failpoints")]
 pub use driver::StandIn;
 pub use driver::{
