@@ -590,7 +590,9 @@ See [Codex §5](vendors/codex.md) for the full reviewed failure scenarios.
 - **Private per-turn process routes** (Claude, Pi, fake): after the process exits
   and Host has reported group cleanup, bounded by the S1 rules (wall
   deadline, `force_at`, `close_by`, 3 s allowance). A tool that ended never
-  shortens this.
+  shortens this. Claude's exit after its result is bounded by a 5 s grace
+  (`vendors/claude-code.md` §7): past it, or at Claude's own follow-up init,
+  Host force-closes the group and the turn keeps its result.
 - **Persistent-server routes** (Codex, OpenCode) after a `Completed` or
   `Failed` terminal: at once. Cleanup does not apply without a cancel
   (C1 §7.3).

@@ -33,6 +33,13 @@ use via_wire::{
 /// first byte, or the turn fails closed.
 const DECLINE_WITHIN: Duration = Duration::from_secs(5);
 
+/// How long Claude Code may take to exit after the result and stdin EOF.
+/// It normally exits within a second; a background task (a `Bash` call
+/// with `run_in_background`) keeps it alive until the task ends, and then
+/// it starts a follow-up turn of its own (observed on 2.1.295). The VIA
+/// turn ends at its result, so past this grace Host force-closes the group.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
 /// The decoded messages that may wait for room on the hop before Route
 /// stops reading (runtime §8: 1,024 messages of route data, with its
 /// 4 MiB). Reading ahead keeps the control lane answered while the
@@ -265,11 +272,15 @@ impl PrivateProtocol for ClaudeLane {
         })
     }
 
-    /// The phase rules Route keeps: after the result, a second result, an
-    /// init or a control request (stdin is closed: it cannot be declined)
-    /// fails the turn `protocol`, unless that init or result names another
-    /// session than the result Route kept: that is the Adapter's identity
-    /// check (C2 §2's mismatch after a retained terminal), handed on.
+    /// The phase rules Route keeps: after the result, a second result or a
+    /// control request (stdin is closed: it cannot be declined) fails the
+    /// turn `protocol`, unless that result names another session than the
+    /// result Route kept: that is the Adapter's identity check (C2 §2's
+    /// mismatch after a retained terminal), handed on, as is an init of
+    /// another session. An init of the same session after the result is
+    /// Claude Code's own follow-up turn, begun once a background task
+    /// ended: it is not handed on, and the finalization ends now, so the
+    /// group is force-closed and the turn keeps its result.
     /// Before the result, a control request is declined at once, and
     /// handed on only once its decline was written whole.
     async fn admit(
@@ -297,7 +308,10 @@ impl PrivateProtocol for ClaudeLane {
         }
         match message {
             Message::Result(_) if read => Err(protocol(turn, "a second result").into()),
-            Message::Init(_) if read => Err(protocol(turn, "an init after the result").into()),
+            Message::Init(_) if read => {
+                serving.deadline = Deadline::at(tokio::time::Instant::now());
+                Ok(None)
+            }
             Message::ControlRequest(_) if read => Err(protocol(turn, UNANSWERED).into()),
             Message::ControlRequest(request) => Self::decline(serving, request).await,
             Message::Result(result) => {
@@ -349,12 +363,16 @@ impl PrivateProtocol for ClaudeLane {
         true
     }
 
-    /// Per turn: stdin EOF after the result, then S1's close (AD19).
+    /// Per turn: stdin EOF after the result, then S1's close (AD19),
+    /// within [`EXIT_GRACE`] of the result: past it the finalization takes
+    /// the late path, which force-closes the group and keeps the result.
     fn after_terminal<'s>(
-        _serving: &'s mut Serving<'_, Self>,
+        serving: &'s mut Serving<'_, Self>,
         _messages: &'s mut WireMessages,
         terminal: ResultRead,
     ) -> impl Future<Output = Result<AfterTerminal<Self>, Failed>> + Send + 's {
+        let grace = tokio::time::Instant::now() + EXIT_GRACE;
+        serving.deadline = Deadline::at(serving.deadline.instant().min(grace));
         std::future::ready(Ok(AfterTerminal::Finalize(terminal)))
     }
 

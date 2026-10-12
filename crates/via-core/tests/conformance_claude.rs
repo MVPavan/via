@@ -1078,6 +1078,100 @@ fn claude_terminal_protected_before_room() {
     conformance_expect::check(&expect, &outcome).unwrap();
 }
 
+/// A Claude Code background task (a `Bash` call with `run_in_background`)
+/// keeps the process alive after its `result` and stdin EOF; once the task
+/// ends, Claude Code starts a follow-up turn of its own with a fresh init
+/// (observed live on 2.1.295). The VIA turn ends at its result: a process
+/// still alive after the exit grace, or one that begins such a follow-up,
+/// is force-closed (the fake takes the anchor's `SIGTERM`), and the turn
+/// completes with its result, promptly. `tail` follows the result's
+/// `await_eof`; the wall is long, so only the grace can end the turn in
+/// time.
+fn check_background_task(
+    variant: &str,
+    tail: &[Value],
+    knobs: conformance_run::Knobs,
+) -> Result<(), String> {
+    let name = "claude_lazy_init_acceptance";
+    let mut replay = replay_of(name)?;
+    let base = replay["steps"].as_array().ok_or("no steps")?.clone();
+    let (result_at, _) = emit_step(&mut replay, None, "\"type\":\"result\"")?;
+    if result_at != 6 {
+        return Err(format!("{name}: the result is step {result_at}, not 6"));
+    }
+    // The init and its thinking tokens, then the reply and its result
+    // without the SIGUSR1 gate between them.
+    let mut steps = base[..4].to_vec();
+    steps.extend_from_slice(&base[5..=6]);
+    steps.push(json!({"await_eof": {}}));
+    steps.extend_from_slice(tail);
+    replay["steps"] = json!(steps);
+    replay["deadline_ms"] = json!(40_000);
+    let mut expect = conformance_expect::load(&fixtures(), name)?;
+    let turn = &mut expect["turns"][0];
+    turn["gates"] = json!([]);
+    turn["deadlines"] = json!({"wall_ms": 20_000, "idle_ms": 60_000});
+    turn["expect"]["exit"] = json!({"code": 143, "signal": null});
+    let started = std::time::Instant::now();
+    check_variant(variant, &replay, &expect, knobs)?;
+    let took = started.elapsed();
+    if took >= std::time::Duration::from_secs(12) {
+        return Err(format!(
+            "{variant}: the turn ended {took:?} after its start, not at its result's exit grace"
+        ));
+    }
+    Ok(())
+}
+
+/// The background task outlives the exit grace: no follow-up yet.
+#[test]
+fn claude_background_task_outlives_result() {
+    let tail = [
+        json!({"await_signal": {"signal": "SIGTERM"}}),
+        json!({"exit": {"code": 143, "stderr": ""}}),
+    ];
+    let knobs = conformance_run::Knobs::default();
+    check_background_task("claude_background_task_lingers", &tail, knobs).unwrap();
+}
+
+/// The background task ends: Claude Code's own follow-up begins with an
+/// init after the result, which ends the turn as its result, never as a
+/// protocol failure.
+#[test]
+fn claude_background_task_follow_up_init() {
+    let mut replay = replay_of("claude_lazy_init_acceptance").unwrap();
+    let (_, init) = emit_step(&mut replay, None, "\"subtype\":\"init\"").unwrap();
+    let tail = [
+        json!({"delay": {"ms": 200}}),
+        json!({"emit": {"line": init}}),
+        emit(&json!({
+            "type": "assistant",
+            "message": {"id": "msg_follow_up", "role": "assistant",
+                "content": [{"type": "text", "text": "No response requested."}]},
+            "session_id": "${sid}",
+        })),
+        json!({"await_signal": {"signal": "SIGTERM"}}),
+        json!({"exit": {"code": 143, "stderr": ""}}),
+    ];
+    let knobs = conformance_run::Knobs::default();
+    check_background_task("claude_background_task_follow_up", &tail, knobs).unwrap();
+}
+
+/// A cancel ordered while the background task holds the process after the
+/// result does not wait for the task: the turn still ends at the grace.
+#[test]
+fn claude_background_task_cancel_settles() {
+    let tail = [
+        json!({"await_signal": {"signal": "SIGTERM"}}),
+        json!({"exit": {"code": 143, "stderr": ""}}),
+    ];
+    let knobs = conformance_run::Knobs {
+        stop_after: Some(std::time::Duration::from_millis(1500)),
+        ..conformance_run::Knobs::default()
+    };
+    check_background_task("claude_background_task_cancel", &tail, knobs).unwrap();
+}
+
 /// Carry-item 1 (Claude ruling C1, packet §5): a session-cumulative cost
 /// lower than the session's last one is an unexpected counter reset: the
 /// turn warns `cost_counter_reset` (outside C1 §5's closed list, so the

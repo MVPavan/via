@@ -671,7 +671,13 @@ Do not dispatch the next turn until Core permits it under the cleanup gate.
 Close is per turn: stdin EOF after the result, then S1's close. Early EOF
 with no active tool completes the turn (c10), and EOF does not stop an active
 tool, so a running turn is interrupted first. Graceful close closes stdin only
-on this private connection and waits through the absolute deadline. A running turn first follows the appropriate Core
+on this private connection and waits for the exit at most 5 s after the
+result (never past the wall). A background task (`Bash` with
+`run_in_background`) keeps Claude alive after its result and stdin EOF; once
+the task ends, Claude starts a follow-up turn of its own with a new init of
+the same session (observed on 2.1.295). The VIA turn ends at its result: past
+the 5 s, or at that init, Host force-closes the group and the turn keeps its
+result; nothing of the follow-up is read. A running turn first follows the appropriate Core
 drain/cancel policy; close does not manufacture a cancel acknowledgement. At the
 deadline request cleanup through Route/Wire/Host's verified anchor. `Forced`
 requires Host evidence that the anchor issued force; quiescence and reaping are
