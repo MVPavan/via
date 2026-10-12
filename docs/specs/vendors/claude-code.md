@@ -677,7 +677,11 @@ result (never past the wall). A background task (`Bash` with
 the task ends, Claude starts a follow-up turn of its own with a new init of
 the same session (observed on 2.1.295). The VIA turn ends at its result: past
 the 5 s, or at that init, Host force-closes the group and the turn keeps its
-result; nothing of the follow-up is read. A running turn first follows the appropriate Core
+result; nothing of the follow-up is read. The next turn's resumed process
+first runs a turn of its own for the task's pending notification (no model
+call on 2.1.296) and emits its `result`, marked `origin.kind:
+"task-notification"`, before the prompt's turn: Route drops such a result,
+which is never the VIA turn's terminal, and reads on to the prompt's result. A running turn first follows the appropriate Core
 drain/cancel policy; close does not manufacture a cancel acknowledgement. At the
 deadline request cleanup through Route/Wire/Host's verified anchor. `Forced`
 requires Host evidence that the anchor issued force; quiescence and reaping are
