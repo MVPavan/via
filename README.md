@@ -74,6 +74,21 @@ via close "$SESSION" --handle-file handle
 Use `via describe --harness <h> --model <m> --bound full --network` to see
 what a route supports before running anything; it starts no agent.
 
+## Roadmap
+
+In the pipeline, not in 0.1.0:
+
+- **An ACP route.** One generic route for Zed's
+  [Agent Client Protocol](https://agentclientprotocol.com), so any harness
+  that speaks ACP, natively (such as `gemini --acp` or `opencode acp`) or
+  through a bridge, plugs into VIA without a dedicated adapter. This opens
+  VIA to many more harnesses at once.
+- **More harnesses:** Cursor, Gemini CLI, Devin, Amp, Kimi, Goose, Droid,
+  Cline and others.
+- **More lifecycle control:** steering a running turn, and pause.
+- **macOS.** Help from Mac users is very welcome.
+- **Leftover-process reporting** in the result envelope.
+
 ## Documentation
 
 - [User guide](docs/usage.md): every verb, models, envelope, exit codes,
