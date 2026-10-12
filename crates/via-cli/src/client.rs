@@ -13,6 +13,8 @@ use std::{
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
+use crate::render::{self, Output};
+
 const MAX_LINE: u64 = 16 * 1024 * 1024;
 
 pub(crate) struct Paths {
@@ -310,6 +312,7 @@ fn spawn_daemon(paths: &Paths) -> anyhow::Result<Starting> {
         "VIA_FAILPOINT_DIR",
         "VIA_FAILPOINT_TOKEN",
         "VIA_TEST_HARNESS_PROCESSES",
+        "VIA_TEST_MODELS_DISCOVERY_MS",
         "VIA_TEST_IDLE_EXIT_MS",
         "VIA_TEST_CLIENT_VERSION",
         "VIA_TEST_PARTIAL_LINE_MS",
@@ -679,16 +682,18 @@ pub(crate) fn request_within(
     }
 }
 
-pub(crate) fn emit_response(response: &Value, _json_output: bool) -> anyhow::Result<Option<Value>> {
+/// Prints a reply: its result on stdout, or its error on stderr (then
+/// `None`), each as `output` says.
+pub(crate) fn emit_response(response: &Value, output: Output) -> anyhow::Result<Option<Value>> {
     if let Some(error) = response.get("error") {
-        super::write_json(io::stderr(), error)?;
+        render::error(error, output.json)?;
         return Ok(None);
     }
     let result = response
         .get("result")
         .context("daemon reply has no result")?
         .clone();
-    super::write_json(io::stdout(), &result)?;
+    output.result(&result)?;
     Ok(Some(result))
 }
 
@@ -696,15 +701,9 @@ pub(crate) fn call(
     method: &str,
     params: &Value,
     auto_start: bool,
-    json_output: bool,
+    output: Output,
 ) -> anyhow::Result<i32> {
-    call_within(
-        method,
-        params,
-        auto_start,
-        json_output,
-        Duration::from_secs(30),
-    )
+    call_within(method, params, auto_start, output, Duration::from_secs(30))
 }
 
 /// `call` whose reply may take up to `read`.
@@ -712,11 +711,11 @@ pub(crate) fn call_within(
     method: &str,
     params: &Value,
     auto_start: bool,
-    json_output: bool,
+    output: Output,
     read: Duration,
 ) -> anyhow::Result<i32> {
     let response = request_within(method, params, auto_start, read)?;
-    Ok(if emit_response(&response, json_output)?.is_some() {
+    Ok(if emit_response(&response, output)?.is_some() {
         0
     } else {
         2

@@ -8,6 +8,7 @@
 
 mod catalog;
 mod delivery;
+mod discover;
 mod driver;
 #[cfg(test)]
 mod driver_tests;

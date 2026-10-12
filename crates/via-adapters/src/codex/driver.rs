@@ -1231,7 +1231,7 @@ pub(super) fn mark_initialized(home: &Path) {
 
 /// Creates `<state>/vendor/codex` (0700) when missing; a non-directory or
 /// a symlink there is refused.
-fn ensure_home(home: &Path) -> std::io::Result<()> {
+pub(super) fn ensure_home(home: &Path) -> std::io::Result<()> {
     match std::fs::DirBuilder::new().mode(0o700).create(home) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1765,20 +1765,10 @@ fn adopt(
 ) -> Arc<[DiscoveredModel]> {
     let adapter = &facts.session.adapter;
     facts.instance = Some(instance_report(&server.user_agent));
-    if let Some(version) = normalize::instance_version(&server.user_agent) {
-        adapter
-            .instances
-            .record_version(HARNESS, &adapter.binary, version.to_owned());
-    }
-    let catalog: Arc<[DiscoveredModel]> = server.models.iter().map(normalize::discovered).collect();
     let spec = &facts.driver.spec;
     let key = adapter.server_key(spec.inherit.requested, &spec.vendor_args);
-    if adapter.discovered(
-        key,
-        id.clone(),
-        Arc::clone(&catalog),
-        normalize::instance_version(&server.user_agent).map(str::to_owned),
-    ) {
+    let (catalog, replaced) = adapter.learned(key, id, server);
+    if replaced {
         let saved = Arc::clone(&adapter.saved_catalog);
         let vendor = adapter.servers.vendor_state_dir().to_path_buf();
         // Packet §3: the driver's tracker owns this best-effort write

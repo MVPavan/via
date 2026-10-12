@@ -199,6 +199,25 @@ pub(crate) fn argv(recipe: &Recipe<'_>) -> Vec<OsString> {
     args
 }
 
+/// The `models` probe's argv (owner 2026-10-12): RPC mode with no
+/// session file, under the recipe's no-trust, no-extension, no-template
+/// and offline switches (packet §4.1). It is never prompted, so no model,
+/// tools or session identity are named.
+pub(crate) fn probe_argv() -> Vec<OsString> {
+    [
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--no-approve",
+        "-ne",
+        "-np",
+        "--offline",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
+}
+
 /// Why VIA's own Pi state is not used (picrit #1, runtime §6.1): the
 /// shared managed-directory refusal.
 pub(super) use crate::private_dir::Unsafe;
@@ -328,6 +347,29 @@ impl PiAdapter {
         ]);
         // Seven distinct names: always valid.
         EnvAllowList::try_from_entries(entries).unwrap_or_else(|_| EnvAllowList::default())
+    }
+
+    /// The `models` probe's process ([`probe_argv`]) in `<vendor>/pi`,
+    /// with the launch environment and its harness-process slot.
+    pub(crate) fn probe_spec(
+        &self,
+        owner: ProcessOwner,
+        capacity: crate::CapacityToken,
+    ) -> PrivateProcessSpec {
+        PrivateProcessSpec {
+            program: self.binary.clone(),
+            args: probe_argv(),
+            cwd: pi_state(&self.vendor_state_dir),
+            env: self.env_list(),
+            owner,
+            // Wire creates the server-owned evidence folder and names it.
+            stderr_path: PathBuf::new(),
+            capacity: Some(capacity),
+            die_with_anchor: false,
+            exclusive_lock: None,
+            version_probe: None,
+            stderr: crate::StderrCapture::Log,
+        }
     }
 
     /// One launch's process: the binary with the recipe's argv in the

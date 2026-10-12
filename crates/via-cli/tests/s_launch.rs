@@ -65,6 +65,9 @@ struct Sandbox {
     daemon: Option<Child>,
     /// The teardown's one deadline, once it began.
     deadline: Rc<Cell<Option<Instant>>>,
+    /// Cleared by a scenario whose CLI and daemon must not find the host's
+    /// vendor binaries: their `PATH` is then [`Self::bin`] alone.
+    host_path: bool,
 }
 
 impl Sandbox {
@@ -98,6 +101,7 @@ impl Sandbox {
             store: true,
             daemon: None,
             deadline: Rc::default(),
+            host_path: true,
         })
     }
 
@@ -143,7 +147,7 @@ impl Sandbox {
 
     fn command(&self) -> Command {
         let mut path = OsString::from(self.bin.as_os_str());
-        if let Some(inherited) = std::env::var_os("PATH") {
+        if let Some(inherited) = std::env::var_os("PATH").filter(|_| self.host_path) {
             path.push(":");
             path.push(inherited);
         }
@@ -535,20 +539,23 @@ fn marking_script(path: &Path, marker: &Path) -> TestResult {
 
 /// What one vendor harness answers once configured (C2 §7 item 1): its
 /// `describe` refusal kind, `None` once it plans, for the model its row
-/// names (or none), and its `models` list.
+/// names (or none), its `models` list and that list's `harnesses` status.
 struct LaunchRow {
     harness: &'static str,
     model: Option<&'static str>,
     refused: Option<&'static str>,
     models: Value,
+    status: &'static str,
 }
 
 /// The per-harness expectations. A vendor adapter that does not plan yet
 /// refuses `describe` with `harness_unavailable` and lists no models. Each
 /// adapter track flips its own row: Claude (x.3.2 C1) plans from its
-/// bundled catalog; Codex (x.3.2 X1) plans a named model, and lists none
-/// before discovery, since it has no bundled catalog; so does `OpenCode`
-/// (via-4sw.3.2, packet §6), whose catalog is its live server's.
+/// bundled catalog; Codex (x.3.2 X1) plans a named model, and has no
+/// bundled catalog; nor does `OpenCode` (via-4sw.3.2, packet §6), whose
+/// catalog is its live server's. Their `models` discovers on demand
+/// (owner 2026-10-12): the marker scripts here are no server, so it
+/// fails with `status: error` and lists nothing.
 fn launch_rows() -> [LaunchRow; 3] {
     let bundled = |model| json!({"model":model,"harness":"claude","aliases":[],"source":"bundled"});
     [
@@ -557,28 +564,34 @@ fn launch_rows() -> [LaunchRow; 3] {
             model: None,
             refused: None,
             models: json!([bundled("sonnet"), bundled("opus"), bundled("haiku")]),
+            status: "ok",
         },
         LaunchRow {
             harness: "codex",
             model: Some("gpt-6-sol"),
             refused: None,
             models: json!([]),
+            status: "error",
         },
         LaunchRow {
             harness: "opencode",
             model: Some("opencode/big-pickle"),
             refused: None,
             models: json!([]),
+            status: "error",
         },
     ]
 }
 
 /// C2 §7 item 1, design §7 S-LAUNCH acceptance: with `harnesses.claude`
 /// and `harnesses.codex` pinned to marker-writing executables, and
-/// `opencode` (and the defaults) on the client's `PATH`, `describe` and
-/// `models` for each vendor harness run no binary, and neither does
-/// `daemon status`, which lists no shared server. Each harness's result is
-/// its [`launch_rows`] row. A guard for x.3.2.
+/// `opencode` (and the defaults) on the client's `PATH`, `describe` for
+/// each vendor harness runs no binary, and neither does `daemon status`,
+/// which lists no shared server. `models` then discovers (owner
+/// 2026-10-12): Claude's bundled catalog runs nothing, and the two
+/// discovering harnesses report their failed discovery without failing the
+/// call. Each harness's result is its [`launch_rows`] row. A guard for
+/// x.3.2.
 #[test]
 fn s_launch_describe_starts_nothing() -> TestResult {
     evidenced(|| {
@@ -623,14 +636,6 @@ fn s_launch_describe_starts_nothing() -> TestResult {
                 planned
             };
             check(planned, || format!("describe {harness}: {outcomes:?}"))?;
-            let models = sandbox.run(&["models", "--harness", harness, "--json"])?;
-            let listed: Value = serde_json::from_slice(&models.stdout).unwrap_or(Value::Null);
-            outcomes.push(json!({"models":harness,"exit":models.status.code(),
-                "stdout":listed,"stderr":String::from_utf8_lossy(&models.stderr)}));
-            check(
-                models.status.success() && listed["models"] == row.models,
-                || format!("models {harness}: {outcomes:?}"),
-            )?;
         }
         let status = sandbox.run(&["daemon", "status", "--json"])?;
         let reported: Value = serde_json::from_slice(&status.stdout).unwrap_or(Value::Null);
@@ -643,7 +648,23 @@ fn s_launch_describe_starts_nothing() -> TestResult {
                 "a vendor binary ran: {}",
                 fs::read_to_string(&marker).unwrap_or_default()
             )
-        })
+        })?;
+        for row in launch_rows() {
+            let harness = row.harness;
+            let models = sandbox.run(&["models", "--harness", harness, "--json"])?;
+            let listed: Value = serde_json::from_slice(&models.stdout).unwrap_or(Value::Null);
+            outcomes.push(json!({"models":harness,"exit":models.status.code(),
+                "stdout":listed,"stderr":String::from_utf8_lossy(&models.stderr)}));
+            check(
+                models.status.success()
+                    && listed["models"] == row.models
+                    && listed["harnesses"][0]["harness"] == harness
+                    && listed["harnesses"][0]["status"] == row.status
+                    && listed["harnesses"].as_array().map(Vec::len) == Some(1),
+                || format!("models {harness}: {outcomes:?}"),
+            )?;
+        }
+        Ok(())
     })
 }
 
@@ -1105,5 +1126,395 @@ fn s_launch_startup_wait_keeps_its_deadline() -> TestResult {
             }),
             || format!("readiness accepted after the startup deadline: {late:?}"),
         )
+    })
+}
+
+// ------------------------------------------------- models: on-demand discovery
+
+/// The catalog the fake Codex server lists: Sol (its default) and Luna.
+fn codex_model(model: &str, default: bool) -> Value {
+    json!({"id":model,"model":model,"upgrade":null,"upgradeInfo":null,
+        "displayName":model,"description":"A model in the fixture's catalog.",
+        "modelSpecialty":null,"hidden":false,
+        "supportedReasoningEfforts":[{"reasoningEffort":"low","description":"low"},
+            {"reasoningEffort":"medium","description":"medium"}],
+        "defaultReasoningEffort":"medium","inputModalities":["text"],
+        "supportsPersonality":false,"isDefault":default})
+}
+
+/// A replaying `codex app-server` that answers the handshake VIA's
+/// registry runs (`initialize`, `initialized`, one `model/list` page) and
+/// then waits for its stdin to close, as a retired server's does.
+fn codex_server() -> Value {
+    let page = json!({"id":"MODELS","result":{"data":[codex_model("gpt-6-sol", true),
+        codex_model("gpt-6-luna", false)],"nextCursor":null}})
+    .to_string()
+    .replace("\"MODELS\"", "${models}");
+    json!({
+        "source": "synthetic (via-l47.2): the Codex handshake VIA's discovery reads",
+        "argv": ["app-server", "--disable", "memories"],
+        "deadline_ms": 20000,
+        "steps": [
+            {"expect":{"line":{"method":"initialize"},"capture":{"init":"/id"}}},
+            {"emit":{"line":"{\"id\":${init},\"result\":{\"userAgent\":\"via/0.159.2 (Linux 6.0.0; x86_64) unknown (via; 0.0.0)\",\"codexHome\":\"/state/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}"}},
+            {"expect":{"line":{"method":"initialized"}}},
+            {"expect":{"line":{"method":"model/list"},"capture":{"models":"/id"}}},
+            {"emit":{"line":page}},
+            {"await_eof":{}}
+        ]
+    })
+}
+
+/// The Pi probe's argv (C1 §3.13): RPC mode, no session, no trust,
+/// extensions or templates, offline.
+const PI_PROBE: [&str; 7] = [
+    "--mode",
+    "rpc",
+    "--no-session",
+    "--no-approve",
+    "-ne",
+    "-np",
+    "--offline",
+];
+
+/// A replaying `pi --mode rpc` that answers the one `get_available_models`
+/// (or, with `answer` false, never answers it) and ends at stdin EOF.
+fn pi_probe(answer: bool) -> Value {
+    let reply = json!({"command":"get_available_models","data":{"models":[
+        {"id":"gpt-6-luna","name":"GPT-6 Luna","provider":"openai"},
+        {"id":"gpt-6-sol","name":"GPT-6 Sol","provider":"openai"}]},
+        "id":"ID","success":true,"type":"response"})
+    .to_string()
+    .replace("\"ID\"", "${gm}");
+    let mut steps = vec![json!({"expect":{"line":{"type":"get_available_models"},
+        "capture":{"gm":"/id"}}})];
+    if answer {
+        steps.push(json!({"emit":{"line":reply}}));
+    }
+    steps.push(json!({"await_eof":{}}));
+    json!({
+        "source": "synthetic (via-l47.2): the Pi models probe",
+        "argv": PI_PROBE,
+        "deadline_ms": 20000,
+        "steps": steps
+    })
+}
+
+/// A fake `opencode serve --stdio` answering only the handshake's routes:
+/// its version, no integration, a one-model catalog and the event stream.
+fn opencode_server() -> Value {
+    let route = |method: &str, path: &str, responses: Value| json!({"method":method,"path":path,"responses":responses});
+    json!({"routes": [
+        route("GET", "/api/info", json!([{"status":200,"json":{"version":"2.0.22","pid":"$PID"}}])),
+        route("GET", "/api/integration", json!([{"status":200,"json":{"data":[]}}])),
+        route("GET", "/api/model", json!([{"status":200,"json":{"data":[
+            {"providerID":"opencode","id":"big-pickle","name":"Big Pickle","variants":[]}]}}])),
+        {"method":"GET","path":"/api/event",
+         "sse":{"events":[{"type":"server.connected","properties":{}}]}},
+    ]})
+}
+
+impl Sandbox {
+    /// `<root>/vendor/<name>`: a link to the fake beside its fixture
+    /// `<name>.<kind>.json` (`replay` or `opencode`), the binary a
+    /// scenario pins.
+    fn fake_vendor(&self, name: &str, kind: &str, fixture: &Value) -> TestResult<PathBuf> {
+        let dir = self.root.path().join("vendor");
+        if !dir.exists() {
+            daemon::private_dir(&dir)?;
+        }
+        let program = dir.join(name);
+        std::os::unix::fs::symlink(&self.fake, &program)?;
+        fs::write(
+            dir.join(format!("{name}.{kind}.json")),
+            serde_json::to_vec(fixture)?,
+        )?;
+        Ok(program)
+    }
+
+    /// VIA's private Pi agent directory as the Pi setup makes it
+    /// (`docs/usage.md`): 0700 down from `vendor/`, `settings.json` with
+    /// cache warming off.
+    fn pi_profile(&self) -> TestResult {
+        let agent = self.state.join("vendor/pi/agent");
+        for dir in [
+            self.state.join("vendor"),
+            self.state.join("vendor/pi"),
+            agent.clone(),
+        ] {
+            daemon::private_dir(&dir)?;
+        }
+        let settings = agent.join("settings.json");
+        fs::write(&settings, br#"{"cacheWarming":"off"}"#)?;
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    /// `via models` with `args`, its JSON reply.
+    fn models(&self, args: &[&str]) -> TestResult<Value> {
+        let mut command = vec!["models", "--json"];
+        command.extend(args);
+        let run = self.run_within(&command, Duration::from_secs(40))?;
+        check(run.status.success(), || {
+            format!(
+                "via models {args:?}: {} {}",
+                run.status,
+                String::from_utf8_lossy(&run.stderr)
+            )
+        })?;
+        Ok(serde_json::from_slice(&run.stdout)?)
+    }
+}
+
+/// The pids a fake vendor `program` recorded: one per replay launch
+/// (`<name>.launches`), or per `OpenCode` serve (`<name>.reports`).
+fn fake_pids(program: &Path) -> TestResult<Vec<u32>> {
+    let launches = program.with_extension("launches");
+    let reports = program.with_extension("reports");
+    if launches.exists() {
+        return fs::read_to_string(launches)?
+            .lines()
+            .map(|line| Ok(line.trim().parse()?))
+            .collect();
+    }
+    if !reports.exists() {
+        return Ok(Vec::new());
+    }
+    fs::read_to_string(reports)?
+        .lines()
+        .map(|line| {
+            let report: Value = serde_json::from_str(line)?;
+            Ok(u32::try_from(
+                report["pid"].as_u64().ok_or("a report without its pid")?,
+            )?)
+        })
+        .collect()
+}
+
+/// Waits by `by` until every process in `pids` has exited (vanished, a
+/// zombie or its pid reused): only `/proc` is observed, nothing signalled.
+fn all_gone(pids: &[u32], by: Instant) -> TestResult {
+    for &pid in pids {
+        let Ok(bytes) = fs::read(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let (_, _, start) = parse_stat(&bytes).ok_or("malformed stat")?;
+        if let Some(survivor) = survived(pid, start, by)? {
+            return Err(survivor.into());
+        }
+    }
+    Ok(())
+}
+
+/// The model names `listed` holds for `harness`, each with `source`.
+fn names(listed: &Value, harness: &str, source: &str) -> Vec<String> {
+    listed["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["harness"] == harness && entry["source"] == source)
+        .filter_map(|entry| entry["model"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// `harness`'s `harnesses` entry in `listed`.
+fn outcome_of<'a>(listed: &'a Value, harness: &str) -> &'a Value {
+    listed["harnesses"]
+        .as_array()
+        .and_then(|outcomes| {
+            outcomes
+                .iter()
+                .find(|outcome| outcome["harness"] == harness)
+        })
+        .unwrap_or(&Value::Null)
+}
+
+/// After a discovery, the daemon holds no server and no harness-process
+/// slot (by `by`), and every fake process it started has exited.
+fn nothing_left(sandbox: &Sandbox, programs: &[&Path], by: Instant) -> TestResult {
+    loop {
+        let status = sandbox.run(&["daemon", "status", "--json"])?;
+        let reported: Value = serde_json::from_slice(&status.stdout).unwrap_or(Value::Null);
+        if reported["servers"] == json!([]) && reported["harness_processes"]["in_use"] == 0 {
+            break;
+        }
+        if Instant::now() >= by {
+            return Err(format!("servers or slots left after discovery: {reported}").into());
+        }
+        std::thread::sleep(Duration::from_millis(50).min(outer_cleanup::left(by)));
+    }
+    for program in programs {
+        all_gone(&fake_pids(program)?, by)?;
+    }
+    Ok(())
+}
+
+/// C1 §3.13 (owner 2026-10-12): with no VIA server running, `models`
+/// discovers each harness's live catalog itself: Codex's and `OpenCode`'s
+/// through a server VIA launches for the call, Pi's through one probe
+/// process, all `source: discovered`; Claude's bundled aliases carry the
+/// pass-through note and run nothing. Every process started for the call
+/// is gone after it, with no server or slot held.
+#[test]
+fn s_launch_models_discovers_each_harness() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new()?;
+        sandbox.host_path = false;
+        let marker = sandbox.root.path().join("ran.marker");
+        let claude = sandbox.root.path().join("claude-pinned");
+        marking_script(&claude, &marker)?;
+        let codex = sandbox.fake_vendor("codex", "replay", &codex_server())?;
+        let opencode = sandbox.fake_vendor("opencode", "opencode", &opencode_server())?;
+        let pi = sandbox.fake_vendor("pi", "replay", &pi_probe(true))?;
+        sandbox.pi_profile()?;
+        sandbox.config(
+            &json!({"harnesses":{"claude":{"binary":claude},"codex":{"binary":codex},
+                "opencode":{"binary":opencode},"pi":{"binary":pi}}})
+            .to_string(),
+        )?;
+        sandbox.start_daemon()?;
+        let listed = sandbox.models(&[])?;
+        // The sandbox configures the fake too: listed last, bundled.
+        let ok = |harness| outcome_of(&listed, harness)["status"] == "ok";
+        check(
+            ["claude", "codex", "opencode", "pi", "fake"]
+                .into_iter()
+                .all(ok)
+                && listed["harnesses"].as_array().map(Vec::len) == Some(5),
+            || format!("every harness discovered: {listed}"),
+        )?;
+        check(
+            names(&listed, "claude", "bundled") == ["sonnet", "opus", "haiku"]
+                && outcome_of(&listed, "claude")["message"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("full Claude model ID")),
+            || format!("Claude's bundled aliases and note: {listed}"),
+        )?;
+        check(
+            names(&listed, "codex", "discovered") == ["gpt-6-sol", "gpt-6-luna"]
+                && names(&listed, "opencode", "discovered") == ["opencode/big-pickle"]
+                && names(&listed, "pi", "discovered") == ["openai/gpt-6-luna", "openai/gpt-6-sol"],
+            || format!("discovered catalogs: {listed}"),
+        )?;
+        check(!marker.exists(), || "Claude's binary ran".to_owned())?;
+        for program in [&codex, &opencode, &pi] {
+            check(fake_pids(program)?.len() == 1, || {
+                format!("{} launched once", program.display())
+            })?;
+        }
+        nothing_left(
+            &sandbox,
+            &[&codex, &opencode, &pi],
+            Instant::now() + Duration::from_secs(15),
+        )
+    })
+}
+
+/// C1 §3.13: `--harness` limits discovery to that harness (Pi's fake never
+/// starts); a harness whose binary is not found is `unavailable` while
+/// the others succeed; and Codex's catalog, once discovered, is known (its
+/// saved snapshot), so a later call starts no second server.
+#[test]
+fn s_launch_models_filter_and_missing_binary() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new()?;
+        // No `opencode` anywhere on the daemon's PATH, and none pinned.
+        sandbox.host_path = false;
+        let marker = sandbox.root.path().join("ran.marker");
+        let claude = sandbox.root.path().join("claude-pinned");
+        marking_script(&claude, &marker)?;
+        let codex = sandbox.fake_vendor("codex", "replay", &codex_server())?;
+        let pi = sandbox.fake_vendor("pi", "replay", &pi_probe(true))?;
+        sandbox.pi_profile()?;
+        sandbox.config(
+            &json!({"harnesses":{"claude":{"binary":claude},"codex":{"binary":codex},
+                "pi":{"binary":pi}}})
+            .to_string(),
+        )?;
+        sandbox.start_daemon()?;
+        let filtered = sandbox.models(&["--harness", "codex"])?;
+        check(
+            filtered["harnesses"] == json!([{"harness":"codex","status":"ok"}])
+                && names(&filtered, "codex", "discovered") == ["gpt-6-sol", "gpt-6-luna"]
+                && filtered["models"].as_array().map(Vec::len) == Some(2),
+            || format!("models --harness codex: {filtered}"),
+        )?;
+        check(fake_pids(&pi)?.is_empty(), || {
+            "the filter still started Pi".to_owned()
+        })?;
+        nothing_left(
+            &sandbox,
+            &[&codex],
+            Instant::now() + Duration::from_secs(15),
+        )?;
+        let listed = sandbox.models(&[])?;
+        check(
+            outcome_of(&listed, "opencode")
+                == &json!({"harness":"opencode","status":"unavailable",
+                    "message":"the harness binary was not found when the daemon started"})
+                && names(&listed, "opencode", "discovered").is_empty()
+                && outcome_of(&listed, "codex")["status"] == "ok"
+                && outcome_of(&listed, "pi")["status"] == "ok"
+                && outcome_of(&listed, "claude")["status"] == "ok"
+                && names(&listed, "pi", "discovered") == ["openai/gpt-6-luna", "openai/gpt-6-sol"]
+                && names(&listed, "codex", "discovered") == ["gpt-6-sol", "gpt-6-luna"],
+            || format!("unfiltered with OpenCode missing: {listed}"),
+        )?;
+        check(fake_pids(&codex)?.len() == 1, || {
+            "a known Codex catalog started a second server".to_owned()
+        })?;
+        check(!marker.exists(), || "Claude's binary ran".to_owned())?;
+        nothing_left(
+            &sandbox,
+            &[&codex, &pi],
+            Instant::now() + Duration::from_secs(15),
+        )
+    })
+}
+
+/// C1 §3.13: a harness whose discovery outlives the call's bound (lowered
+/// here to 1.5 s) is `error` with the timeout named, its bundled entries
+/// kept, while the others answer; the call returns, and the unanswering
+/// probe process is stopped with it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s_launch_models_discovery_timeout() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new()?;
+        sandbox.host_path = false;
+        let marker = sandbox.root.path().join("ran.marker");
+        let claude = sandbox.root.path().join("claude-pinned");
+        marking_script(&claude, &marker)?;
+        let pi = sandbox.fake_vendor("pi", "replay", &pi_probe(false))?;
+        sandbox.pi_profile()?;
+        sandbox.config(
+            &json!({"harnesses":{"claude":{"binary":claude},"pi":{"binary":pi}}}).to_string(),
+        )?;
+        let trace = fs::File::create(sandbox.root.path().join("daemon.trace"))?;
+        let child = sandbox
+            .command()
+            .env("VIA_TEST_MODELS_DISCOVERY_MS", "1500")
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(trace)
+            .spawn()?;
+        let pid = child.id();
+        sandbox.daemon = Some(child);
+        sandbox.wait_serving(pid, Instant::now() + Duration::from_secs(20))?;
+        let began = Instant::now();
+        let listed = sandbox.models(&[])?;
+        check(began.elapsed() < Duration::from_secs(10), || {
+            format!("models took {:?}", began.elapsed())
+        })?;
+        check(
+            outcome_of(&listed, "pi")
+                == &json!({"harness":"pi","status":"error","message":"discovery timed out"})
+                && names(&listed, "pi", "bundled") == ["openai/gpt-6-luna"]
+                && outcome_of(&listed, "claude")["status"] == "ok",
+            || format!("a timed-out Pi discovery: {listed}"),
+        )?;
+        check(fake_pids(&pi)?.len() == 1, || "Pi launched once".to_owned())?;
+        nothing_left(&sandbox, &[&pi], Instant::now() + Duration::from_secs(15))
     })
 }

@@ -223,6 +223,18 @@ impl PiRoute {
         private::turn::<PiLane>(&self.runtime, process, start, hop, signals, input).await
     }
 
+    /// C1 `models` (owner 2026-10-12): the catalog of the Pi process
+    /// `process` starts, read by `deadline` with `get_available_models`
+    /// alone, as `(provider, id)` pairs; the process is closed before this
+    /// returns ([`super::catalog`]).
+    pub async fn available_models(
+        &self,
+        process: PrivateProcessSpec,
+        deadline: Deadline,
+    ) -> Result<Vec<(String, String)>, super::CatalogError> {
+        super::catalog::available_models(&self.runtime, process, deadline).await
+    }
+
     /// Packet §7.4 (R1): whether every earlier Pi launch of `session` is
     /// proven gone, by Host's one non-signalling pass within `deadline`. A
     /// Store read or commit that fails, or outlives the deadline, is the

@@ -92,7 +92,7 @@ private per-turn process (glossary fix, §10 G7).
 | C1 surface | Mapping |
 |---|---|
 | `describe` | Pure plan; no process or file write; the last version read for this program path, else `null`/`untested` |
-| `models` | Bundled catalog, provider-qualified with no bare-ID alias (a bare ID such as `gpt-6-luna` is Codex's, and model-only routing must stay unique); the live list is the handshake's `get_available_models` |
+| `models` | Bundled catalog, provider-qualified with no bare-ID alias (a bare ID such as `gpt-6-luna` is Codex's, and model-only routing must stay unique); the live list is the handshake's `get_available_models`. C1 `models` reads that list on demand (owner 2026-10-12): after §4.3's directory and profile checks, one private process `pi --mode rpc --no-session --no-approve -ne -np --offline` with §4.1's environment and cwd `<vendor_state_dir>/pi`, holding a harness-process slot, is sent only `get_available_models` (never a prompt) and closed: stdin EOF and Host's graceful close once it answered, Host's force close otherwise. A failure falls back to the bundled catalog |
 | `spawn`, `resume` | Core receipt, then one launch per turn (§2.1) |
 | `steer` | `unsupported_verb` naming `pi-rpc`; nothing written (PI-8) |
 | `cancel` | Queued: Core-local. Running: §7 |

@@ -171,9 +171,9 @@ impl Daemon {
         self.engine.describe(&params)
     }
 
-    fn models(&self, raw: &Value) -> Value {
+    async fn models(&self, raw: &Value) -> Value {
         let params: ModelsParams = serde_json::from_value(raw.clone()).unwrap();
-        self.engine.models(&params)
+        self.engine.models(&params).await
     }
 
     /// The envelope of `session`'s turn `turn` once it is terminal.
@@ -509,10 +509,19 @@ fn conformance_intake_model_only_spawn() {
             .await
             .unwrap_err();
         assert_eq!(error.kind, "unknown_model", "{error:?}");
+        // No vendor binary resolves here: each is listed unavailable, and
+        // nothing is launched (C1 §3.13 `harnesses`).
+        let unavailable = |harness| {
+            json!({"harness":harness,"status":"unavailable",
+                   "message":"the harness binary was not found when the daemon started"})
+        };
         assert_eq!(
-            daemon.models(&json!({})),
+            daemon.models(&json!({})).await,
             json!({"models":[{"model":"fake-pro","harness":"fake","aliases":["pro"],
-                              "source":"bundled"}]})
+                              "source":"bundled"}],
+                   "harnesses":[unavailable("claude"),unavailable("codex"),
+                                unavailable("opencode"),unavailable("pi"),
+                                {"harness":"fake","status":"ok"}]})
         );
         daemon.stop().await;
     });

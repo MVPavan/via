@@ -76,7 +76,7 @@ what a route supports before running anything; it starts no agent.
 
 ## Roadmap
 
-In the pipeline, not in 0.1.0:
+In the pipeline, not yet released:
 
 - **An ACP route.** One generic route for Zed's
   [Agent Client Protocol](https://agentclientprotocol.com), so any harness

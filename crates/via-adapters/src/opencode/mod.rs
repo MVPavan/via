@@ -119,13 +119,90 @@ impl OpenCodeAdapter {
         self.servers
             .servers
             .live_facts(&self.servers.key())
-            .iter()
-            .flat_map(|facts| facts.models.iter())
-            .map(|model| CatalogModel {
-                model: format!("{}/{}", model.provider_id, model.id),
-                aliases: Vec::new(),
-            })
-            .collect()
+            .map(|facts| catalog_of(&facts))
+            .unwrap_or_default()
+    }
+}
+
+impl OpenCodeAdapter {
+    /// C1 `models` (owner 2026-10-12): the live server's catalog, else the
+    /// catalog VIA's own server reports by `deadline`, launched (or
+    /// joined) with a harness-process slot from `slots` exactly as a
+    /// turn's, and pinned only until its handshake was read. Dropping the
+    /// pin is the registry's ordinary last release: the server retires at
+    /// once unless a session took it meanwhile. The error is VIA's text for
+    /// the caller's `harnesses[].message`.
+    pub(crate) async fn discover(
+        &self,
+        (slots, deadline): (&Arc<tokio::sync::Semaphore>, crate::Deadline),
+    ) -> Result<Vec<CatalogModel>, String> {
+        let live = self.listed();
+        if !live.is_empty() {
+            return Ok(live);
+        }
+        let capacity = crate::discovery::slot(slots, deadline).await?;
+        // The registry replaces the owner with the server it mints.
+        let owner = ProcessOwner::Server {
+            server_id: via_routes::codex::ServerId::mint()
+                .map_err(|_| "a server ID could not be minted".to_owned())?,
+        };
+        let pin = self
+            .servers
+            .acquire(owner, capacity)
+            .map_err(|failure| launch_message(&failure))?;
+        match pin
+            .ready(tokio::time::sleep_until(deadline.instant()))
+            .await
+        {
+            Ok(()) => {}
+            Err(Some(error)) => return Err(launch_message(&error.failure)),
+            Err(None) => return Err(crate::discovery::TIMED_OUT.to_owned()),
+        }
+        let (_, facts) = pin
+            .live()
+            .ok_or_else(|| "the server ended before its catalog was read".to_owned())?;
+        Ok(catalog_of(&facts))
+    }
+}
+
+/// A server's catalog, its public fields only: `provider/id`.
+fn catalog_of(facts: &via_routes::opencode::ServerFacts) -> Vec<CatalogModel> {
+    facts
+        .models
+        .iter()
+        .map(|model| CatalogModel {
+            model: format!("{}/{}", model.provider_id, model.id),
+            aliases: Vec::new(),
+        })
+        .collect()
+}
+
+/// A failed launch as the caller reads it: VIA's text, never vendor
+/// output.
+fn launch_message(failure: &LaunchFailure) -> String {
+    match failure {
+        LaunchFailure::Acquire {
+            launch: Some(cause),
+            ..
+        } => format!("the OpenCode server could not be started ({})", cause.step),
+        LaunchFailure::Acquire { launch: None, .. } | LaunchFailure::Internal => {
+            "the OpenCode server could not be started".to_owned()
+        }
+        LaunchFailure::Refused(refusal) => format!("the OpenCode server was refused: {refusal}"),
+        LaunchFailure::Unsafe { detail } => detail.clone(),
+        LaunchFailure::Overflow | LaunchFailure::Protocol { .. } => {
+            "the OpenCode server's handshake broke its protocol".to_owned()
+        }
+        LaunchFailure::Transient { step } => {
+            format!("the OpenCode server's handshake failed ({step})")
+        }
+        LaunchFailure::Credential { .. } => {
+            "VIA's private OpenCode directory holds a stored login \
+             (unexpected_credential_state)"
+                .to_owned()
+        }
+        LaunchFailure::Deadline => "the OpenCode server's handshake timed out".to_owned(),
+        LaunchFailure::Shutdown => "the daemon is shutting down".to_owned(),
     }
 }
 
