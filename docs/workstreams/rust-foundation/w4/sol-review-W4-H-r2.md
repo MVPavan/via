@@ -1,0 +1,14 @@
+**Verdict: UNSOUND.** Three round-1 blockers are addressed at their owning layers. The acquisition fix settles a stalled turn, but it introduces a path that can lose vendor output without recording an incomplete raw log.
+
+| Round-1 blocker | Round-2 assessment |
+|---|---|
+| Force during acquisition | **Partly fixed.** Wire now observes force and bounds the acquisition wait at `crates/via-wire/src/runtime.rs:167–184`. The stalled-anchor regression would time out on round-1 code for the stated reason. It does not cover an acquisition that has already sent ARM. |
+| Blocked observation forwarding | **Fixed at Route and Adapter** (`crates/via-routes/src/runtime.rs:341–359`, `crates/via-adapters/src/runtime.rs:200–221`). The reported 19-second round-1 failure is consistent with waiting for capacity until the turn deadline. The test does not establish that forwarding was blocked *when* force arrived. |
+| Client joins miscounted | **Fixed** at `crates/via-cli/src/server.rs:305–326`. The new test’s reported `(1, 0)` versus `(0, 0)` failure directly exercises the round-1 count. |
+| Queued-drive regression was vacuous | **Improved.** It requires a receipt and observes a queued handoff (`crates/via-cli/tests/s1_daemon_stop.rs:1212–1264`). The reported skipped-drain mutation fails for an unresolved turn. That is useful evidence, though it is a mutation check rather than a direct run of this test on round-1 code. |
+
+**Merge blocker:** After Host sends ARM, the vendor can start and write to its inherited pipes while Host awaits the spawn reply or durable vendor facts (`crates/via-host/src/host.rs:428–446`). If force then expires the new two-second grace, Wire drops that acquisition (`crates/via-wire/src/runtime.rs:169–184`). Route reports it with `raw_incomplete: false` (`crates/via-routes/src/runtime.rs:79–90`), so Core cannot emit `raw_log.incomplete` or its warning. The new acquisition test uses an anchor that never sends `Ready` (`crates/via-core/tests/force_stop.rs:151–162`), and cannot expose this after-ARM case. **Fix:** make abandonment after ARM retain and drain the pipes through the raw writer, or carry verified byte-loss evidence into Route and Core; add a regression that stalls after vendor launch and writes output before force.
+
+**Deferrable test issue:** The forwarding test waits one second but does not establish that its observation channel is full at force time (`crates/via-core/tests/route_stream.rs:383–405`). Gate force on observed backpressure so the test proves the specific race.
+
+I reviewed the supplied refs read-only. I did not run branch tests; the worker’s gate results and pre-fix outputs remain reported evidence.

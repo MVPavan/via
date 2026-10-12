@@ -1,0 +1,22 @@
+**Verdict: SOUND WITH CHANGES.** The round-1 ack and stale-ack blockers are addressed. Host reconciliation is now called before request admission, but recovery can still admit requests without attempting cleanup for every committed anchor. The recovered envelope also omits the failure class specified by C1.
+
+### Round-1 findings
+
+| Finding | Owning-layer fix and regression |
+|---|---|
+| **B1 — action without ack** | **Addressed.** `Controller::enter` propagates marker-write errors before returning an action; `write_marker` syncs the file, renames it, then syncs the directory (`crates/via-store/src/failpoint.rs:127`, `crates/via-store/src/failpoint.rs:157`, `crates/via-store/src/failpoint.rs:180`). The new test makes the ack rename fail while `crash` is armed. The old behavior would abort the test process, so it detects the original failure. It does not inject a directory-sync failure. |
+| **B2 — stale ack** | **Addressed.** Arming removes old markers and `wait_ack` checks the current daemon PID (`crates/via-cli/tests/support/failpoints.rs:52`, `crates/via-cli/tests/support/failpoints.rs:135`). The new test detects both old behaviors: a planted marker surviving `arm`, and acceptance of an ack from another PID (`crates/via-cli/tests/s1_crash_points.rs:1057`). |
+| **B3 — no Host reconciliation** | **Partly addressed.** Core calls the existing Adapter → Host recovery path before resolving turns, and the F10 tests require committed absence evidence before `result` is served (`crates/via-core/src/engine/recovery.rs:29`, `crates/via-cli/tests/s1_crash_points.rs:842`). Those tests detect round 1’s missing call and settlement. They do not cover an incomplete Host scan or an uncertain cleanup result. |
+| **Unreaped client** | **Addressed.** `PendingClient` kills and waits on timeout and on drop before `finish` (`crates/via-cli/tests/s1_crash_points.rs:287`, `crates/via-cli/tests/s1_crash_points.rs:310`). This is a harness resource fix; there is no direct regression for the early-failure path. |
+
+### Merge blockers
+
+1. **Recovery can proceed after Host has not reconciled every anchor.** Core discards a Host recovery error with `.ok()` (`crates/via-core/src/engine/recovery.rs:32`). Its single five-second deadline covers Host’s sequential scan; after expiry, later anchors can receive only an uncertain report without a stop attempt. Host’s Store read also silently limits the scan to 10,000 rows (`crates/via-store/src/runtime/anchor.rs:160`). Core then uses `.all()` on the reports for a turn, which yields **false `quiescent`** when that turn’s anchor was omitted (`crates/via-core/src/engine/recovery.rs:167`). A live omitted group can remain while the daemon begins admission. Make the anchor scan complete or fail explicitly, check report coverage against committed anchors, and do not admit after a failed or unfinished reconciliation. An individual anchor’s verified uncertainty may still be recorded as `uncertain`.
+
+2. **Recovered `unknown` omits its specified cause.** C1 §8.2 assigns `daemon_restart` to Core, while recovery commits `failure: null` in both the envelope and `turn.ended` (`crates/via-core/src/engine/recovery.rs:93`, `crates/via-core/src/engine/recovery.rs:113`). Add `DaemonRestart` to `FailureClass` and commit that class in both places. The turn’s **state remains `unknown`** under C1 §7.5; the transport-loss precedent does not override the restart-specific class.
+
+I found no newly introduced **false `forced`** claim: recovery’s `forced` value comes from Host reports. The current tests allow either outcome for an anchored turn, so they do not establish the live-vendor forced path. Ack publication is ordered and synced in code, and the harness now rejects stale PIDs. The client cleanup paths no longer show the round-1 process leak.
+
+**Deferrable:** a deterministic regression for Host’s uncertain and live-vendor forced paths needs the planned Host seam. Keyed receipt replay, queued-successor cancellation, and recovered raw-log incompleteness remain with their assigned tasks.
+
+This was read-only: I inspected the supplied refs and contracts, ran `git diff --check` successfully, and checked Git status. I did not run branch tests or `bd`; the worker’s gate results are reported evidence, not independently rerun results.

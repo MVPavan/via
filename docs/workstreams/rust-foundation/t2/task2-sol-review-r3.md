@@ -1,0 +1,5 @@
+1. **Yes.** At `975fd22`, `effort: null`, `bound: null`, and `deadlines: null` return `invalid_params` naming the field and route `fake`. A present bound object returns `bound_unsupported`; `output_schema: null` and `max_steps: null` remain accepted. `Nullable` distinguishes an omitted `deadlines` member from explicit null. It does not alter keyed replay identity, which uses the raw parameter bytes, or resume inheritance from the latest accepted turn.
+
+2. **Yes.** The test observes turn 2 at its gate, then requires a 2,000 ms `wait_timeout` before releasing it. That proves it remains live beyond turn 1’s 1,500 ms budget without a fixed test sleep. The gate prevents an ordinary completion race; unusually severe scheduling delay could still make the test fail by reaching turn 2’s own 60 s deadline, but I found no inherent bounded-wait race.
+
+3. **SOUND (merge).** No blockers found in `git diff 118be44 975fd22`. This was a read-only source review; I did not run Rust tests or `bd`.

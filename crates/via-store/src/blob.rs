@@ -1,0 +1,1106 @@
+//! Blob files (Task 4 design §6.5): `<state>/blobs/b_<32 hex>.blob`, each
+//! created exclusively (0600, never through a symlink) and owned by the one
+//! handle that writes or reads it, on the blocking pool, each step within
+//! 2 s. A row names a blob only after its writer finished (synced the file
+//! and `blobs/`), in the same transaction; a blob no row names is swept at
+//! start.
+
+use std::{
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
+};
+
+use sha2::{Digest, Sha256};
+use tokio::{
+    runtime::Handle,
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
+    task::JoinSet,
+};
+
+use crate::{StoreError, evidence::sync_dir};
+
+/// A prompt longer than this many bytes is stored as a blob, not inline.
+pub const INLINE_MAX: usize = 256 * 1024;
+
+/// Largest chunk one [`BlobWriter::write`] takes or one
+/// [`BlobReader::next_chunk`] returns.
+pub const BLOB_CHUNK: usize = 64 * 1024;
+
+/// Largest blob a prompt load accepts, and largest prompt file: C1's
+/// 16 MiB prompt (Task 4 design §5.2 `PROMPT_MAX`).
+pub const PROMPT_MAX: u64 = 16 * 1024 * 1024;
+
+/// Bound of each blocking blob step.
+const BLOB_IO: Duration = Duration::from_secs(2);
+
+/// A finished blob: its id, length and SHA-256, as a row stores it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobRef {
+    id: String,
+    len: u64,
+    sha256: [u8; 32],
+}
+
+impl BlobRef {
+    /// The blob's id, `b_<32 hex>`; its file is `blobs/<id>.blob`.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The blob's length in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the blob holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The SHA-256 of the blob's bytes.
+    pub fn sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+
+    /// The stored form, `<id>:<len>:<sha256 hex>`.
+    pub(crate) fn encode(&self) -> String {
+        format!("{}:{}:{}", self.id, self.len, hex(&self.sha256))
+    }
+
+    /// Reads a stored form back; anything else is corrupt evidence.
+    pub(crate) fn decode(stored: &str) -> Result<Self, StoreError> {
+        let mut parts = stored.split(':');
+        let (Some(id), Some(len), Some(sha256), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(StoreError::CorruptEvidence);
+        };
+        if !valid_id(id) || sha256.len() != 64 {
+            return Err(StoreError::CorruptEvidence);
+        }
+        let mut digest = [0_u8; 32];
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&sha256[index * 2..index * 2 + 2], 16)
+                .map_err(|_| StoreError::CorruptEvidence)?;
+        }
+        Ok(Self {
+            id: id.to_owned(),
+            len: len.parse().map_err(|_| StoreError::CorruptEvidence)?,
+            sha256: digest,
+        })
+    }
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+/// `b_` and 32 lowercase hex digits.
+fn valid_id(id: &str) -> bool {
+    id.strip_prefix("b_").is_some_and(|digits| {
+        digits.len() == 32
+            && digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// Most blob steps running at once. `spawn_blocking` work cannot be aborted
+/// (coding-style §5), so a step that overran its caller's bound stays owned
+/// until it ends; the cap bounds how many blocking threads a stalled
+/// filesystem can hold. A step past the cap waits for a slot within its
+/// own bound (bead via-s4s), so healthy concurrency, such as 32 turns
+/// settling spilled final texts together, only queues; a step is refused
+/// only when no slot frees in time, which is the stall the cap is for.
+const BLOB_TASKS: usize = 16;
+
+/// How long `Store::drop` waits for owned blob steps, within final
+/// shutdown's 2 s Store reserve (the writer join shares it).
+pub(crate) const BLOB_DRAIN: Duration = Duration::from_secs(1);
+
+/// The Store's owned blob steps (coding-style §5 task ownership): every
+/// step runs on the blocking pool inside this `JoinSet`, which keeps it
+/// until it ends, holding one of [`BLOB_TASKS`] slots that it releases as
+/// it ends. The mutex is never held across an `.await`. Final shutdown
+/// holds a clone to count the steps still running after the Store's
+/// bounded drain.
+#[derive(Clone, Debug)]
+pub struct BlobTasks {
+    set: Arc<Mutex<JoinSet<()>>>,
+    /// Never closed; FIFO, so a waiting step is not starved.
+    slots: Arc<Semaphore>,
+}
+
+impl Default for BlobTasks {
+    fn default() -> Self {
+        Self {
+            set: Arc::default(),
+            slots: Arc::new(Semaphore::new(BLOB_TASKS)),
+        }
+    }
+}
+
+impl BlobTasks {
+    fn lock(&self) -> MutexGuard<'_, JoinSet<()>> {
+        self.set.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Admits `work` onto `runtime`'s blocking pool once a slot is free,
+    /// waiting at most until `deadline`: `false` when no slot was taken
+    /// before it, and nothing was started. Cancelled while waiting, it
+    /// starts nothing.
+    async fn admit(
+        &self,
+        runtime: &Handle,
+        deadline: tokio::time::Instant,
+        work: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        let slot = Arc::clone(&self.slots).acquire_owned();
+        // `Err` inside is a closed semaphore, which this never closes.
+        let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, slot).await else {
+            return false;
+        };
+        // `timeout_at` polls the acquisition before it checks the deadline,
+        // so a slot that freed while this task was not polled can arrive
+        // late: past the deadline the work never starts and the slot returns.
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        self.start(runtime, slot, work);
+        true
+    }
+
+    /// Starts `work` holding `slot`, after reaping ended steps. The slot
+    /// moves into the blocking closure and is released as it ends, even by
+    /// a panic, so the slots bound the blocking threads held.
+    fn start(
+        &self,
+        runtime: &Handle,
+        slot: OwnedSemaphorePermit,
+        work: impl FnOnce() + Send + 'static,
+    ) {
+        let mut set = self.lock();
+        while set.try_join_next().is_some() {}
+        set.spawn_blocking_on(
+            move || {
+                let _slot = slot;
+                work();
+            },
+            runtime,
+        );
+    }
+
+    /// Runs one blob step, owned by this set, and waits at most
+    /// [`BLOB_IO`] for a slot and its result together. A step that overran
+    /// keeps running to its end, owning what it was given; the caller's
+    /// request is not committed.
+    pub async fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let runtime = Handle::try_current()
+            .map_err(|error| StoreError::Write(format!("blob task: {error}")))?;
+        let deadline = tokio::time::Instant::now() + BLOB_IO;
+        let (reply, result) = oneshot::channel();
+        let admitted = self
+            .admit(&runtime, deadline, move || {
+                #[cfg(feature = "test-failpoints")]
+                if let Err(error) = crate::failpoint::hit("blob.step.stall") {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+                let _ = reply.send(work());
+            })
+            .await;
+        if !admitted {
+            return Err(StoreError::Write(
+                "blob I/O: no blob step slot freed within 2 s".to_owned(),
+            ));
+        }
+        match tokio::time::timeout_at(deadline, result).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(StoreError::Write(format!("blob I/O: {error}"))),
+            Ok(Err(_)) => Err(StoreError::Write(
+                "blob task ended without a result".to_owned(),
+            )),
+            Err(_) => Err(StoreError::Write("blob I/O exceeded 2 s".to_owned())),
+        }
+    }
+
+    /// Like [`Self::run`] for a step on a caller's file, bounded by the
+    /// caller's `deadline` instead of 2 s, the wait for a slot included:
+    /// `Ok(None)` when the deadline passed first, a started step still
+    /// owned until it ends. The step's own outcome, errors included, is
+    /// its value.
+    pub(crate) async fn run_until<T: Send + 'static>(
+        &self,
+        deadline: tokio::time::Instant,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<Option<T>, StoreError> {
+        let runtime = Handle::try_current()
+            .map_err(|error| StoreError::Write(format!("blob task: {error}")))?;
+        let (reply, result) = oneshot::channel();
+        let admitted = self
+            .admit(&runtime, deadline, move || {
+                let _ = reply.send(work());
+            })
+            .await;
+        if !admitted {
+            return Ok(None);
+        }
+        match tokio::time::timeout_at(deadline, result).await {
+            Ok(Ok(value)) => Ok(Some(value)),
+            Ok(Err(_)) => Err(StoreError::Write(
+                "blob task ended without a result".to_owned(),
+            )),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Unlinks `path` from a synchronous `Drop`: inside a runtime the unlink
+    /// is an owned step (never blocking a Tokio worker); with no slot free
+    /// it is left for the start-up sweep, as `Drop` cannot wait; outside
+    /// any runtime it runs here.
+    fn unlink_detached(&self, path: PathBuf) {
+        match Handle::try_current() {
+            Ok(runtime) => {
+                // No free slot: the file is left for the start-up sweep.
+                if let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() {
+                    self.start(&runtime, slot, move || {
+                        let _ = fs::remove_file(path);
+                    });
+                }
+            }
+            Err(_) => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Steps still owned, after reaping ended ones.
+    pub fn outstanding(&self) -> usize {
+        let mut set = self.lock();
+        while set.try_join_next().is_some() {}
+        set.len()
+    }
+
+    /// Waits at most `bound` for every owned step to end, from a blocking
+    /// context (`Store::drop`); returns how many are still running.
+    pub(crate) fn drain(&self, bound: Duration) -> usize {
+        let deadline = Instant::now() + bound;
+        loop {
+            let pending = self.outstanding();
+            if pending == 0 || Instant::now() >= deadline {
+                return pending;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// `<state>/blobs`, validated or created by `Store::open`.
+#[derive(Clone, Debug)]
+pub(crate) struct Blobs {
+    dir: Arc<PathBuf>,
+    pub(crate) tasks: BlobTasks,
+    /// Test builds: blob files created.
+    #[cfg(feature = "test-failpoints")]
+    writes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Blobs {
+    /// Validates `<state>/blobs` as the State directory is validated, or
+    /// creates it 0700 and makes it durable with one sync of `state`.
+    pub(crate) fn open(state: &Path) -> Result<Self, StoreError> {
+        let dir = state.join("blobs");
+        if fs::symlink_metadata(&dir).is_ok() {
+            crate::runtime::validate_dir(&dir)?;
+        } else {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|error| StoreError::Open(error.to_string()))?;
+            sync_dir(state).map_err(|error| StoreError::Open(error.to_string()))?;
+        }
+        Ok(Self {
+            dir: Arc::new(dir),
+            tasks: BlobTasks::default(),
+            #[cfg(feature = "test-failpoints")]
+            writes: Arc::default(),
+        })
+    }
+
+    fn path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.blob"))
+    }
+
+    /// Test builds: how many blob files were created.
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Creates a new blob file under a fresh random id.
+    pub(crate) async fn writer(&self) -> Result<BlobWriter, StoreError> {
+        let dir = Arc::clone(&self.dir);
+        let (id, file) = self
+            .tasks
+            .run(move || {
+                let mut random = [0_u8; 16];
+                File::open("/dev/urandom")?.read_exact(&mut random)?;
+                let id = format!("b_{}", hex(&random));
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+                    .open(dir.join(format!("{id}.blob")))?;
+                Ok((id, file))
+            })
+            .await?;
+        #[cfg(feature = "test-failpoints")]
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(BlobWriter {
+            path: self.path(&id),
+            dir: Arc::clone(&self.dir),
+            tasks: self.tasks.clone(),
+            id,
+            open: Some((file, Sha256::new())),
+            len: 0,
+            done: false,
+        })
+    }
+
+    /// Unlinks a finished blob no committed row names; a failed unlink
+    /// leaves it for the start-up sweep.
+    pub(crate) async fn discard(&self, blob: &BlobRef) {
+        let path = self.path(&blob.id);
+        let _ = self.tasks.run(move || fs::remove_file(path)).await;
+    }
+
+    /// Opens `blob` for reading: a regular file of its recorded length.
+    pub(crate) async fn reader(&self, blob: &BlobRef) -> Result<BlobReader, StoreError> {
+        let path = self.path(&blob.id);
+        let len = blob.len;
+        let opened = self
+            .tasks
+            .run(move || match open_regular(&path) {
+                Ok((file, actual)) => Ok(Some((file, actual))),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            })
+            .await?;
+        match opened {
+            Some((file, actual)) if actual == len => Ok(BlobReader {
+                tasks: self.tasks.clone(),
+                file: Some(file),
+                left: len,
+            }),
+            // Missing, not a regular file, or another length: not the blob.
+            _ => Err(StoreError::CorruptEvidence),
+        }
+    }
+
+    /// Loads a prompt blob into one exact `String`, with a running SHA-256
+    /// and a UTF-8 check (design §6.5): a blob that differs from its record
+    /// is corrupt evidence.
+    pub(crate) async fn load_text(&self, blob: &BlobRef) -> Result<String, StoreError> {
+        if blob.len > PROMPT_MAX {
+            return Err(StoreError::CorruptEvidence);
+        }
+        let capacity = usize::try_from(blob.len).map_err(|_| StoreError::CorruptEvidence)?;
+        let mut reader = self.reader(blob).await?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = reader.next_chunk().await? {
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != capacity || <[u8; 32]>::from(hasher.finalize()) != blob.sha256 {
+            return Err(StoreError::CorruptEvidence);
+        }
+        String::from_utf8(bytes).map_err(|_| StoreError::CorruptEvidence)
+    }
+
+    /// Checks one referenced blob on the SQLite thread (design §6.5
+    /// recovery): a regular file of the recorded length and SHA-256.
+    pub(crate) fn verify(&self, blob: &BlobRef) -> Result<(), StoreError> {
+        let corrupt = || StoreError::Corrupt(format!("blob {}", blob.id));
+        let (mut file, len) = open_regular(&self.path(&blob.id)).map_err(|_| corrupt())?;
+        if len != blob.len {
+            return Err(corrupt());
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; BLOB_CHUNK];
+        loop {
+            let read = file.read(&mut buffer).map_err(|_| corrupt())?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if <[u8; 32]>::from(hasher.finalize()) == blob.sha256 {
+            Ok(())
+        } else {
+            Err(corrupt())
+        }
+    }
+
+    /// Unlinks every blob file whose id is not in `referenced`, on the
+    /// SQLite thread; returns how many. Other names are left alone.
+    pub(crate) fn sweep(&self, referenced: &HashSet<String>) -> Result<u64, StoreError> {
+        let failed = |error: io::Error| StoreError::Write(format!("blob sweep: {error}"));
+        let mut swept = 0;
+        for entry in fs::read_dir(self.dir.as_path()).map_err(failed)? {
+            let name = entry.map_err(failed)?.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".blob")) else {
+                continue;
+            };
+            if valid_id(id) && !referenced.contains(id) {
+                fs::remove_file(self.path(id)).map_err(failed)?;
+                swept += 1;
+            }
+        }
+        if swept > 0 {
+            sync_dir(&self.dir).map_err(failed)?;
+        }
+        Ok(swept)
+    }
+}
+
+/// Why a prompt file was not copied (Task 4 design §10.4 step 4).
+#[derive(Debug)]
+pub enum PromptFileError {
+    /// Refused by `reason`: `unreadable`, `not_regular`, `too_large`,
+    /// `not_utf8`, `changed` or `timeout`.
+    Refused(&'static str),
+    /// A blob step failed: the request is not committed.
+    Store(StoreError),
+}
+
+/// A prompt file's metadata that must not change during the pass.
+#[derive(Debug, Eq, PartialEq)]
+struct Stamp {
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+impl Blobs {
+    /// Copies the prompt file at `path` into a new finished blob in one
+    /// pass (design §10.4): opened read-only with `O_NONBLOCK`, so a FIFO
+    /// cannot block the open, and `fstat`ed: a regular file of at most
+    /// `max` bytes ([`PROMPT_MAX`] for a prompt file). It streams in 64 KiB chunks through the blob's
+    /// running SHA-256 with a streaming UTF-8 check, then `fstat`s again:
+    /// bytes read other than the first size, or a changed size, `mtime`
+    /// or `ctime`, refuse it as `changed`. The whole pass ends by
+    /// `deadline`. Any refusal discards the blob; the caller holds no lock.
+    pub(crate) async fn copy_file(
+        &self,
+        path: PathBuf,
+        deadline: tokio::time::Instant,
+        max: u64,
+    ) -> Result<BlobRef, PromptFileError> {
+        let opened = self
+            .tasks
+            .run_until(deadline, move || -> io::Result<(File, fs::Metadata)> {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+                    .open(path)?;
+                let metadata = file.metadata()?;
+                Ok((file, metadata))
+            })
+            .await
+            .map_err(PromptFileError::Store)?;
+        let (file, first) = match opened {
+            None => return Err(PromptFileError::Refused("timeout")),
+            Some(Err(_)) => return Err(PromptFileError::Refused("unreadable")),
+            Some(Ok(opened)) => opened,
+        };
+        if !first.is_file() {
+            return Err(PromptFileError::Refused("not_regular"));
+        }
+        if first.len() > max {
+            return Err(PromptFileError::Refused("too_large"));
+        }
+        // Test builds: the pass holds here, with no lock held (§13.2).
+        #[cfg(feature = "test-failpoints")]
+        let _ = crate::failpoint::hit_async("prompt_file.copy.pause").await;
+        let timeout = || PromptFileError::Refused("timeout");
+        // The blob's own steps end by `deadline` too. A creation cut off
+        // leaves at most an unnamed file, which the start-up sweep removes.
+        let mut writer = tokio::time::timeout_at(deadline, self.writer())
+            .await
+            .map_err(|_| timeout())?
+            .map_err(PromptFileError::Store)?;
+        if let Err(error) = self
+            .copy_chunks(file, &Stamp::of(&first), &mut writer, deadline)
+            .await
+        {
+            writer.discard().await;
+            return Err(error);
+        }
+        // A `finish` cut off drops its writer, which unlinks the file.
+        let blob = tokio::time::timeout_at(deadline, writer.finish())
+            .await
+            .map_err(|_| timeout())?
+            .map_err(PromptFileError::Store)?;
+        if tokio::time::Instant::now() >= deadline {
+            self.discard(&blob).await;
+            return Err(timeout());
+        }
+        Ok(blob)
+    }
+
+    /// The streaming part of [`Self::copy_file`]: every chunk into
+    /// `writer`, then the second `fstat`.
+    async fn copy_chunks(
+        &self,
+        file: File,
+        first: &Stamp,
+        writer: &mut BlobWriter,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), PromptFileError> {
+        let timeout = || PromptFileError::Refused("timeout");
+        let mut file = Some(file);
+        let mut total = 0_u64;
+        // An incomplete UTF-8 sequence at a chunk's end (at most 3 bytes).
+        let mut carry = Vec::new();
+        loop {
+            let Some(mut taken) = file.take() else {
+                return Err(PromptFileError::Refused("unreadable"));
+            };
+            let read = self
+                .tasks
+                .run_until(deadline, move || {
+                    let chunk = read_chunk(&mut taken);
+                    (taken, chunk)
+                })
+                .await
+                .map_err(PromptFileError::Store)?;
+            let (taken, chunk) = read.ok_or_else(timeout)?;
+            let chunk = chunk.map_err(|_| PromptFileError::Refused("unreadable"))?;
+            file = Some(taken);
+            if chunk.is_empty() {
+                break;
+            }
+            total += chunk.len() as u64;
+            if total > first.len {
+                return Err(PromptFileError::Refused("changed"));
+            }
+            if !utf8_continues(&mut carry, &chunk) {
+                return Err(PromptFileError::Refused("not_utf8"));
+            }
+            tokio::time::timeout_at(deadline, writer.write(&chunk))
+                .await
+                .map_err(|_| timeout())?
+                .map_err(PromptFileError::Store)?;
+        }
+        if !carry.is_empty() {
+            return Err(PromptFileError::Refused("not_utf8"));
+        }
+        let Some(file) = file else {
+            return Err(PromptFileError::Refused("unreadable"));
+        };
+        let second = self
+            .tasks
+            .run_until(deadline, move || file.metadata())
+            .await
+            .map_err(PromptFileError::Store)?
+            .ok_or_else(timeout)?
+            .map_err(|_| PromptFileError::Refused("unreadable"))?;
+        if total != first.len || Stamp::of(&second) != *first {
+            return Err(PromptFileError::Refused("changed"));
+        }
+        Ok(())
+    }
+}
+
+/// Reads up to [`BLOB_CHUNK`] bytes, fewer only at end of file.
+fn read_chunk(file: &mut File) -> io::Result<Vec<u8>> {
+    let mut chunk = vec![0_u8; BLOB_CHUNK];
+    let mut filled = 0;
+    while filled < BLOB_CHUNK {
+        match file.read(&mut chunk[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    chunk.truncate(filled);
+    Ok(chunk)
+}
+
+/// Checks `chunk` as the continuation of UTF-8 text whose previous chunk
+/// left `carry`, an incomplete sequence, which this updates.
+fn utf8_continues(carry: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let joined;
+    let text = if carry.is_empty() {
+        chunk
+    } else {
+        let mut bytes = std::mem::take(carry);
+        bytes.extend_from_slice(chunk);
+        joined = bytes;
+        &joined[..]
+    };
+    match std::str::from_utf8(text) {
+        Ok(_) => true,
+        // Only an incomplete sequence at the end: the next chunk decides.
+        Err(error) if error.error_len().is_none() => {
+            *carry = text[error.valid_up_to()..].to_vec();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Opens `path` without following a symlink and returns it with its length
+/// when it is a regular file.
+fn open_regular(path: &Path) -> io::Result<(File, u64)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("blob is not a regular file"));
+    }
+    Ok((file, metadata.len()))
+}
+
+/// Writes one new blob. Until [`BlobWriter::finish`] succeeds nothing may
+/// name it; `discard` or dropping the handle unlinks it.
+pub struct BlobWriter {
+    path: PathBuf,
+    dir: Arc<PathBuf>,
+    tasks: BlobTasks,
+    id: String,
+    /// The file and the running SHA-256; `None` after a failed step.
+    open: Option<(File, Sha256)>,
+    len: u64,
+    /// Finished or discarded: `Drop` leaves the file alone.
+    done: bool,
+}
+
+impl BlobWriter {
+    /// Appends one chunk of at most [`BLOB_CHUNK`] bytes within 2 s. A
+    /// failure is final for this blob: nothing names it yet, so the request
+    /// is not committed.
+    pub async fn write(&mut self, chunk: &[u8]) -> Result<(), StoreError> {
+        if chunk.len() > BLOB_CHUNK {
+            return Err(StoreError::Constraint("blob chunk over 64 KiB"));
+        }
+        let (mut file, mut hasher) = self
+            .open
+            .take()
+            .ok_or_else(|| StoreError::Write("blob writer failed earlier".to_owned()))?;
+        // Test builds: `fail_io` at occurrence k fails the k-th chunk.
+        #[cfg(feature = "test-failpoints")]
+        crate::failpoint::hit("blob.write.fail_after")
+            .map_err(|error| StoreError::Write(error.to_string()))?;
+        let data = chunk.to_vec();
+        let (file, hasher) = self
+            .tasks
+            .run(move || {
+                file.write_all(&data)?;
+                hasher.update(&data);
+                Ok((file, hasher))
+            })
+            .await?;
+        self.open = Some((file, hasher));
+        self.len += chunk.len() as u64;
+        Ok(())
+    }
+
+    /// Syncs the file and then `blobs/`, so the blob is durable before a
+    /// row names it, and returns its reference.
+    pub async fn finish(mut self) -> Result<BlobRef, StoreError> {
+        let (file, hasher) = self
+            .open
+            .take()
+            .ok_or_else(|| StoreError::Write("blob writer failed earlier".to_owned()))?;
+        let dir = Arc::clone(&self.dir);
+        self.tasks
+            .run(move || {
+                file.sync_all()?;
+                sync_dir(&dir)
+            })
+            .await?;
+        self.done = true;
+        Ok(BlobRef {
+            id: std::mem::take(&mut self.id),
+            len: self.len,
+            sha256: hasher.finalize().into(),
+        })
+    }
+
+    /// Unlinks the unfinished blob on the blocking pool.
+    pub async fn discard(mut self) {
+        self.done = true;
+        let path = std::mem::take(&mut self.path);
+        drop(self.open.take());
+        let _ = self.tasks.run(move || fs::remove_file(path)).await;
+    }
+}
+
+impl Drop for BlobWriter {
+    fn drop(&mut self) {
+        if !self.done {
+            // An abandoned writer, such as a cancelled request: one owned
+            // unlink, off the Tokio worker (review round 1).
+            self.tasks.unlink_detached(std::mem::take(&mut self.path));
+        }
+    }
+}
+
+/// Reads one blob in chunks of at most [`BLOB_CHUNK`] bytes.
+pub struct BlobReader {
+    tasks: BlobTasks,
+    file: Option<File>,
+    /// Bytes still expected.
+    left: u64,
+}
+
+impl BlobReader {
+    /// The next chunk, `None` at the recorded end. A file that ends early
+    /// is corrupt evidence.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| StoreError::Write("blob reader failed earlier".to_owned()))?;
+        let want = usize::try_from(self.left.min(BLOB_CHUNK as u64)).unwrap_or(BLOB_CHUNK);
+        let (file, chunk) = self
+            .tasks
+            .run(move || {
+                let mut chunk = vec![0_u8; want];
+                let mut filled = 0;
+                while filled < want {
+                    let read = file.read(&mut chunk[filled..])?;
+                    if read == 0 {
+                        break;
+                    }
+                    filled += read;
+                }
+                chunk.truncate(filled);
+                Ok((file, chunk))
+            })
+            .await?;
+        if chunk.is_empty() {
+            return Err(StoreError::CorruptEvidence);
+        }
+        self.left -= chunk.len() as u64;
+        self.file = Some(file);
+        Ok(Some(chunk))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::{Pin, pin},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        task::Poll,
+        time::{Duration, Instant},
+    };
+
+    use tokio::runtime::Handle;
+
+    use super::{BLOB_TASKS, BlobTasks, utf8_continues};
+    use crate::StoreError;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// Fills every slot with a step that counts itself in `running` (its
+    /// highest in `peak`) and ends when the returned sender sends, one
+    /// step per message, or is dropped, every step.
+    async fn hold_every_slot(
+        tasks: &BlobTasks,
+        (running, peak): (&Arc<AtomicUsize>, &Arc<AtomicUsize>),
+    ) -> mpsc::Sender<()> {
+        let (release, blocked) = mpsc::channel::<()>();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let by = tokio::time::Instant::now() + Duration::from_secs(1);
+        for _ in 0..BLOB_TASKS {
+            let blocked = Arc::clone(&blocked);
+            let (running, peak) = (Arc::clone(running), Arc::clone(peak));
+            let admitted = tasks
+                .admit(&Handle::current(), by, move || {
+                    let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    let _ = blocked.lock().map(|blocked| blocked.recv());
+                    running.fetch_sub(1, Ordering::AcqRel);
+                })
+                .await;
+            assert!(admitted, "a free slot admits at once");
+        }
+        assert_eq!(tasks.outstanding(), BLOB_TASKS);
+        release
+    }
+
+    /// Polls `future` once: whether it is still pending.
+    async fn pending<F: Future>(mut future: Pin<&mut F>) -> bool {
+        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+    }
+
+    /// Blocks until at most `left` steps are owned, within 10 s.
+    fn ended_down_to(tasks: &BlobTasks, left: usize) {
+        let by = Instant::now() + Duration::from_secs(10);
+        while tasks.outstanding() > left {
+            assert!(
+                Instant::now() < by,
+                "{} steps still owned",
+                tasks.outstanding()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Every slot is free again: none was leaked.
+    fn every_slot_free(tasks: &BlobTasks) {
+        assert_eq!(tasks.drain(Duration::from_secs(10)), 0);
+        assert_eq!(tasks.slots.available_permits(), BLOB_TASKS);
+    }
+
+    /// Review round 1, bead via-s4s: with [`BLOB_TASKS`] steps stalled, a
+    /// new step waits for a slot within its bound and is then refused, as
+    /// `Write` (the request's `not_committed`) at 2 s or `None` at its
+    /// deadline, starting nothing: at most the cap's threads are held. A
+    /// `Drop` unlink with no slot is left for the sweep. Once the stall
+    /// ends the steps are reaped and a new step runs.
+    #[test]
+    fn stalled_steps_hold_the_cap_and_a_new_step_is_refused_at_its_bound() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let counts = (&Arc::default(), &Arc::default());
+        let root = tempfile::tempdir().expect("dir");
+        let kept = root.path().join("kept.blob");
+        std::fs::write(&kept, b"x").expect("file");
+        let release = runtime.block_on(async {
+            let release = hold_every_slot(&tasks, counts).await;
+            let started = Instant::now();
+            let refused = tasks.run(|| Ok(())).await;
+            let waited = started.elapsed();
+            assert!(
+                matches!(&refused, Err(StoreError::Write(message)) if message.contains("slot")),
+                "{refused:?}"
+            );
+            assert!(
+                waited >= Duration::from_millis(1_900) && waited < Duration::from_secs(4),
+                "refused after {waited:?}"
+            );
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            let late = tasks.run_until(deadline, || ()).await;
+            assert!(matches!(late, Ok(None)), "{late:?}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{started:?}");
+            assert_eq!(tasks.outstanding(), BLOB_TASKS, "a refused step started");
+            tasks.unlink_detached(kept.clone());
+            assert_eq!(tasks.outstanding(), BLOB_TASKS);
+            release
+        });
+        assert!(
+            kept.exists(),
+            "a Drop unlink with no slot is left for the sweep"
+        );
+        drop(release);
+        every_slot_free(&tasks);
+        runtime.block_on(async {
+            assert!(tasks.run(|| Ok(())).await.is_ok(), "the slots were freed");
+        });
+    }
+
+    /// Bead via-s4s critical review: a queued step whose deadline passed
+    /// while its executor stalled never starts, even when a slot frees
+    /// before it is polled again: it is refused as an acquisition timeout
+    /// is, and the slot returns.
+    #[test]
+    fn a_queued_step_past_its_deadline_never_starts() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let flag = Arc::clone(&ran);
+            let mut queued = pin!(tasks.run_until(deadline, move || {
+                flag.store(true, Ordering::Release);
+            }));
+            assert!(pending(queued.as_mut()).await, "queued behind the cap");
+            // The executor stalls past the deadline; a slot frees meanwhile.
+            std::thread::sleep(Duration::from_millis(200));
+            release.send(()).expect("a holder waits");
+            ended_down_to(&tasks, BLOB_TASKS - 1);
+            let late = queued.await;
+            drop(release);
+            assert!(matches!(late, Ok(None)), "{late:?}");
+        });
+        every_slot_free(&tasks);
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "work started after its deadline"
+        );
+    }
+
+    /// Bead via-s4s: the wait for a slot and the work share one bound. A
+    /// step that gets its slot near its deadline and then stalls answers
+    /// at the deadline, not a full bound after its slot.
+    #[test]
+    fn a_queued_step_shares_its_bound_with_its_wait() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let (stall, stalled) = mpsc::channel::<()>();
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            // A slot frees 0.9 s in, 0.1 s before the deadline.
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(900));
+                release.send(()).expect("a holder waits");
+                release
+            });
+            let late = tasks.run_until(deadline, move || stalled.recv()).await;
+            let answered = started.elapsed();
+            let release = releaser.join().expect("releaser");
+            assert!(matches!(late, Ok(None)), "{late:?}");
+            // A fresh bound after the slot would answer near 1.9 s.
+            assert!(answered < Duration::from_millis(1_500), "{answered:?}");
+            assert_eq!(tasks.outstanding(), BLOB_TASKS, "the stalled step is owned");
+            drop(release);
+        });
+        drop(stall);
+        every_slot_free(&tasks);
+    }
+
+    /// Bead via-s4s: a queued step cancelled by its caller starts nothing
+    /// and leaks no slot.
+    #[test]
+    fn a_cancelled_queued_step_starts_nothing_and_leaks_no_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let flag = Arc::clone(&ran);
+            let mut queued = Box::pin(tasks.run_until(deadline, move || {
+                flag.store(true, Ordering::Release);
+            }));
+            assert!(pending(queued.as_mut()).await, "queued behind the cap");
+            drop(queued);
+            drop(release);
+        });
+        every_slot_free(&tasks);
+        assert!(!ran.load(Ordering::Acquire), "a cancelled step started");
+    }
+
+    /// Bead via-s4s: a step that panics returns its slot as it unwinds;
+    /// its caller sees a `Write` failure.
+    #[test]
+    fn a_panicking_step_returns_its_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        runtime.block_on(async {
+            let failed = tasks
+                .run(|| -> std::io::Result<()> { panic!("a blob step panics") })
+                .await;
+            assert!(
+                matches!(&failed, Err(StoreError::Write(message)) if message.contains("without a result")),
+                "{failed:?}"
+            );
+        });
+        every_slot_free(&tasks);
+    }
+
+    /// Bead via-s4s: twice [`BLOB_TASKS`] healthy steps at once all
+    /// succeed. With every slot held, each further step is explicitly
+    /// polled to pending, not refused; once the holders end, each runs,
+    /// and no more than the cap run at once.
+    #[test]
+    fn healthy_steps_past_the_cap_wait_for_a_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&running, &peak)).await;
+            let mut queued = Vec::new();
+            for _ in 0..BLOB_TASKS {
+                let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
+                let mut step = Box::pin(tasks.run(move || {
+                    let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    running.fetch_sub(1, Ordering::AcqRel);
+                    Ok(())
+                }));
+                assert!(
+                    pending(step.as_mut()).await,
+                    "a step past the cap was answered"
+                );
+                queued.push(step);
+            }
+            drop(release);
+            for step in queued {
+                let step = step.await;
+                assert!(step.is_ok(), "a healthy step failed: {step:?}");
+            }
+        });
+        let peak = peak.load(Ordering::Acquire);
+        assert!(peak <= BLOB_TASKS, "{peak} steps ran at once");
+        every_slot_free(&tasks);
+    }
+
+    /// Design §10.4: a character split across chunks carries over; an
+    /// invalid byte fails wherever it is.
+    #[test]
+    fn utf8_check_carries_a_split_character() {
+        let text = "a€b".as_bytes();
+        let mut carry = Vec::new();
+        assert!(utf8_continues(&mut carry, &text[..2]));
+        assert_eq!(carry, text[1..2]);
+        assert!(utf8_continues(&mut carry, &text[2..3]));
+        assert!(utf8_continues(&mut carry, &text[3..]));
+        assert!(carry.is_empty());
+        let mut carry = Vec::new();
+        assert!(!utf8_continues(&mut carry, &[b'a', 0xff]));
+        let mut carry = Vec::new();
+        assert!(utf8_continues(&mut carry, &[0xe2]));
+        assert!(!utf8_continues(&mut carry, b"x"));
+    }
+}

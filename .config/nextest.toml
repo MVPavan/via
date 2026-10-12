@@ -1,0 +1,25 @@
+[profile.default]
+fail-fast = false
+status-level = "fail"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Task 4 T4-6 F24 (design §5.1, §13.2): the memory gate drives every holder
+# of the daemon at its maximum and samples its RSS, so it runs alone: it
+# neither disturbs nor is disturbed by timing-bound scenarios.
+[[profile.default.overrides]]
+filter = 'test(/^s1_f24_flood_/)'
+threads-required = "num-test-threads"
+
+# x.3.2 X5 (X0 item 9.2): `codex_rss_leases` drives every holder of one
+# Codex server and its 32 sessions at once and samples its RSS, so it runs
+# alone, as F24 does.
+[[profile.default.overrides]]
+filter = 'test(=codex_rss_leases)'
+threads-required = "num-test-threads"
+
+# Bead via-oq3: `s1_slots_32_parallel_*` runs 32 turns' agents and anchors
+# at once with 32 harness-process slots and samples the daemon's RSS, so it runs
+# alone, as F24 does.
+[[profile.default.overrides]]
+filter = 'test(/^s1_slots_32_parallel_/)'
+threads-required = "num-test-threads"

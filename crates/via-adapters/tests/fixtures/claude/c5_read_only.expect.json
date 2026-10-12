@@ -1,0 +1,72 @@
+{
+  "source": "CC c5_read_only, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 0,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      0
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Read input.txt, then try to write output.txt containing its text using a file-edit tool. Report what happened.",
+        "effort": null,
+        "bound": {
+          "mode": "read_only",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "read_only is refused bound_unsupported before any vendor I/O while CLAUDE-BOUND-1 is open (C2 §6.2 Bound, §7 item 13; packet §8). The fixture records the candidate recipe and is never started."
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. No init: the post-prompt successful result is the only message.",
+  "argv": [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "haiku",
+    "--session-id",
+    {
+      "capture": "sid"
+    },
+    "--restricted",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none",
+    "--tools",
+    "Read,Write,Edit,Glob,Grep,Bash",
+    "--allowedTools",
+    "Read,Write,Edit,Glob,Grep,Bash"
+  ],
+  "version": "2.1.285 (Claude Code)",
+  "deadline_ms": 20000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Reply RESULT_ONLY."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"${sid}\",\"stop_reason\":\"end_turn\",\"terminal_reason\":\"completed\",\"num_turns\":1,\"total_cost_usd\":0.001,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":20},\"permission_denials\":[],\"result\":\"RESULT_ONLY\"}"
+      }
+    },
+    {
+      "await_eof": {}
+    }
+  ]
+}

@@ -1,0 +1,168 @@
+//! Proves process outcomes reach artifacts even when the scenario fails early.
+
+#[path = "support/scenario.rs"]
+mod scenario;
+#[expect(dead_code, reason = "shared support; this file collects no State")]
+mod support;
+
+use std::error::Error;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+use scenario::{ScenarioError, run_command, run_scenario};
+use serde_json::Value;
+use support::evidence::Evidence;
+
+fn fixture() -> Result<(tempfile::TempDir, std::path::PathBuf), Box<dyn Error>> {
+    let sandbox = tempfile::tempdir()?;
+    let fixture = sandbox.path().join("fixture.json");
+    fs::write(&fixture, b"{}")?;
+    Ok((sandbox, fixture))
+}
+
+fn outcome(artifact: &Path) -> Result<Value, Box<dyn Error>> {
+    Ok(serde_json::from_slice(&fs::read(
+        artifact.join("summary.json"),
+    )?)?)
+}
+
+#[test]
+fn actual_wrong_result_panic_is_recorded_as_failure() -> Result<(), Box<dyn Error>> {
+    let (_sandbox, fixture) = fixture()?;
+    let via = Path::new(env!("CARGO_BIN_EXE_via"));
+    let evidence = Evidence::new("runner_wrong_result", via, &fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let mut command = Command::new(via);
+            command.arg("--version");
+            let capture = run_command(&mut command, Duration::from_secs(2))
+                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
+            evidence
+                .write("version.stdout", &capture.stdout)
+                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
+            assert_eq!(capture.stdout, b"deliberately wrong result\n");
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(report.outcome, "fail");
+    assert!(!report.evidence_complete);
+    assert!(report.require_pass().is_err());
+    // The run has no daemon, so its required evidence is missing: the
+    // artifact records that beside the failure, which it keeps (runtime
+    // §11.2, S1 critic r2 finding 3).
+    let summary = outcome(&report.artifact)?;
+    assert_eq!(summary["outcome"], "fail", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
+    assert!(
+        summary["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("scenario assertion panicked")),
+        "{summary}"
+    );
+    assert!(report.artifact.join("sha256.manifest").is_file());
+    Ok(())
+}
+
+#[test]
+fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>> {
+    let (_sandbox, fixture) = fixture()?;
+    let via = Path::new(env!("CARGO_BIN_EXE_via"));
+    let evidence = Evidence::new("runner_timeout", via, &fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let mut command = Command::new("sleep");
+            command.arg("5");
+            let capture = run_command(&mut command, Duration::from_millis(400))
+                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
+            // The captured outcome first; a lost output write is attached
+            // to it, never in its place (S1-evidence2 fix round 2, finding 5).
+            let written = evidence
+                .write("sleep.stdout", &capture.stdout)
+                .and_then(|()| evidence.write("sleep.stderr", &capture.stderr));
+            if capture.timed_out {
+                assert!(!capture.status.success());
+                return Err(ScenarioError::Timeout(format!(
+                    "sleep exceeded scenario deadline{}{}",
+                    capture.notes(),
+                    written
+                        .err()
+                        .map_or_else(String::new, |error| format!(" ({error})"))
+                )));
+            }
+            written.map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
+            Err(ScenarioError::Failure(
+                "sleep unexpectedly finished".to_owned(),
+            ))
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(report.outcome, "timeout");
+    assert!(!report.evidence_complete);
+    // As above: missing required evidence is recorded beside the timeout.
+    let summary = outcome(&report.artifact)?;
+    assert_eq!(summary["outcome"], "timeout", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
+    assert!(
+        summary["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("sleep exceeded scenario deadline")),
+        "{summary}"
+    );
+    assert!(report.artifact.join("sha256.manifest").is_file());
+    Ok(())
+}
+
+/// `via-jm4.7.6`: an infrastructure failure of the action is recorded as
+/// `infrastructure_failure`, never as a pass or an ordinary failure. A
+/// cleanup that panics after a passing action keeps the `pass` and records
+/// the cleanup failure beside it; the scenario still fails (runtime §11.2,
+/// S1 critic r2 finding 3).
+#[test]
+fn infrastructure_failures_are_classified_as_infrastructure() -> Result<(), Box<dyn Error>> {
+    let (_sandbox, fixture) = fixture()?;
+    let via = Path::new(env!("CARGO_BIN_EXE_via"));
+    let evidence = Evidence::new("runner_infrastructure_action", via, &fixture)?;
+    let report = run_scenario(
+        evidence,
+        |_| {
+            Err(ScenarioError::Infrastructure(
+                "fixture host is unavailable".to_owned(),
+            ))
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(report.outcome, "infrastructure_failure");
+    assert!(report.require_pass().is_err());
+    assert_eq!(
+        outcome(&report.artifact)?["outcome"],
+        "infrastructure_failure"
+    );
+    let evidence = Evidence::new("runner_infrastructure_cleanup", via, &fixture)?;
+    let report = run_scenario(
+        evidence,
+        |_| Ok(()),
+        |_| -> Result<(), ScenarioError> { panic!("cleanup lost its supervisor") },
+    );
+    assert_eq!(report.outcome, "pass");
+    assert!(!report.evidence_complete);
+    assert!(
+        report.detail.contains("cleanup panicked"),
+        "{}",
+        report.detail
+    );
+    assert!(report.require_pass().is_err());
+    let summary = outcome(&report.artifact)?;
+    assert_eq!(summary["outcome"], "pass", "{summary}");
+    assert!(
+        summary["cleanup_failure"]
+            .as_str()
+            .is_some_and(|failure| failure.contains("cleanup panicked")),
+        "{summary}"
+    );
+    Ok(())
+}

@@ -1,0 +1,123 @@
+{
+  "source": "CC c9b, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": "Always end every reply with the exact word MANGO.",
+      "cwd": "/work/project",
+      "resume": "22222222-2222-4222-8222-222222222222",
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Use Read to read made.txt and reply with its content.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.0109639,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 21765,
+          "cached_input_tokens": 21480,
+          "output_tokens": 156,
+          "scope": "turn"
+        },
+        "final_text": [
+          "The file contains: FILE_MARKER\n\nMANGO"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1,
+            "vendor_session_id": "22222222-2222-4222-8222-222222222222"
+          },
+          "turn.accepted",
+          "progress",
+          "final_text",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "Read"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "The replay pins the literal --resume value, sessions.main.resume, so a driver that passes another ID fails the replay. Resume of c9a's session: the frozen instructions are reapplied on every launch (packet §4 instructions; C2 §6.2 run_turn submission)."
+      }
+    }
+  ]
+}

@@ -1,0 +1,261 @@
+{
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. Three lifetimes: --max-turns 1 ends error_max_turns with num_turns 2; 2 on resume succeeds; null omits the flag.",
+  "harness": "claude",
+  "launches": 3,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1,
+      2,
+      3
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "List files twice.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": 1
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "failed",
+          "stop_reason": "max_steps",
+          "class_hint": "budget_exceeded",
+          "vendor_code": "error_max_turns",
+          "vendor_stop_reason": "tool_use"
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": null,
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
+          "turn.accepted"
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "Packet \u00a75: N is agentic iterations (two tool calls in one iteration count once); error_max_turns with terminal_reason max_turns maps failed / max_steps / budget_exceeded even though num_turns is 2."
+      }
+    },
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "List files again.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": 2
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.001,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          },
+          "structured_output": null
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": [
+          "LISTED"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 2
+          },
+          "turn.accepted"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "N=2 on resume succeeds."
+      }
+    },
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply DONE.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.001,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          },
+          "structured_output": null
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": [
+          "DONE"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 3
+          },
+          "turn.accepted"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "A null max_steps omits --max-turns."
+      }
+    }
+  ]
+}

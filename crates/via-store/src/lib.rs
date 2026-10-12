@@ -1,0 +1,261 @@
+//! Durable identity and storage boundary types. Store never decides lifecycle
+//! outcomes; Core supplies proposed transitions and Store checks their versions.
+
+use std::{fmt, num::NonZeroU32};
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// A canonical VIA session identifier (`s_` and 12 lowercase Crockford digits).
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// Returns the canonical wire representation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The lowercase Crockford base-32 digits VIA's internal IDs use.
+const CROCKFORD: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// Whether `suffix` is exactly 12 lowercase Crockford digits.
+fn crockford12(suffix: &str) -> bool {
+    suffix.len() == 12 && suffix.bytes().all(|byte| CROCKFORD.contains(&byte))
+}
+
+impl TryFrom<&str> for SessionId {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let Some(suffix) = value.strip_prefix("s_") else {
+            return Err("session id must start with s_");
+        };
+        if !crockford12(suffix) {
+            return Err("session id must contain 12 lowercase Crockford digits");
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value.as_str()).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// An internal shared-server identifier (runtime §5 AR6): `v_` and 12
+/// lowercase Crockford digits. It names the server's evidence folder and
+/// its anchor's owner; no C1 field carries it. It never collides with a
+/// session folder, whose IDs start `s_`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ServerId(String);
+
+impl ServerId {
+    /// Mints a fresh ID from 60 bits of `/dev/urandom`, as session IDs are
+    /// made.
+    pub fn mint() -> std::io::Result<Self> {
+        use std::io::Read as _;
+        let mut random = [0_u8; 8];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let mut bits = u64::from_le_bytes(random);
+        let mut id = String::with_capacity(14);
+        id.push_str("v_");
+        for _ in 0..12 {
+            id.push(char::from(
+                CROCKFORD[usize::try_from(bits & 31).unwrap_or(0)],
+            ));
+            bits >>= 5;
+        }
+        Ok(Self(id))
+    }
+
+    /// Returns the canonical representation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for ServerId {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let Some(suffix) = value.strip_prefix("v_") else {
+            return Err("server id must start with v_");
+        };
+        if !crockford12(suffix) {
+            return Err("server id must contain 12 lowercase Crockford digits");
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl fmt::Display for ServerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// The durable owner of a VIA-owned private process group (runtime §5
+/// AR6): one turn of a per-turn route, or one shared server, which no turn
+/// owns; a server-route turn reaches its server's anchor only through its
+/// link (runtime §6 `server_turns`).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ProcessOwner {
+    /// The turn that owns a per-turn process.
+    Turn {
+        /// VIA session that admitted the turn.
+        session_id: SessionId,
+        /// One-based turn number.
+        turn: TurnNumber,
+    },
+    /// A shared server.
+    Server {
+        /// The server's internal ID.
+        server_id: ServerId,
+    },
+}
+
+/// One-based turn number within a session.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct TurnNumber(NonZeroU32);
+
+impl TurnNumber {
+    /// Returns the one-based number.
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// The number alone, as C1 names a turn within its session (`2`; the
+/// session's address adds `s_…/`): never the `Debug` form in a message.
+impl std::fmt::Display for TurnNumber {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl TryFrom<u32> for TurnNumber {
+    type Error = &'static str;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        NonZeroU32::new(value)
+            .map(Self)
+            .ok_or("turn number must be at least one")
+    }
+}
+
+impl<'de> Deserialize<'de> for TurnNumber {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_from(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A retry identity as Store keeps it: the identity bytes' length and
+/// SHA-256, never the bytes (Task 4 design §6.4, §6.5). A retry matches when
+/// both are equal, which keeps C1's byte-identical rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Identity {
+    /// Length of the identity bytes.
+    pub len: u64,
+    /// SHA-256 of the identity bytes.
+    pub sha256: [u8; 32],
+}
+
+impl Identity {
+    /// The identity of `bytes`.
+    pub fn of(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+}
+
+/// An absolute monotonic deadline; never serialized or persisted.
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline(tokio::time::Instant);
+
+impl Deadline {
+    /// Wraps an already calculated absolute instant.
+    pub fn at(instant: tokio::time::Instant) -> Self {
+        Self(instant)
+    }
+
+    /// Returns the absolute instant for nested operations.
+    pub fn instant(self) -> tokio::time::Instant {
+        self.0
+    }
+}
+
+/// The first recorded storage failure class, without request payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreFailureKind {
+    /// Storage could not be opened or validated.
+    Open,
+    /// A transaction failed before commit.
+    Write,
+    /// The writer cannot establish whether a mutation committed.
+    UncertainCommit,
+    /// A referenced durable span was missing or corrupt.
+    CorruptEvidence,
+    /// The bounded request quota was exhausted.
+    Quota,
+    /// SQLite reported a corrupt database.
+    Corrupt,
+}
+
+/// Whether a requested mutation has a positive commit receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitOutcome<T> {
+    /// The mutation committed and may be acknowledged to its caller.
+    Committed(T),
+    /// The mutation definitely did not commit.
+    NotCommitted(StoreFailureKind),
+    /// The outcome is unknown; the mutation must never be resent speculatively.
+    Uncertain(StoreFailureKind),
+}
+
+mod blob;
+mod evidence;
+#[cfg(feature = "test-failpoints")]
+pub mod failpoint;
+mod final_text;
+pub mod json_limits;
+mod lanes;
+mod runtime;
+mod structured_output;
+
+pub use blob::{
+    BLOB_CHUNK, BlobReader, BlobRef, BlobTasks, BlobWriter, INLINE_MAX, PROMPT_MAX, PromptFileError,
+};
+pub use evidence::{EVIDENCE_FILES, EvidenceRoot};
+pub use final_text::{FINAL_TEXT_FILE_MAX, FinalTextFile, FinalTextRef};
+pub use lanes::{Lane, Lanes};
+pub use structured_output::StructuredOutputRef;
+
+pub use runtime::{
+    ANCHOR_PAGE_LIMIT, AcceptanceRecord, ActiveTurn, AnchorCohort, AnchorIdentity, AnchorIntent,
+    AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorRecord, CancelCause, CloseIntent,
+    ClosedOutcome, ClosedRecord, ClosingRecord, ENVELOPE_MAX, EventRecord, EventsPage, EventsQuery,
+    EventsRead, EvidenceRefs, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord,
+    GroupAbsenceRecord, InstanceRecord, KeyedOperation, ListPage, ListQuery, OperationRecord,
+    OperationVerb, PAGE_BYTES, PAGE_MAX, Predecessors, ProcessJournal, Prompt, QueuedSummary,
+    QueuedTurn, ReceiptRecord, ResumeRecord, RevisableTurn, RevisionRecord, RuntimeResources,
+    SERVER_LINKS_LIMIT, SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_STEPS,
+    STATUS_TURNS, ServerLink, SessionEventRecord, SessionIdentity, SessionRoute, SessionSnapshot,
+    SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusTurn, SteerIntent, SteerOutcome,
+    StepRow, StepsRecord, Store, StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey,
+    SubmissionRecord, SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts,
+    TerminalRecord, UnfinishedTurn, WalLimits, at_ms,
+};

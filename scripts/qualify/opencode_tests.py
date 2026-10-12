@@ -1,0 +1,734 @@
+"""Offline entry/acquisition/verdict regressions for OpenCode packet §13."""
+
+import contextlib
+import io
+import json
+import os
+import shutil
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import opencode
+from opencode_safety import Blocked
+from opencode_safety_tests import fake_cli_generation
+
+
+class EntryTests(unittest.TestCase):
+    def test_proven_stop_removes_run_root_even_when_native_diagnostic_fails(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix='oc-entry-',dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory);instances=[]
+            class FakeDriver:
+                def __init__(self,**kwargs):
+                    self.vault=opencode.safety.PasswordVault()
+                    self.proc=opencode.safety.ProcReader(root/'synthetic-proc')
+                    self.work=kwargs['run_root'];self.external_root=True
+                    self.identities={opencode.safety.Identity(123,456)};self.daemon=None
+                    self.stop_result=None;instances.append(self)
+                def prepare(self):pass
+                def observe(self,*_args):return {'release':'a'*64,'test-failpoints':'b'*64}
+                def finish(self):
+                    self.stop_result={'proven':True,'processes_gone':True,'pgrep_clear':True,'locks_free':True}
+                    error=Blocked('native diagnostic unavailable');error.diagnostic_failure=True
+                    raise error
+            class Adapter:
+                def execute(self,operation,**_kwargs):
+                    if operation=='build_hashes':return {'release':'a'*64,'test-failpoints':'b'*64}
+                    return {}
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                acquire=False,opencode=root/'pin',via_release=root/'release',via_failpoints=root/'fp',
+                fake_gate_manifest=root/'gates')
+            def preflight(_driver,case):case.check('FAKE predicate',True)
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'system_tools_preflight',return_value={'rg':True,'python3':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), \
+                 patch.object(opencode_driver,'Driver',FakeDriver), \
+                 patch.object(opencode.cases,'DriverAdapter',return_value=Adapter()), \
+                 patch.dict(opencode.cases.CASES,{'preflight':preflight}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            self.assertFalse(instances[0].work.exists())
+            self.assertTrue(summary.get('run_root_cleanup',{}).get('removed'))
+            self.assertEqual(summary['blocks'][0]['reason'],'native diagnostic unavailable')
+            self.assertEqual(summary.get('diagnostic_error'),'Blocked')
+            self.assertTrue(summary.get('process_cleanup',{}).get('proven'))
+
+    def setUp(self):
+        # Entry tests script admission; ancestor discovery is independently tested.
+        ancestors=patch.object(opencode.runroots,'check_ancestors',return_value={
+            'checked_names':list(opencode.runroots.DISCOVERY_NAMES),
+            'ancestors':['temporary-directory','filesystem-root'],'clear':True})
+        ancestors.start();self.addCleanup(ancestors.stop)
+        # FAKE entry transports never start processes; runtime ownership and
+        # binary strings are exercised separately by the run-root regressions.
+        holder=tempfile.TemporaryDirectory(prefix='oc-entry-roots-',dir=opencode.SCRATCHPAD)
+        self.addCleanup(holder.cleanup)
+        def allocate():
+            return Path(tempfile.mkdtemp(prefix=opencode.runroots.RUN_PREFIX,dir=holder.name))
+        def remove(root,proof):
+            if any(proof.get(key) is not True for key in ('proven','processes_gone','pgrep_clear')):
+                raise Blocked('run root cleanup needs process absence')
+            shutil.rmtree(root)
+            return {'removed':True,'path_class':'private-external-run-root','name':root.name}
+        for name,function in (('create_run_root',allocate),('remove_run_root',remove)):
+            fixture=patch.object(opencode.runroots,name,side_effect=function)
+            fixture.start();self.addCleanup(fixture.stop)
+        strings=patch.object(opencode.runroots,'discovery_strings',return_value={'basis':'FAKE'})
+        strings.start();self.addCleanup(strings.stop)
+
+    def test_optional_real_via_skips_are_reported_without_passing_as_executed(self):
+        class Optional(unittest.TestCase):
+            def runTest(self): self.skipTest('optional real-VIA audit: binaries absent')
+        optional=Optional()
+        optional.id=lambda:'opencode_via_tests.RealViaTests.test_fixture'
+        with patch.object(opencode,'TEST_MODULES',('opencode_via_tests',)), \
+                patch.object(opencode.unittest.defaultTestLoader,'loadTestsFromModule',
+                             return_value=unittest.TestSuite([optional])):
+            failed,count=opencode.self_test()
+        self.assertEqual(failed,[])
+        self.assertEqual(count,1)
+        self.assertEqual(opencode.self_test.skipped,[{'test':optional.id(),
+            'reason':'optional real-VIA audit: binaries absent'}])
+
+    def test_failed_self_test_identity_and_cleanup_proofs_reach_summary_and_phase(self):
+        with tempfile.TemporaryDirectory(prefix='oc-entry-',dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                acquire=False,opencode=root/'pin',via_release=root/'release',via_failpoints=root/'fp',
+                fake_gate_manifest=root/'gates')
+            identity='opencode_readiness_tests.ReadinessTests.test_cached_vendor_origin_rechecks_host_binding'
+            proof={'build':'release','owned_processes':1,'identities_gone':True,
+                   'pgrep_clear':True,'private_root_removed':True,'short_runtime_removed':True}
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([identity],1)) as tests, \
+                 patch.object(opencode,'verify_fake_gates') as gates, \
+                 patch.object(opencode.safety,'verify_binary') as pin, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                tests.skipped=[]; tests.real_via_cleanup=[proof]
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            phase=json.loads((args.evidence/'setup.json').read_text())
+            self.assertEqual(summary['self_test_admission']['failed'],[identity])
+            self.assertEqual(summary['self_test_admission']['real_via_cleanup'],[proof])
+            self.assertEqual(phase[-1]['self_test_admission'],summary['self_test_admission'])
+            self.assertEqual(summary['blocks'][0]['reason'],'offline self-tests failed')
+            gates.assert_not_called(); pin.assert_not_called()
+
+    def test_preflight_schema_block_reason_reaches_summary_and_phase(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            class FakeDriver(opencode_driver.Driver):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs, execute=lambda *_a, **_k:
+                                     (0,b'{"harness":"opencode"}',b''))
+                def prepare(self):
+                    self._binary=root/'release'; self.project=root; self.env={}
+                    fake_cli_generation(self)
+                def build(self, _kind): return 'a'*64
+                def observe(self, kind, _args=None):
+                    if kind=='build_hashes':
+                        return {'release':'a'*64,'failpoints':'b'*64}
+                    if kind=='interruption': return {'interrupted':False}
+                    if kind=='fresh_max_steps': return self.via(['describe'])
+                    raise AssertionError('unexpected FAKE observation')
+                def finish(self):
+                    self.daemon=None  # FAKE transport owns no real process.
+                    raise Blocked('FAKE cleanup stop proof unavailable')
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                                 acquire=False,opencode=root/'fake-pin',via_release=root/'release',
+                                 via_failpoints=root/'fp',fake_gate_manifest=root/'gates')
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), \
+                 patch.object(opencode_driver,'Driver',FakeDriver), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            phase=json.loads((args.evidence/'preflight.json').read_text())
+            block=summary['blocks'][0]
+            self.assertEqual(block['reason'],'describe: required field missing',summary)
+            self.assertEqual((block['phase'],block['case'],block['verb']),
+                             ('preflight','preflight','describe'))
+            replies=sorted(args.evidence.glob('*reply-block.json'))
+            self.assertTrue(replies,'preflight schema block did not retain its reply')
+            self.assertEqual(block['reply_evidence'],[replies[0].name])
+            saved=json.loads(replies[0].read_text())
+            self.assertEqual(saved['replies'][-1]['projection']['harness'],'opencode')
+            self.assertEqual(phase[0]['blocking'],block)
+            self.assertEqual(phase[0]['result'],'blocked')
+            self.assertEqual(summary['blocks'][1]['reason'],'FAKE cleanup stop proof unavailable')
+            cleanup=json.loads((args.evidence/'cleanup.json').read_text())
+            self.assertEqual(cleanup[0]['blocking'],summary['blocks'][1])
+            self.assertEqual(summary['result'],'blocked')
+            self.assertEqual(len(summary['runner_source']['sha256']),64)
+
+    def test_record_only_block_stops_every_later_phase_and_keeps_reason(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix='oc-entry-',dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            class FakeDriver:
+                def __init__(self,**_kwargs):
+                    self.vault=opencode.safety.PasswordVault()
+                    self.proc=opencode.safety.ProcReader(root/'synthetic-proc')
+                def prepare(self): pass
+                def finish(self): return {'complete':True,'processes_gone':True}
+                def observe(self,*_args): return {'release':'a'*64,'test-failpoints':'b'*64}
+            args=SimpleNamespace(self_test=False,phase=['ledger','helpers'],evidence=root/'run',
+                acquire=False,opencode=root/'pin',via_release=root/'release',via_failpoints=root/'fp',
+                fake_gate_manifest=root/'gates')
+            calls=[]
+            class CaseDriver:
+                def execute(self,operation,**kwargs):
+                    if operation=='build_hashes': return {'release':'a'*64,'test-failpoints':'b'*64}
+                    if operation=='phase_begin': calls.append(kwargs['phase'])
+            later=unittest.mock.Mock()
+            def preflight(_driver,case): case.check('FAKE preflight',True)
+            def blocked(_driver,_case): raise Blocked('FAKE record-only admission block')
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'system_tools_preflight',return_value={'rg':True,'python3':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), \
+                 patch.object(opencode_driver,'Driver',FakeDriver), \
+                 patch.object(opencode.cases,'DriverAdapter',return_value=CaseDriver()), \
+                 patch.dict(opencode.cases.PHASE_CASES,{'ledger':('compaction','usage')}), \
+                 patch.dict(opencode.cases.CASES,{'preflight':preflight,'compaction':blocked,'usage':later}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            later.assert_not_called()
+            self.assertEqual(calls,['preflight','ledger'])
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            self.assertEqual(summary['blocks'][0]['reason'],'FAKE record-only admission block')
+            self.assertEqual(summary['failure_order'][0]['case'],'compaction')
+            self.assertEqual(json.loads((args.evidence/'ledger.json').read_text())[0]['result'],'blocked')
+
+    def test_untrusted_exception_text_never_enters_block_evidence(self):
+        reason=opencode.safety.blocking_record(ValueError('VENDOR PRIVATE RETURNED TEXT'))
+        self.assertEqual(reason['reason'],'unexpected runner exception')
+        self.assertNotIn('VENDOR PRIVATE',json.dumps(reason))
+
+    def test_protected_match_in_runner_block_reason_is_redacted(self):
+        reason=opencode.safety.blocking_record(
+            Blocked('FAKE stop echoed protected-fixture-value'),
+            secret_forms=[b'protected-fixture-value'])
+        self.assertEqual(reason['reason'],'blocking reason matched protected material')
+        self.assertNotIn('protected-fixture-value',json.dumps(reason))
+
+    def test_original_runner_failure_precedes_cleanup_failure_in_summary(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            class FakeDriver:
+                def __init__(self,**kwargs):
+                    self.vault=opencode.safety.PasswordVault()
+                    self.proc=opencode.safety.ProcReader(root/'synthetic-proc')
+                def prepare(self): raise ValueError('FAKE original setup failure')
+                def finish(self): raise Blocked('FAKE secondary cleanup failure')
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                                 acquire=False,opencode=root/'fake-pin',via_release=root/'release',
+                                 via_failpoints=root/'fp',fake_gate_manifest=root/'gates')
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'system_tools_preflight',return_value={'rg':True,'python3':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), patch.object(opencode_driver,'Driver',FakeDriver), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            self.assertEqual(summary['failure_order'],[
+                {'stage':'runner','kind':'ValueError'},{'stage':'cleanup','kind':'Blocked'}])
+            self.assertEqual(summary['result'],'blocked')
+
+    def test_plain_invocation_cannot_start_live(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            opencode.arguments([])
+
+    def test_self_test_rejects_live_or_acquisition(self):
+        for flag in ("--live", "--acquire"):
+            with self.subTest(flag=flag), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                opencode.arguments(["--self-test", flag])
+
+    def test_offline_arguments_need_no_binary(self):
+        self.assertTrue(opencode.arguments(["--self-test"]).self_test)
+
+    def test_phase_selection_always_starts_with_preflight(self):
+        self.assertEqual(opencode.selected_phases(["anchor"]), ["preflight", "anchor"])
+
+    def test_partial_coverage_never_qualifies(self):
+        record = {"case": "preflight", "disposition": "gate", "result": "pass"}
+        verdict = opencode.summary_verdict([record], ["preflight"], {"stopped": True}, False)
+        self.assertEqual(verdict["result"], "not_passed")
+
+    def test_uncertain_stop_or_signal_never_passes(self):
+        phases = opencode.selected_phases(None)
+        records = [{"case": name, "disposition": "gate", "result": "pass"}
+                   for phase in phases for name in opencode.cases.PHASE_CASES[phase]]
+        for cleanup, interrupted in (({}, False), ({"stopped": None}, False),
+                                     ({"stopped": True}, True)):
+            self.assertEqual(opencode.summary_verdict(records, phases, cleanup, interrupted)
+                             ["result"], "not_passed")
+        self.assertEqual(opencode.summary_verdict(records, phases, {"stopped": True}, False)
+                         ["result"], "pass")
+
+    def test_missing_or_duplicate_case_does_not_pass(self):
+        phases = opencode.selected_phases(None)
+        records = [{"case": name, "disposition": "gate", "result": "pass"}
+                   for phase in phases for name in opencode.cases.PHASE_CASES[phase]]
+        for incomplete in (records[:-1], records + [records[0]]):
+            self.assertEqual(opencode.summary_verdict(incomplete, phases, {"stopped": True}, False)
+                             ["result"], "not_passed")
+
+    def test_record_only_absence_is_not_a_gate_pass(self):
+        records = [{"case": "collision", "disposition": "record-only", "result": "not_observable"}]
+        self.assertEqual(opencode.summary_verdict(records, ["seams"], {"stopped": True}, False)
+                         ["gate_passed"], 0)
+
+    def test_summary_declared_deferrals_include_every_deferred_live_row(self):
+        verdict=opencode.summary_verdict([], ["preflight"], {"stopped":True}, False)
+        self.assertEqual(set(verdict["deferred"]),{"L1","L6","L10","L12"})
+        self.assertEqual(verdict["deferred_count"],4)
+        self.assertEqual(verdict["record_only_count"],0)
+        self.assertEqual(verdict["result"],"not_passed")
+
+    def test_summary_uses_recorded_deferral_reasons_without_counting_gate_passes(self):
+        records=[opencode.cases.run_case(None,name,opencode.cases.CASES[name],"record-only")
+                 for name in ("collision","forms","other")]
+        verdict=opencode.summary_verdict(records,["seams"],{"stopped":True},False)
+        self.assertEqual(set(verdict["deferred"]),{"L1","L6","L10","L12"})
+        self.assertEqual(verdict["deferred_count"],4)
+        for row,live in zip(records,("L1","L6","L12")):
+            self.assertEqual(verdict["deferred"][live],row["reason"])
+        self.assertEqual(verdict["record_only_count"],0)
+        self.assertEqual(verdict["gate_passed"],0)
+
+    def test_private_acquisition_environment_restored_after_error(self):
+        before = dict(os.environ)
+        with self.assertRaises(Blocked):
+            with opencode.acquisition_home(Path("scratchpad/private-fixture-home")):
+                self.assertEqual(set(os.environ), {"HOME", "PATH", "LANG"})
+                raise Blocked("fixture")
+        self.assertTrue(dict(os.environ) == before, "caller environment was restored")
+
+    def test_manifest_identity_integrity_and_size_required(self):
+        for manifest in ({}, {"name": "@opencode/cli-linux-x64", "version": "2.0.24"},
+                         {"name": "@opencode/cli-linux-x64", "version": "2.0.22", "dist": {}}):
+            with patch.object(opencode, "official_get", return_value=json.dumps(manifest).encode()), \
+                    self.assertRaises(Blocked):
+                opencode.package_manifest("@opencode/cli-linux-x64")
+
+    def test_acquisition_attempts_same_version_fallbacks_then_blocks(self):
+        with tempfile.TemporaryDirectory() as root:
+            calls = []
+            def unavailable(package):
+                calls.append(package)
+                raise Blocked("fixture package unavailable")
+            with patch.object(opencode, "package_manifest", side_effect=unavailable), \
+                    patch.object(opencode, "acquire_release", side_effect=Blocked("fixture")) as release, \
+                    self.assertRaises(Blocked):
+                opencode.acquire(Path(root))
+            self.assertEqual(calls, ["@opencode/cli-linux-x64", "@opencode/cli-linux-x64-baseline"])
+            release.assert_not_called()
+
+    def test_release_tag_and_asset_required_before_download(self):
+        invalid = ({"tag_name": "v2.0.24", "draft": False, "assets": []},
+                   {"tag_name": "v2.0.22", "draft": True, "assets": []},
+                   {"tag_name": "v2.0.22", "draft": False, "assets": []})
+        for release in invalid:
+            with patch.object(opencode, "official_get", return_value=json.dumps(release).encode()) as get, \
+                    self.assertRaises(Blocked):
+                opencode.acquire_release(Path("unused-fixture"))
+            get.assert_not_called()
+
+    def test_acquisition_requires_private_context_before_any_network(self):
+        with self.assertRaises(Blocked):
+            opencode.official_get("https://registry.npmjs.org/fixture", allowed_hosts={"registry.npmjs.org"})
+
+    def test_changed_registry_anchor_stops_before_archive_download_or_parse(self):
+        for field, changed in (("integrity", "sha512-" + "A" * 88),
+                               ("unpackedSize", 204482253)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                dist = {"tarball": opencode.safety.NPM_URL,
+                        "integrity": "sha512-" + opencode.safety.NPM_SHA512,
+                        "unpackedSize": 204482252, field: changed}
+                with patch.object(opencode, "package_manifest", return_value=dist), \
+                        patch.object(opencode, "official_get", return_value=b"unparsed fixture") as get, \
+                        patch.object(opencode.safety, "extract_pinned_npm", return_value=Path("pin")) as parse:
+                    with self.assertRaisesRegex(Blocked, "no official same-version artifact"):
+                        opencode.acquire(Path(directory))
+                    get.assert_not_called()
+                    parse.assert_not_called()
+
+    def test_unanchored_release_fallback_stops_before_network(self):
+        release = {"tag_name": "v2.0.22", "draft": False, "assets": [{
+            "name": "opencode-linux-x64.tar.gz",
+            "browser_download_url": "https://github.com/anomalyco/opencode/releases/download/v2.0.22/fixture.tgz"}]}
+        with patch.object(opencode, "official_get", side_effect=[json.dumps(release).encode(),
+                                                                b"unparsed archive"]) as get, \
+                patch.object(opencode.safety, "extract_pinned_release", return_value=Path("pin")) as parse:
+            with self.assertRaisesRegex(Blocked, "pre-extraction archive pin"):
+                opencode.acquire_release(Path("unused-fixture"))
+            get.assert_not_called()
+            parse.assert_not_called()
+
+    def test_partial_phase_records_survive_a_later_infrastructure_failure(self):
+        self._entry_partial_fixture(missing_recovery_parent=False)
+
+    def test_phase_sink_receives_completed_row_before_later_guard_failure(self):
+        class FakeDriver:
+            guards = 0
+            def execute(self, action, **_fields):
+                if action == "build_hashes":
+                    return {"release": "a" * 64, "test-failpoints": "b" * 64}
+                if action == "phase_guard":
+                    self.guards += 1
+                    if self.guards == 2:
+                        raise Blocked("later infrastructure failure")
+                return {}
+        records = []
+        first = {"case": "free", "disposition": "gate", "result": "pass"}
+        with patch.dict(opencode.cases.PHASE_CASES, {"free": ("free", "continuity")}), \
+                patch.object(opencode.cases, "run_case", return_value=first), \
+                self.assertRaisesRegex(Blocked, "later infrastructure failure"):
+            opencode.cases.run_phase(FakeDriver(), "free",
+                                    record_sink=lambda rows: records.extend(rows))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["case"], "free")
+        self.assertEqual(records[0]["via_build"]["sha256"], "a" * 64)
+
+    def test_recovery_parent_is_created_before_prepare(self):
+        self._entry_partial_fixture(missing_recovery_parent=True)
+
+    def test_missing_system_tools_stop_before_acquisition(self):
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=True, opencode=None, via_release=root / "release",
+                                   via_failpoints=root / "failpoints", fake_gate_manifest=root / "fake-gates")
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode.shutil, "which", return_value=None), \
+                    patch.object(opencode, "acquire", side_effect=Blocked("must not acquire")) as acquire, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            acquire.assert_not_called()
+
+    def test_recovery_common_parents_need_not_be_chmodded(self):
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            parent = Path(directory) / "shared-scratch-parent"
+            parent.mkdir(mode=0o755)
+            # Establish the asserted mode independently of the caller's umask.
+            parent.chmod(0o755)
+            target = parent / "recovery"
+            with patch.object(opencode, "RECOVERY_ROOT", target):
+                self.assertEqual(opencode.private_recovery_root(), target)
+            self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_bearer_in_final_cleanup_cannot_reach_evidence(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    self.vault = opencode.safety.PasswordVault()
+                    self.secret_forms = [b"h_private_fake_fixture"]
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                def prepare(self): pass
+                def observe(self, _kind): return {}
+                def finish(self): return {"stopped": True, "echo": "h_private_fake_fixture"}
+                def clear_sensitive(self): self.secret_forms.clear()
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin",
+                                   via_release=root / "release", via_failpoints=root / "failpoints",
+                                   fake_gate_manifest=root / "fake-gates")
+            record = {"case": "preflight", "disposition": "gate", "result": "pass", "checks": []}
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode, "RECOVERY_ROOT", root / "recovery"), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", return_value=[record]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            fallback=json.loads((args.evidence / "summary.json").read_text())
+            self.assertEqual(fallback['result'],'blocked')
+            self.assertTrue(fallback['summary_rejected'])
+            for path in args.evidence.glob("*.json"):
+                self.assertNotIn(b"h_private_fake_fixture", path.read_bytes())
+
+    def _entry_partial_fixture(self, *, missing_recovery_parent):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            recovery = root / "new-parent" / "recovery" if missing_recovery_parent else root / "recovery"
+            calls = []
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    self.vault = opencode.safety.PasswordVault()
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                def prepare(self): calls.append("prepare")
+                def observe(self, _kind): return {}
+                def finish(self): return {"stopped": True}
+                def clear_sensitive(self): self.vault.clear()
+            args = SimpleNamespace(self_test=False, phase=["free"], evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin",
+                                   via_release=root / "release", via_failpoints=root / "failpoints",
+                                   fake_gate_manifest=root / "fake-gates")
+            record = {"case": "preflight", "disposition": "gate", "result": "pass", "checks": []}
+            def phase(_adapter, _name, *, record_sink=None):
+                if record_sink is not None: record_sink([record])
+                raise Blocked("later fake phase infrastructure failed")
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode, "RECOVERY_ROOT", recovery), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", side_effect=phase), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            self.assertEqual(calls, ["prepare"])
+            summary = json.loads((args.evidence / "summary.json").read_bytes())
+            self.assertEqual(summary["cases"], [record])
+            partial=json.loads((args.evidence / "preflight.json").read_bytes())
+            self.assertEqual(partial[0],record)
+            self.assertEqual(partial[1]['blocking']['reason'],'later fake phase infrastructure failed')
+            self.assertEqual(summary["result"], "blocked")
+
+    def test_fake_gate_proof_binds_both_builds_source_tests_and_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "crates").mkdir()
+            (root / "third_party").mkdir()
+            (root / "scripts").mkdir()
+            for name in ("Cargo.toml", "Cargo.lock", "scripts/check-release-features.py"):
+                (root / name).write_text("fixture build input")
+            release, failpoints = root / "release", root / "failpoints"
+            release.write_bytes(b"release"); failpoints.write_bytes(b"failpoints")
+            release.chmod(0o500); failpoints.chmod(0o500)
+            (root / "scratchpad").mkdir(mode=0o700)
+            manifest = root / "scratchpad" / "manifest.json"
+            valid = {"version": 1, "result": "pass",
+                     "rust_source_sha256": opencode.rust_source_hash(root),
+                     "via_hashes": {"release": opencode.safety.sha256(release),
+                                    "test-failpoints": opencode.safety.sha256(failpoints)},
+                     "tests": list(opencode.FAKE_GATE_TESTS),
+                     "gates": {name: 0 for name in opencode.FAKE_GATES}}
+            for change in ({"version": True}, {"result": "unknown"},
+                           {"rust_source_sha256": "0" * 64}, {"via_hashes": {}},
+                           {"tests": []}, {"gates": {}},
+                           {"gates": {name: False for name in opencode.FAKE_GATES}}):
+                with self.subTest(change=tuple(change)):
+                    manifest.write_text(json.dumps({**valid, **change}))
+                    with self.assertRaises(Blocked):
+                        opencode.verify_fake_gates(manifest, release, failpoints, root)
+            manifest.write_text(json.dumps(valid))
+            proof = opencode.verify_fake_gates(manifest, release, failpoints, root)
+            self.assertIs(proof["verified"], True)
+            failpoints.chmod(0o700)
+            failpoints.write_bytes(b"changed build")
+            failpoints.chmod(0o500)
+            with self.assertRaises(Blocked):
+                opencode.verify_fake_gates(manifest, release, failpoints, root)
+
+    def test_manifest_and_program_overrides_cannot_read_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scratchpad").mkdir(mode=0o700)
+            executable = root / "via"
+            executable.write_bytes(b"fixture"); executable.chmod(0o500)
+            credential = root / "scratchpad" / "auth.json"
+            credential.write_bytes(b"synthetic private fixture"); credential.chmod(0o500)
+            with patch.object(opencode.safety, "sha256") as hash_file, \
+                    self.assertRaises(Blocked):
+                opencode.verify_fake_gates(root / "outside.json", executable, executable, root)
+            hash_file.assert_not_called()
+            with patch.object(opencode.safety, "sha256") as hash_file, \
+                    self.assertRaises(Blocked):
+                opencode.verify_fake_gates(root / "scratchpad" / "manifest.json",
+                                          credential, executable, root)
+            hash_file.assert_not_called()
+
+    def test_missing_manifest_blocks_before_acquisition_or_driver_start(self):
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=True, opencode=None, via_release=root / "release",
+                                   via_failpoints=root / "failpoints", fake_gate_manifest=root / "missing")
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "acquire") as acquire, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            acquire.assert_not_called()
+            summary = json.loads((args.evidence / "summary.json").read_text())
+            self.assertEqual(summary["runner_error"], "Blocked")
+            self.assertFalse(summary["daemons_stopped"])
+
+    def test_entry_fake_phase_always_cleans_up_and_writes_sanitized_summary(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            calls = []
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    self.vault = opencode.safety.PasswordVault()
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                def prepare(self):
+                    calls.append("prepare")
+                def observe(self, kind):
+                    self_kind = kind
+                    if self_kind != "build_hashes":
+                        raise Blocked("fixture observation unavailable")
+                    return {"release": "1" * 64, "test-failpoints": "2" * 64}
+                def finish(self):
+                    calls.append("finish")
+                    return {"stopped": True}
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin",
+                                   via_release=root / "release", via_failpoints=root / "failpoints",
+                                   fake_gate_manifest=root / "fake-gates")
+            record = {"case": "preflight", "disposition": "gate", "result": "pass", "checks": []}
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode, "RECOVERY_ROOT", root / "recovery"), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", return_value=[record]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            self.assertEqual(calls, ["prepare", "finish"])
+            summary = json.loads((args.evidence / "summary.json").read_text())
+            self.assertEqual(summary["result"], "not_passed")
+            self.assertTrue(summary["daemons_stopped"])
+
+    def test_rejected_password_record_never_reaches_final_summary(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            password = b"entry-synthetic-memory-password"
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    self.vault = opencode.safety.PasswordVault()
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                    class Proc:
+                        def read(self, *_args):
+                            return b"OPENCODE_PASSWORD=" + password + b"\0"
+                    self.vault.read_once(Proc(), opencode.safety.Identity(44, 7))
+                def prepare(self): pass
+                def observe(self, _kind): return {}
+                def finish(self):
+                    # Reproduce the original component's premature clear. The
+                    # entry must also exclude a rejected record before cleanup.
+                    self.vault.clear()
+                    return {"stopped": True}
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin", via_release=root / "release",
+                                   via_failpoints=root / "failpoints", fake_gate_manifest=root / "fake-gates")
+            record = {"case": "preflight", "disposition": "gate", "result": "pass",
+                      "checks": [{"observation": password.decode()}]}
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode, "RECOVERY_ROOT", root / "recovery"), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", return_value=[record]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            for artifact in args.evidence.glob("*.json"):
+                self.assertNotIn(password, artifact.read_bytes())
+
+    def test_final_password_sink_rejects_before_guaranteed_memory_clear(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            password, instances = b"final-synthetic-memory-password", []
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    instances.append(self)
+                    self.vault = opencode.safety.PasswordVault()
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                    class Proc:
+                        def read(self, *_args): return b"OPENCODE_PASSWORD=" + password + b"\0"
+                    self.vault.read_once(Proc(), opencode.safety.Identity(44, 7))
+                def prepare(self): pass
+                def observe(self, _kind): return {}
+                def finish(self): return {"stopped": True, "unsafe": password.decode()}
+                def clear_sensitive(self): self.vault.clear()
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin", via_release=root / "release",
+                                   via_failpoints=root / "failpoints", fake_gate_manifest=root / "fake-gates")
+            record = {"case": "preflight", "disposition": "gate", "result": "pass", "checks": []}
+            output = io.StringIO()
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode, "RECOVERY_ROOT", root / "recovery"), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", return_value=[record]), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(opencode.main([]), 1)
+            self.assertEqual(json.loads(output.getvalue())["result"], "blocked")
+            fallback=json.loads((args.evidence / "summary.json").read_text())
+            self.assertEqual(fallback['result'],'blocked')
+            self.assertTrue(fallback['summary_rejected'])
+            self.assertFalse(instances[0].vault.leaks(password))
+            for artifact in args.evidence.glob("*.json"):
+                self.assertNotIn(password, artifact.read_bytes())
+
+    def test_changed_final_gate_evidence_blocks_otherwise_complete_run(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    self.vault = opencode.safety.PasswordVault()
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                def prepare(self): pass
+                def observe(self, _kind): return {}
+                def finish(self): return {"stopped": True}
+                def clear_sensitive(self): self.vault.clear()
+            args = SimpleNamespace(self_test=False, phase=None, evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin",
+                                   via_release=root / "release", via_failpoints=root / "failpoints",
+                                   fake_gate_manifest=root / "fake-gates")
+            def records(_adapter, phase, **_options):
+                return [{"case": name, "disposition": "gate", "result": "pass", "checks": []}
+                        for name in opencode.cases.PHASE_CASES[phase]]
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", side_effect=[
+                        {"verified": True}, Blocked("build changed")]) as proof, \
+                    patch.object(opencode, "RECOVERY_ROOT", root / "recovery"), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", side_effect=records), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            self.assertEqual(proof.call_count, 2)
+            summary = json.loads((args.evidence / "summary.json").read_bytes())
+            self.assertEqual(summary["result"], "blocked")
+            self.assertEqual(summary["proof_error"], "Blocked")
+            self.assertTrue(summary["coverage_complete"])
+
+
+if __name__ == "__main__":
+    unittest.main()

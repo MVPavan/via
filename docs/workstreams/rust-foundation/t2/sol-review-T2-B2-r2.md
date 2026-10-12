@@ -1,0 +1,19 @@
+## Verdict: SOUND WITH CHANGES — do not merge yet
+
+The four round-1 blockers are **addressed in their tested interleavings**, and the F28 test now waits, with a 10-second bound, for both `turn.started` events while both fake-agent gates remain held. The new regressions exercise the original failures. The worker reports five passing full failpoint runs; I did not independently rerun them in this read-only review.
+
+### Merge blockers
+
+1. **A failed write can be followed by a new dispatch before the latch is set.** `crates/via-core/src/engine.rs:254` waits for `admission` before publishing Store failure, while `crates/via-core/src/engine/drive.rs:157` grants from the still-clear latch. If one receipt holds `admission`, another session can observe a failed write and wait to latch while a third turn is granted and launched. **Fix:** publish an immediate failure-pending gate and force signal on observing the failed write; make grant and the pre-ARM gate honor it, then acquire `admission` to finalize the ordered latch. Add a gated three-session regression.
+
+2. **An in-path force close can leave an older queued turn inside a closed session.** After restart, recovery leaves unsubmitted queued turns durable but does not put them in the new daemon’s `unresolved` set. A new resume can create a slot; force then cancels that new turn and chooses `close` using only the in-memory set at `crates/via-core/src/engine/drive.rs:443`. The closing-terminal transaction at `crates/via-store/src/runtime/sql.rs:782` does not check for another queued or running turn. The new closure pass sees the session already closed and skips it, permitting clean-exit accounting to miss the old turn. This is a force-closure defect; it does not require implementing dispatch after restart. **Fix:** make the closing-terminal transaction atomically refuse `session.closed` while any other queued or running turn remains. Regress with an older durable queued turn, a new resume, and force stop.
+
+3. **A force-path read can consume the four-second reserve.** `crates/via-core/src/engine/drive.rs:228` checks the cutoff only before sleeping; the Store reads in `crates/via-core/src/engine/drive.rs:419` can remain pending past it. Final shutdown still has its overall 10-second timeout, so this does not justify a clean exit, but a hung read can leave no reserved time for Host cleanup and forced terminals. **Fix:** apply the shared read cutoff to each force-path read itself and treat expiry as unresolved. Add a stalled-read regression.
+
+### Other requested checks
+
+I found no lock-order cycle or self-wait in the inspected latch callers: `head.lost()` consumes and releases its guard before the async latch, and admission holders use `latch_held`. Admission-held closing commits serialize Store work across sessions; a Store hang can hold that barrier until the shutdown timeout and produce exit 4. `commit_session_closed` prevents a second close and refuses queued or running turns; `unclosed_sessions` prevents a clean exit when its closure pass cannot close a recorded session. `Durable { uncertain }` preserves the readable terminal while latching, and startup recovery rejects an uncertain terminal before admission.
+
+**Deferrable:** the new startup-recovery rejection at `crates/via-core/src/engine/recovery.rs:205` has no focused lost-reply regression. Add one that proves startup fails on the uncertain terminal and a subsequent restart reads the durable result.
+
+Checks performed: ref-based source and diff inspection, `git diff --check cd614b3 2a27978` (pass), and final Git status. No files were edited, no `bd` command was run, and the Rust gate was not rerun.

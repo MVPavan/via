@@ -1,0 +1,27 @@
+[package]
+name = "via-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "rt"] }
+rusqlite = { workspace = true, features = ["backup"] }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
+
+[features]
+# Test-only fault hooks and the failpoint controller (runtime-contracts §11); default off.
+test-failpoints = []
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

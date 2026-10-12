@@ -1,0 +1,9 @@
+**Verdict: SOUND WITH CHANGES.** §11 correctly reserves before the grant and submission, keeps slot waiters queued without `submitted_at`, and excludes that wait from the turn’s wall deadline. Drain must wait for those accepted turns. Acquiring with no lock held and rechecking force or the Store-failed latch after acquisition preserves the existing grant rule.
+
+Two decisions are required:
+
+1. **Release capacity only when no private group was created or its absence is proved.** `run` returning is insufficient: Route/Host close can return cleanup `uncertain`, and a forced turn can pass to final shutdown for more evidence. Runtime §5 explicitly says a timed-out wait releases no admission capacity. Keep or transfer the permit to the cleanup owner until positive absence; a dropped dispatcher future must not release it while its group may live. Use one RAII owner or explicit ownership transfer so each permit is released exactly once. runtime contract (`docs/specs/runtime-contracts.md:584`) · Host close (`crates/via-host/src/host.rs:926`) · forced handoff (`crates/via-core/src/engine/drive.rs:304`)
+
+2. **Account for earlier-daemon groups during startup recovery.** A live group found there consumes the same four-group bound even though this Engine did not launch it. Before dispatching handed-off turns, reserve capacity for groups whose absence is unproved; if that exhausts the bound, start no new child until cleanup proves room. Otherwise §10 can launch four new groups alongside survivors from the prior daemon. `crates/via-core/src/engine/recovery.rs:126` · runtime bound (`docs/specs/runtime-contracts.md:956`)
+
+The proposed semaphore wake, force/latch wake, lock order, wall-deadline and drain rules need no other decision-level change. The restart handoff can start many **dispatchers**, provided child creation remains gated by the corrected capacity ownership.

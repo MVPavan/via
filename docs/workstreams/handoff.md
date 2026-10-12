@@ -1,26 +1,32 @@
 # VIA — handoff
 
-> Plain-text paths such as `workflow_interpreter/…`, `docs/adr/…`, `docs/research/…`, `.repo-context/…` and `scratchpad/…` refer to the parent repository [MVPavan/coding-ritual](https://github.com/MVPavan/coding-ritual) (branch `dws-workflow`, pinned for links at `09cee1b`), where VIA's exploration started. This repo is a submodule there.
+> VIA exploration started in [MVPavan/coding-ritual](https://github.com/MVPavan/coding-ritual) (historical branch `dws-workflow`, pinned for links at `09cee1b`). The old worktree/submodule setup was removed; work now continues only in this standalone repository. Paths in the historical evidence and reuse sections below are parent-repo references unless explicitly described as local. Current `.repo-context/` and `docs/specs/` references belong to this repository.
 
-Status: idea approved for exploration, nothing built. Bead: `cr-w53s` (epic).
-Branch `via`, cut from `dws-workflow` @ fe6a9f9 (2026-09-24).
+Status: owner-paused S1 checkpoint with partial runtime code and tests;
+integration acceptance and test compilation fixes remain open. Current epic:
+`via-jm4`. After explicit owner resumption, recover from
+[the Rust foundation handoff](rust-foundation/session-handoff.md).
+Historical exploration began on branch `via`, cut from `dws-workflow` @ fe6a9f9
+(2026-09-24), tracked then as `cr-w53s`.
 
 ## What VIA is
 
-A single CLI to run a **role + prompt** on **any coding harness** (Claude Code,
-Codex, OpenCode, Pi, Gemini, Cursor, …) and get a **structured result** back —
+A single CLI to run an **explicitly configured agent + prompt** on **any coding
+harness** and get a
+**structured result** back —
 so any agent can use sub-agents across harnesses and models, not only within
-Claude or within Codex. VIA is also meant to become the **control plane** the
+Claude or within Codex. The first release supports **Claude Code, Codex and
+OpenCode**. VIA is also meant to become the **control plane** the
 workflow interpreter's foreman calls instead of driving crews itself.
 
 Owner's framing: there will be several top harnesses; some models live only in
 some of them; people will use several at once. VIA is the cross-harness,
 cross-model single interface, with one pattern for spawn / resume / steer /
-end — plus a passthrough mode that forwards native arguments unchanged.
+cancel / close. Passthrough remains a later extension outside the first release.
 
 First open question from the owner: **is it needed, and how much?** The
-assessment below says yes, scoped tightly, but that decision is still the
-owner's to confirm in brainstorming.
+assessment below says yes, scoped tightly; the owner confirmed the three-harness
+first-release scope on 2026-09-26.
 
 ## Assessment so far (2026-09-24 discussion)
 
@@ -31,8 +37,8 @@ Why it is useful:
    with its own flags, result shape and resume story.
 2. Cross-harness, cross-model review is a daily practice already (Opus reviews
    GPT-6 Sol's work and vice versa), done by hand.
-3. Model availability dictates the harness; a role → model → harness mapping
-   hides that.
+3. Model availability dictates the harness; caller policy may map a role to
+   explicit model and harness parameters.
 4. The foreman needs exactly "run role R on prompt P, return a structured
    result"; sharing one tested path beats two.
 
@@ -44,27 +50,49 @@ Why to keep it tight:
   declare per-adapter capability, never fake a verb.
 - Passthrough is an escape hatch; results through it are unstructured.
 
-## Proposed properties (to validate in brainstorming)
+## Properties: decided architecture
 
-1. Headless, one turn per process — no PTY or screen scraping.
-2. One result envelope for every harness: status, final text, session id,
-   exit code, usage/cost, input/output tree pins, log path.
-3. Select by role (`roles.toml` + model catalog) or explicit
-   `--model/--effort`; unknown values refused by name.
-4. Uniform verbs `spawn`, `resume`, `steer`, `cancel`, `status`, `result`;
-   each adapter declares which it supports; unsupported → named refusal.
-5. Durable run record with idempotent keys (the existing SQLite ledger).
-6. Explicit isolation per spawn: worktree, sandbox, write permission.
-7. Adapters pinned and contract-tested per CLI version; drift detected;
-   `--passthrough` marks results unstructured.
-8. `spawn --background` → run id; `via wait <id>` → envelope (parallel
-   sub-agents).
+1. **Decided:** One headless VIA daemon per user owns agent processes, vendor
+   connections and the Store. CLI, `via serve --stdio` and thin SDKs speak the
+   public C1 VIA API to it over a user-only Unix socket. The CLI auto-starts
+   it; it exits when idle and rejects client/daemon version mismatches.
+2. **Decided:** One result envelope per turn. The current field definitions
+   are in `docs/specs/via-api-v1.md` §5; denials and auto-declines are required.
+3. **Decided:** Roles are caller policy. VIA takes explicit harness/model,
+   effort, instructions, permission bound, cwd, output schema and namespaced
+   vendor options. The model catalog maps model to harness.
+4. **Decided:** `spawn`, `resume`, `steer`, `cancel`, `status`, `result` declare
+   route-specific capabilities; unsupported verbs get named refusals. A
+   session keeps one route and adapter version for life. Route fallback occurs
+   only before submission.
+5. **Decided:** The daemon alone writes the Store. A session is one resumable
+   agent conversation; each prompt and its tool calls produce one turn. A
+   launch receipt precedes submission; an unknown outcome is never resent
+   automatically. SQLite remains behind a small storage interface.
+6. **Decided:** A session starts with out-of-bound actions denied, not asked.
+   L3 automatically declines vendor requests under a deadline. Denials and
+   declines appear in the turn envelope. The permission bound carries over to
+   every turn unchanged unless the caller explicitly sets a new one on resume
+   through the handle. VIA revalidates it against the route and records it per
+   turn; nothing changes it silently. External sandboxing for vendors without
+   a native bound remains open.
+7. **Decided:** Adapters are versioned and contract-tested against vendor
+   versions. The exact outside-tested-range policy is resolved in S2 under
+   C1 P13 / C2 A2. Passthrough is outside first-release acceptance.
+8. **Decided:** `spawn --background` returns the session and turn address;
+   `via wait` returns that turn's envelope for parallel sub-agents.
 
-Scope ladder (proposal):
-- v0: Claude, Codex, OpenCode; `spawn` / `resume` / `result` as a CLI over the
-  existing crews; agent-matrix skill teaches `via spawn --role … --prompt …`.
-- v1: background/wait, cancel, steer where supported; foreman calls VIA.
-- v2: more harnesses one at a time, each only with a real use.
+Rust 1.98.1, edition 2024, and a single static `via` binary are decided.
+Vendor servers are preferred where available, otherwise vendor CLIs; native
+ACP adds breadth. SDK and bridged ACP routes are not used for now. VIA starts
+its own vendor servers and never attaches to or stops servers it did not start.
+See `.repo-context/invariants.md` and `docs/brainstorms/routes-decision.md`.
+
+First-release scope (owner, 2026-09-26): Claude Code, Codex and OpenCode;
+the full C1 API, including background/wait, cancel, steer and close, with
+truthful per-route capabilities. ACP, additional harnesses, passthrough,
+thin SDK delivery and foreman integration are outside this release. See the
+current handoff for the implementation sequence and proposed release checks.
 
 ## Evidence already gathered
 
@@ -91,7 +119,7 @@ Scope ladder (proposal):
 - Model catalog (auto-discovered, probed) and role bindings:
   `workflow_interpreter/foreman/model_catalog.py`, `config/roles.example.toml`,
   `config/claude-model-seed.json`; design in `docs/workstreams/model-catalog/design.md`.
-- Ledger (run record): see `docs/workstreams/run-ledger/roadmap.md` and
+- Ledger (parent-repo record): see `docs/workstreams/run-ledger/roadmap.md` and
   `docs/adr/0006-ledger-only-record-store.md`.
 - agent-matrix skill (Claude spawn-parameter validation; its catalog
   `docs/research/codebases/subagent-runtimes/agent-matrix-values.yaml` is
@@ -113,19 +141,16 @@ vendor's own tool. Owner decision: terms uncertainty does not block
 development — build adapters properly and disable any a vendor turns out not to
 permit. Record terms status per adapter.
 
-## Open questions for the next session
+## Remaining decisions
 
-1. Confirm need and scope (brainstorm): v0 boundaries, which harnesses first.
-2. Research: does Zed's Agent Client Protocol (ACP) — or another standard —
-   already give structured sessions for the target harnesses? If yes, VIA
-   adapters could speak it instead of parsing each CLI. Unverified; check
-   current coverage from primary sources.
-3. Packaging: a subcommand of the workflow interpreter, or a separate package
-   the interpreter depends on?
-4. Relation to agent-matrix: replace its spawn guidance with VIA usage, fold
-   its catalog into the model catalog, or retire it.
-5. Steering semantics per harness, and what `cancel` means for each.
-6. Name the result envelope contract and where it lives (`contracts/`).
+1. Decide whether VIA may wrap a vendor server in an external sandbox when
+   the vendor has no native bound.
+2. Decide whether shared vendor servers connect to the daemon over stdio or
+   a Unix socket, which could allow rejoining after a daemon crash.
+3. Resolve vendor-dependent C1/C2 decisions with probes in their owning slice.
+
+Language, coding standard, testing policy and S1 scope are approved. The
+relationship to agent-matrix and foreman integration are outside this release.
 
 ## Constraints carried over
 

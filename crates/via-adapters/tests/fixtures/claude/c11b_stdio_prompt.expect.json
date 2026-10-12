@@ -1,0 +1,130 @@
+{
+  "source": "CC c11b_stdio_prompt, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Use Edit to create probe.txt containing READY in the current directory. If permission is denied, say DENIED.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.0093315,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 12287,
+          "cached_input_tokens": 10255,
+          "output_tokens": 852,
+          "scope": "turn"
+        },
+        "final_text": [
+          "DENIED"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "vendor.request_declined",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "Edit"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1,
+          "vendor.request_declined": 1,
+          "action.denied": 0
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [
+          {
+            "field": "vendor.request_declined.vendor_method",
+            "why": "Claude mapping of permission_denials → action.denied {kind,target,reason} and of can_use_tool → vendor.request_declined {vendor_method,summary,blocking} is decided in via-p98.3.2 (claude-code.md amendment); C1 fixes only the field names."
+          }
+        ],
+        "notes": "An incoming can_use_tool control_request is declined on the control path with the pinned error reply, response.error included (packet §6), giving one vendor.request_declined. The result's permission_denials entry for the same tool_use_id was caused by VIA's decline and is suppressed: zero action.denied (C2 §6.2 auto-decline, §7 items 8-9). Replay pins the decline within 5 s of the request (within_ms), no allow payload (absent /response/response; vendor spec: never an invented allow), and stdin EOF after the result."
+      }
+    }
+  ]
+}

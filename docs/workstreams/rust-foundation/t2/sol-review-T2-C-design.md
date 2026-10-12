@@ -1,0 +1,10 @@
+**Verdict: SOUND WITH CHANGES.**
+
+The handoff’s order and ownership rule match C1 §7.5: recovery commits before handoff, handoff finishes before admission, submitted `unknown` turns are never resent, and queued turns behind them are cancelled. Processing each session in turn order means a cancelled queued predecessor cannot strand its successor: the successor sees the same earlier submitted `unknown` turn. A successful cancellation also updates the session to `idle` when no work remains, in the same Store transaction (Store terminal commit (`crates/via-store/src/runtime/sql.rs:793`)). A Store read or uncertain write must fail startup; a crash partway through handoff is safe to repeat from durable state.
+
+Two decisions are required:
+
+1. **Keep `cleanup: pending` waiting, not cancelled.** §10 says to cancel for pending cleanup, but C1 §7.3 (`docs/specs/via-api-v1.md:586`) permits cancellation behind `unknown` and requires pending cleanup to settle before dispatch. Apply `Wait` to pending cleanup in both §10 and the merged dispatcher decision (`crates/via-core/src/engine/drive.rs:247`). Under the current P7 model, pending cleanup is nonterminal and the unresolved check should already cause `Wait`; the written rule should preserve that invariant.
+2. **Remove the pending-start set’s claimed 128-entry ceiling for restart handoff.** `Unresolved` and the queued counter do not reject or panic above their admission limits; the pending set (`crates/via-core/src/engine.rs:378`) likewise currently accepts more than 128. Specify one pending start per recovered `Starting` session, even when durable queued work exceeds 128, and refuse *new* receipts until counts fall below the limits. The 128-capacity channel can then drain starts after main begins serving.
+
+A keyed replay returns the stored receipt without a second enqueue. The handoff adds one predecessor read per queued turn before admission, plus page reads and cancellation preparation and commits; it has no fixed wall-time startup bound. That is consistent with recovery-before-admission, but should be described accurately.

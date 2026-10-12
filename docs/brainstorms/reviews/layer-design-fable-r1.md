@@ -1,0 +1,52 @@
+# Layer design review r1: Claude Fable 5.1 high
+
+Run: `claude -p --model claude-fable-5-1 --effort high`, read-only tools, Claude Code 2.1.282; runtime model claude-fable-5-1, 34 turns, 2026-09-25. Same brief for all three reviewers (`scratchpad/council/layer-design/brief.md`, local). Verbatim output; absolute local paths made repo-relative.
+
+**Verdict: SOUND WITH CHANGES.** The six layers and the C2 boundary are the right cut, but four things leak the route into C1 or C5 as drafted: stdio-attached shared servers, unowned server requests, a per-run raw log that L5 cannot produce, and takeover and cancel semantics that differ by route class.
+
+## Findings
+
+**[blocking] Shared servers attached over stdio foreclose takeover and multi-process use.** `docs/brainstorms/system-layers.md:143` ("endpoint (stdio of the server)") and `:311` ("codex app-server stdio") bind every run on a server to the one VIA process holding the pipes. If that process dies, the server gets EOF and every run is lost, so the lease takeover in `:261-268` is unreachable for exactly the routes chosen for density. Codex can rejoin a live thread from another client: `scratchpad/codex-schema/v2/ThreadResumeParams.json:1476` says "If thread_id identifies a running thread, app-server rejoins that thread". That only helps over a socket. Fix: C5's shared-server shape must be socket-only (Codex `--listen`, OpenCode HTTP already is), with the SERVERS row as the discovery record. Verified from the schema; that `--listen unix://` works and routes notifications per client is inferred from `access-methods.md:55-56` and `thread/unsubscribe` and `serverRequest/resolved` in the schema, not tested.
+
+**[major] Nobody owns server requests, so a run can hang.** C3 passes "server requests" up (`system-layers.md:24`) and stops there. Codex `ServerRequest.json` lists `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call` and `account/chatgptAuthTokens/refresh`; `approvalPolicy: never` (`:113`) silences approvals, not these. ACP `session/request_permission` and Claude `can_use_tool` behave the same way (`access-methods.md:380-383`). The consolidated review asked for an answer policy; the layering still has no home for it. Fix: L3 answers every server request deterministically from the run's declared bound (deny, or cancel the turn) under a deadline, and emits a canonical `server_request_refused` event. L2 never sees the request. This is not a permission layer: it is the "never ask" bound applied.
+
+**[major] L5 cannot write a per-run raw log for server routes.** `RUNS.raw_log_path` (`:368`) and "raw log append per run" (`:340-343`) assume one byte stream per run. On a shared server one connection carries every thread; splitting by `threadId` is protocol knowledge that lives in L4 (`:15`). Either the raw log is per connection with `EVENTS.raw_offset` (`:400`) pointing into it, and `via logs R` filters through L4, or L4 writes a second per-run protocol log. Fix: say the raw tap is per endpoint, add `endpoint_id` to RUNS, and make `logs` an L4-assisted view. Also state who assigns `EVENTS.seq` and that C2 guarantees per-run FIFO only.
+
+**[major] Crash takeover and forced cancel are route-class capabilities, not run-core features.** The state machine (`:220-243`) and lease diagram treat takeover and cancel as uniform. On the Claude control route the vendor process is pipe-attached to the run host; a dead host cannot be replaced, so takeover is unsupported and the child must be reaped via the recorded pgid. On shared servers, "kill tree" (`:317`) kills every other run, so the escalation ceiling is interrupt plus deadline plus `unknown`; cancel during a tool is untested on every route (`scratchpad/headless-bench/analysis.md:85-86`). Fix: add `takeover` and `cancel_force` to the capability declaration per route, give C2 `close(mode, deadline)` with a reported outcome (`graceful` / `forced` / `unknown`), and make the SSJOBS kill rule "never kill a shared server for one run".
+
+**[major] Spawn cannot promise capabilities when the adapter may fall back at spawn.** `:118` records the route per run and `:115` declares capabilities per route, but C1's capability query (`:22`) is per adapter. A caller that needs steer can be silently given `codex exec` (steer unsupported). Fix: add `--require <verb...>` to spawn; refuse by name when the chosen route lacks a required verb, and return the chosen route and its capability set in the launch receipt. C1 stays constant; the premise holds only with this addition.
+
+**[major] "One server per vendor + config" cannot carry a per-run write bound for OpenCode.** OpenCode has no native bound (`access-methods.md:277-279`), so any bound must wrap the process. A shared server wrapped once serves one bound for all sessions. Fix: define the server key as (vendor, version, config hash, isolation bound), letting the Host wrap the whole server; density then holds per bound class. Rule 4 (`:36-37`) already lets the adapter refuse. Note this is a VIA-supplied bound, which the owner has not yet allowed (consolidated review, owner decision 4).
+
+**[major] Server start has no claim or fence.** Two VIA processes spawning Codex at once both pass the "start server if none" check (`:141`) and start two. The LEASES table covers runs only. Fix: SERVERS gets a unique (key) constraint, a state column (`starting`, `ready`, `stopping`) and a lease owner with expiry; the loser waits on the row. Same mechanism decides orphan handling: a VIA-marked server whose lease expired is adoptable, not reaped, while it has live threads.
+
+**[minor] Timeouts, stall detection, backpressure and admission accounting have no layer.** `access-methods.md:280-281` ("VIA owns the deadline") and `:347-349` (Pi stalls if stdout is not drained; Claude waits 30 s). The design lists `timeout` only as a failure class (`:231`). Fix: L2 owns wall-clock and idle deadlines and drives them through `close`; C4 states its flow control (bounded, blocking, never dropping before the tap); admission with no daemon must sum live leases from the Store and rate-limit starts, since the CPU burst is at start-up (`analysis.md:104-107`).
+
+**[minor] Idle state is underspecified for per-session processes.** `:226-227` keeps the session after a turn. For the Claude control route that is a live 145 MB process per idle session (R2). Fix: state the idle policy (close after N s; resume by `--resume` in a fresh process is the same route).
+
+**[minor] C3 is not one contract.** `:24` and `layers-and-names.md:65`: the common part is open/close/health; everything an adapter uses is per-protocol typed calls. Say so. The substitutable boundary is C2, which is what the premise needs. The generic ACP route is the only place C3 commonality pays.
+
+**[minor] Kill and signal flow through the codec layer.** Dependencies point strictly down, so L3's "force" must be forwarded by L4 and L5 to reach L6 (`:26`). Acceptable if C3 and C4 each carry `close(mode)`; otherwise make Host a side component like Store.
+
+**[minor] Naming.** "Session" is used for vendor sessions, C5 shared-server sessions, SESSIONS rows and `via serve` sessions (`layers-and-names.md:52, 67, 89-92`). "Host" names a layer, a run host and a server host. Mermaid node ids `L1`/`L2` in `:262-267` collide with layer labels. The glossary's CLI route ("once per turn", `.repo-context/CONTEXT.md:33-35`) and Worker ("there is no daemon", `:77-78`) no longer describe the Claude control route or the server host.
+
+**Conflicts (Q5).** Invariant 5 is still listed as decided (`.repo-context/invariants.md:27-28`) while `system-layers.md:310-311` proposes a detached VIA server host; `routes-decision.md:157` already says the invariant must change. Handoff property 1 ("one turn per process", `docs/workstreams/handoff.md:49`) conflicts with both the control route and shared servers. Mark both "under revision" in this document rather than leaving `:328-330` to claim the layering is independent of the answer.
+
+**Harness sweep (Q3).** No harness needs a C1 or C2 change, provided the additions above land. Pi and OMP fit as private per-run servers (`access-methods.md:63`), which the L6 taxonomy (`:303-315`) does not draw; add the shape. Copilot's fixed per-server config collapses density to one server per config; the key handles it. Cursor, Antigravity and Amp serve with partial cancel and status. ACP-only harnesses (Devin, Kilo, Cline, Qwen, Grok, Goose, Droid, Hermes) expose no sandbox, so they run only at bound `full`; state this as a declared capability, not a refusal surprise. Codex `exec resume` drops the sandbox flag (`access-methods.md:275-276`), so `continue` must re-validate the bound per route.
+
+**Daemon question (Q4).** It does not block L1 to L4. It does block finalizing C5 (socket vs stdio), the S schema (server claim, lease owner for server-route runs) and the takeover capability of the Codex and OpenCode adapters. The document should say that instead of "the layering does not change".
+
+## Could not verify
+
+Codex app-server multi-client behaviour over a socket (per-client notification routing, whether a second client sees another client's server requests). Whether `approvalPolicy: never` suppresses `requestUserInput` and elicitation. Claude's behaviour when its host dies mid-tool (exit on EPIPE or keep running). Whether OpenCode serve honours per-session permissions at all.
+
+## Add, cut, prototype first
+
+Add: `--require` on spawn, `takeover` and `cancel_force` capability facets, `close(mode, deadline)` on C2 and C3, server claim rows, per-endpoint raw log, server-request answer policy in L3, deadline and flow-control ownership. Cut: the claim that C3 is one contract, and the stdio server endpoint.
+
+Prototype order:
+1. Codex app-server over a Unix socket with two VIA processes: start from A, kill A mid-tool, rejoin from B, kill the server. This decides C5, takeover and the daemon question at once.
+2. Claude control route: `interrupt` control request, stream-json input semantics (steer or queue), host death mid-tool, and no `--permission-prompt-tool`.
+3. Store: extend gate 7 with the server-claim race and lease renewal under multi-process WAL.
+4. Cancel during a running tool on each route class, the fault the benchmark never fired.
+5. OpenCode server inside a `bwrap` wrapper keyed by bound.

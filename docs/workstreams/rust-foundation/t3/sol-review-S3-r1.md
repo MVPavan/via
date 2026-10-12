@@ -1,0 +1,15 @@
+GPT-6 Sol medium check of T3-S3 fix round 1 (`e3d542d..ec5880d` on local `wt/t3-s3`): decisions 1-9.
+
+**Verdict: SOUND WITH CHANGES.** Decisions 1–4, 6 and 7 close the reviewed behaviors without a new race, lost wake, or ledger/`RecoveredSlots` lock nesting that I found. Decision 5 works for every in-tree caller, but its public guard API does not enforce the stated writer-exclusion boundary.
+
+**Important finding — a guard can protect the wrong State directory.** At `wt/t3-s3:crates/via-store/src/runtime.rs:920–928`, `Store::open_locked(state, lock)` accepts a `StoreLock` acquired for any directory. A caller can acquire A’s lock and open B while B’s lock is held, allowing competing writers to B and invalidating the probe’s assumption. **Fix:** bind `StoreLock` to the State directory’s filesystem identity and reject a mismatch in `open_locked`; add a wrong-directory guard test. The daemon’s current call path passes the matching directory.
+
+The key readings otherwise hold:
+
+- **Cohort:** `anchors` is a rowid table; production anchor writes insert or update, with no delete, replace, or vacuum path. Startup reads the bound after recovery and before dispatcher starts or admission. A later anchor is therefore above the bound, and all three resumed reads apply it. Rowid alone would *not* exclude an anchor committed concurrently before the cohort read’s snapshot; the startup ordering is essential.
+- **Unjoined dispatcher:** the post-abort join precedes reconciliation. A still-running dispatcher’s session is excluded from forced terminal and closure commits, and shutdown exits 4. Its submitted nonterminal turn remains for restart recovery to settle as `unknown`; queued work follows the restart handoff. This is consistent with the proposed §6.8 exception, C1 §3.14’s durable-disposition requirement, and the runtime’s incomplete-exit rule.
+- **Other decisions:** the slot read is atomic, though the original queued-to-running miss was not reproducible because that move already held one slot lock. The hello read uses the remaining startup budget. The holdings generation supplies the re-probe wake, and replaced Host tokens drop outside the ledger guard.
+
+The Host, Store, Wire, Routes, Adapters, queue, and drive edits are narrowly tied to their decisions and stay in their respective layers. The added one-section slot read is small hardening rather than a necessary repair of the original claimed race. The reported RED evidence appropriately labels items 1 and 8 as characterizations; seam and acknowledgement tests cover the material orderings. The roughly 7–8 second tests exercise real recovery and backoff deadlines and are acceptable.
+
+I inspected the specified refs, working-tree review and decision documents, contracts, call paths, and test assertions. I did **not** run cargo or bd, check out a ref, reproduce the worker’s logs or gates, or trial-merge S3.

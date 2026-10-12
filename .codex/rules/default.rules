@@ -1,0 +1,61 @@
+# Project-level Codex exec policy for high-risk command prefixes.
+#
+# These rules complement the PreToolUse hooks. Hooks inspect full shell command
+# text inside the session; exec policy applies when Codex requests to run a
+# matching command outside the sandbox.
+
+prefix_rule(
+    pattern = ["git", "reset", "--hard"],
+    decision = "forbidden",
+    justification = "Do not destroy local worktree/history state without explicit user approval and a narrower recovery plan.",
+    match = ["git reset --hard"],
+)
+
+prefix_rule(
+    pattern = ["git", "clean", ["-f", "-fd", "-df"]],
+    decision = "forbidden",
+    justification = "Do not delete untracked files from this repo without explicit user approval.",
+    match = ["git clean -fd", "git clean -f"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", ["--force", "-f"]],
+    decision = "forbidden",
+    justification = "Force-pushes require explicit user approval outside automatic Codex policy.",
+    match = ["git push --force", "git push -f"],
+)
+
+prefix_rule(
+    pattern = ["git", "branch", "-D"],
+    decision = "forbidden",
+    justification = "Deleting local branches requires explicit user approval.",
+    match = ["git branch -D old-branch"],
+)
+
+prefix_rule(
+    pattern = ["git", "checkout", "."],
+    decision = "forbidden",
+    justification = "Do not bulk-revert the working tree. Use file-scoped changes only after approval.",
+    match = ["git checkout ."],
+)
+
+prefix_rule(
+    pattern = ["git", "restore", "."],
+    decision = "forbidden",
+    justification = "Do not bulk-restore the working tree. Use file-scoped changes only after approval.",
+    match = ["git restore ."],
+)
+
+prefix_rule(
+    pattern = ["bd", "init", "--force"],
+    decision = "forbidden",
+    justification = "Reinitializing Beads can wipe the local Dolt store; recover or export state first.",
+    match = ["bd init --force"],
+)
+
+prefix_rule(
+    pattern = ["bd", "init", "--reinit-local"],
+    decision = "forbidden",
+    justification = "Reinitializing Beads can wipe the local Dolt store; recover or export state first.",
+    match = ["bd init --reinit-local"],
+)

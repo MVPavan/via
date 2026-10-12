@@ -1,0 +1,5 @@
+UNSOUND
+
+- **Important — `crates/via-cli/src/server/dispatch.rs:250`: pipelined bytes disable disconnect detection.** After `fill_buf()` returns nonempty, `watched` awaits only the wait future. A client sending a long `wait`, part of its next request, then disconnecting retains its socket slot until the turn ends or the wait expires. **Failure scenario:** 32 such disconnected clients exhaust all slots, preventing `daemon/status` and stop requests. Reproduced: 10/10 new handshakes reset while the turn was held; service recovered after release. **Smallest fix:** retain EOF/error monitoring after buffered input while preserving bounded pipelining and A48 semantics; add this disconnect regression.
+
+**Could not verify:** Independent RED replay against old `read.rs`; the recorded RED and cleanup artifacts were inspected. The full gate was not rerun.

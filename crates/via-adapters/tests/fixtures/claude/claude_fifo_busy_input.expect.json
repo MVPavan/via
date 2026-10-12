@@ -1,0 +1,205 @@
+{
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. Two lifetimes: the second VIA turn is queued while the first one's tool runs.",
+  "harness": "claude",
+  "launches": 2,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1,
+      2
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Run sleep 1 with Bash, then reply FIRST.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.001,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          },
+          "structured_output": null
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": [
+          "FIRST"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
+          "turn.accepted",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "Bash"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "Packet \u00a76: the first process gets exactly one user line although a second turn is queued while its tool runs; strict trailing input fails a busy-input line before await_eof."
+      }
+    },
+    {
+      "session": "main",
+      "start_after": {
+        "turn": 0,
+        "event": "tool_started"
+      },
+      "params": {
+        "prompt": "Reply SECOND.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.002,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          },
+          "structured_output": null
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": [
+          "SECOND"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 2,
+            "vendor_session_id": "39ff47b4-d184-4450-81c9-c067ed1e1874"
+          },
+          "turn.accepted"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "The queued turn starts only after the first settled, as a new process that resumes the confirmed UUID (one user line); the vendor queue count has no authority."
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+[package]
+name = "via-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Test-only failpoint controller (runtime-contracts §11); default off.
+test-failpoints = ["via-host/test-failpoints", "via-store/test-failpoints"]
+# Test-only: `testing`'s test pipes, without the failpoint controller, for
+# the test builds of the layers above (x.3.2 X4); default off.
+test-support = []
+
+[dependencies]
+via-host = { path = "../via-host" }
+via-store = { path = "../via-store" }
+# "net": the OpenCode loopback HTTP/SSE client (runtime §4).
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time", "rt"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

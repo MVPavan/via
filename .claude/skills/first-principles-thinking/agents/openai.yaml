@@ -1,0 +1,4 @@
+interface:
+  display_name: "First Principles Thinking"
+policy:
+  allow_implicit_invocation: true

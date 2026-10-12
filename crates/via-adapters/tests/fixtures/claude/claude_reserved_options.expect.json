@@ -1,0 +1,3381 @@
+{
+  "source": "synthetic (x.3.2 C1): claude_reserved_options, packet §9 F8; no vendor run",
+  "harness": "claude",
+  "launches": 0,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "s01": 0,
+      "s02": 0,
+      "s03": 0,
+      "s04": 0,
+      "s05": 0,
+      "s06": 0,
+      "s07": 0,
+      "s08": 0,
+      "s09": 0,
+      "s10": 0,
+      "s11": 0,
+      "s12": 0,
+      "s13": 0,
+      "s14": 0,
+      "s15": 0,
+      "s16": 0,
+      "s17": 0,
+      "s18": 0,
+      "s19": 0,
+      "s20": 0,
+      "s21": 0,
+      "s22": 0,
+      "s23": 0,
+      "s24": 0,
+      "s25": 0,
+      "s26": 0,
+      "s27": 0,
+      "s28": 0,
+      "s29": 0,
+      "s30": 0,
+      "s31": 0,
+      "s32": 0,
+      "s33": 0,
+      "s34": 0,
+      "s35": 0,
+      "s36": 0,
+      "s37": 0,
+      "s38": 0,
+      "s39": 0,
+      "s40": 0,
+      "s41": 0,
+      "s42": 0,
+      "s43": 0,
+      "s44": 0,
+      "s45": 0,
+      "s46": 0,
+      "s47": 0,
+      "s48": 0,
+      "s49": 0,
+      "s50": 0,
+      "s51": 0,
+      "s52": 0,
+      "s53": 0,
+      "s54": 0,
+      "s55": 0,
+      "s56": 0,
+      "s57": 0
+    },
+    "after_turn": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "s01": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--permission-mode": "x"
+        }
+      },
+      "close": null
+    },
+    "s02": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "permissionMode": "x"
+        }
+      },
+      "close": null
+    },
+    "s03": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "permission_mode": "x"
+        }
+      },
+      "close": null
+    },
+    "s04": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "PERMISSION-MODE": "x"
+        }
+      },
+      "close": null
+    },
+    "s05": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--dangerously-skip-permissions": "x"
+        }
+      },
+      "close": null
+    },
+    "s06": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--allow-dangerously-skip-permissions": "x"
+        }
+      },
+      "close": null
+    },
+    "s07": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--permission-prompt-tool": "x"
+        }
+      },
+      "close": null
+    },
+    "s08": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--permission-prompts": "x"
+        }
+      },
+      "close": null
+    },
+    "s09": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--allowedTools": "x"
+        }
+      },
+      "close": null
+    },
+    "s10": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "allowed_tools": "x"
+        }
+      },
+      "close": null
+    },
+    "s11": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--disallowedTools": "x"
+        }
+      },
+      "close": null
+    },
+    "s12": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--tools": "x"
+        }
+      },
+      "close": null
+    },
+    "s13": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--add-dir": "x"
+        }
+      },
+      "close": null
+    },
+    "s14": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--resume": "x"
+        }
+      },
+      "close": null
+    },
+    "s15": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "-r": "x"
+        }
+      },
+      "close": null
+    },
+    "s16": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--session-id": "x"
+        }
+      },
+      "close": null
+    },
+    "s17": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "sessionId": "x"
+        }
+      },
+      "close": null
+    },
+    "s18": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--continue": "x"
+        }
+      },
+      "close": null
+    },
+    "s19": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "-c": "x"
+        }
+      },
+      "close": null
+    },
+    "s20": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--fork-session": "x"
+        }
+      },
+      "close": null
+    },
+    "s21": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--model": "x"
+        }
+      },
+      "close": null
+    },
+    "s22": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--fallback-model": "x"
+        }
+      },
+      "close": null
+    },
+    "s23": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--effort": "x"
+        }
+      },
+      "close": null
+    },
+    "s24": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--system-prompt": "x"
+        }
+      },
+      "close": null
+    },
+    "s25": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--system-prompt-file": "x"
+        }
+      },
+      "close": null
+    },
+    "s26": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--append-system-prompt": "x"
+        }
+      },
+      "close": null
+    },
+    "s27": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "appendSystemPromptFile": "x"
+        }
+      },
+      "close": null
+    },
+    "s28": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--max-turns": "x"
+        }
+      },
+      "close": null
+    },
+    "s29": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--json-schema": "x"
+        }
+      },
+      "close": null
+    },
+    "s30": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--input-format": "x"
+        }
+      },
+      "close": null
+    },
+    "s31": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--output-format": "x"
+        }
+      },
+      "close": null
+    },
+    "s32": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--print": "x"
+        }
+      },
+      "close": null
+    },
+    "s33": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "-p": "x"
+        }
+      },
+      "close": null
+    },
+    "s34": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--verbose": "x"
+        }
+      },
+      "close": null
+    },
+    "s35": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--include-partial-messages": "x"
+        }
+      },
+      "close": null
+    },
+    "s36": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--replay-user-messages": "x"
+        }
+      },
+      "close": null
+    },
+    "s37": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--bare": "x"
+        }
+      },
+      "close": null
+    },
+    "s38": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--settings": "x"
+        }
+      },
+      "close": null
+    },
+    "s39": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--setting-sources": "x"
+        }
+      },
+      "close": null
+    },
+    "s40": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--restricted": "x"
+        }
+      },
+      "close": null
+    },
+    "s41": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--safe-mode": "x"
+        }
+      },
+      "close": null
+    },
+    "s42": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--agents": "x"
+        }
+      },
+      "close": null
+    },
+    "s43": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--agent": "x"
+        }
+      },
+      "close": null
+    },
+    "s44": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--mcp-config": "x"
+        }
+      },
+      "close": null
+    },
+    "s45": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--strict-mcp-config": "x"
+        }
+      },
+      "close": null
+    },
+    "s46": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--plugin-dir": "x"
+        }
+      },
+      "close": null
+    },
+    "s47": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--no-session-persistence": "x"
+        }
+      },
+      "close": null
+    },
+    "s48": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--disable-slash-commands": "x"
+        }
+      },
+      "close": null
+    },
+    "s49": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--worktree": "x"
+        }
+      },
+      "close": null
+    },
+    "s50": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "cwd": "x"
+        }
+      },
+      "close": null
+    },
+    "s51": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--cwd": "x"
+        }
+      },
+      "close": null
+    },
+    "s52": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "env": "x"
+        }
+      },
+      "close": null
+    },
+    "s53": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "environment": "x"
+        }
+      },
+      "close": null
+    },
+    "s54": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "CLAUDE_CONFIG_DIR": "x"
+        }
+      },
+      "close": null
+    },
+    "s55": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "config_dir": "x"
+        }
+      },
+      "close": null
+    },
+    "s56": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "--debug": "x"
+        }
+      },
+      "close": null
+    },
+    "s57": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "vendor_options": {
+        "claude": {
+          "temperature": "x"
+        }
+      },
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "s01",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--permission-mode` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s02",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `permissionMode` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s03",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `permission_mode` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s04",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `PERMISSION-MODE` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s05",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--dangerously-skip-permissions` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s06",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--allow-dangerously-skip-permissions` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s07",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--permission-prompt-tool` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s08",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--permission-prompts` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s09",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--allowedTools` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s10",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `allowed_tools` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s11",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--disallowedTools` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s12",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--tools` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s13",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--add-dir` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s14",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--resume` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s15",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `-r` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s16",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--session-id` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s17",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `sessionId` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s18",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--continue` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s19",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `-c` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s20",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--fork-session` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s21",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--model` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s22",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--fallback-model` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s23",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--effort` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s24",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--system-prompt` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s25",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--system-prompt-file` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s26",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--append-system-prompt` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s27",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `appendSystemPromptFile` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s28",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--max-turns` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s29",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--json-schema` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s30",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--input-format` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s31",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--output-format` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s32",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--print` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s33",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `-p` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s34",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--verbose` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s35",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--include-partial-messages` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s36",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--replay-user-messages` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s37",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--bare` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s38",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--settings` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s39",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--setting-sources` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s40",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--restricted` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s41",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--safe-mode` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s42",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--agents` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s43",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--agent` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s44",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--mcp-config` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s45",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--strict-mcp-config` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s46",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--plugin-dir` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s47",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--no-session-persistence` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s48",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--disable-slash-commands` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s49",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--worktree` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s50",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `cwd` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s51",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `--cwd` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s52",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `env` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s53",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `environment` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s54",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `CLAUDE_CONFIG_DIR` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s55",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "F8: `config_dir` names a flag, setting or environment override the recipe owns (C2 §6.1, packet §4), normalized for leading dashes, case, `-` and `_`; refused vendor_option_conflict before any receipt or launch."
+      }
+    },
+    {
+      "session": "s56",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "invalid_param:vendor",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "`--debug` is not a reserved key, and the Claude route takes no free-form vendor option (packet §4): invalid_params naming vendor, before any receipt or launch."
+      }
+    },
+    {
+      "session": "s57",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "invalid_param:vendor",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "`temperature` is not a reserved key, and the Claude route takes no free-form vendor option (packet §4): invalid_params naming vendor, before any receipt or launch."
+      }
+    }
+  ]
+}

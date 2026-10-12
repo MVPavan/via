@@ -1,0 +1,290 @@
+{
+  "source": "synthetic (x.3.2 C3, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. Three lifetimes on one UUID: a new session, then two resumes; a gate holds the second launch after its prompt, before its init.",
+  "harness": "claude",
+  "launches": 3,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1,
+      2,
+      3
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Remember ONE.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "structured_output": null,
+          "cost": {
+            "usd": 0.001,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": [
+          "ONE"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1,
+            "vendor_session_id": "39ff47b4-d184-4450-81c9-c067ed1e1874"
+          },
+          "turn.accepted",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1,
+          "session.vendor_identity_confirmed": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "F10, launch 1: --session-id the UUID derived from the VIA session (ruling Q4); its init confirms generation 1."
+      }
+    },
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply TWO.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "structured_output": null,
+          "cost": {
+            "usd": 0.002,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": [
+          "TWO"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 2,
+            "vendor_session_id": "39ff47b4-d184-4450-81c9-c067ed1e1874"
+          },
+          "turn.accepted",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1,
+          "session.vendor_identity_confirmed": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "F10, launch 2: a new process resumes the exact confirmed UUID. At the gate (after the prompt, before init) nothing of this launch confirmed: the historical ID does not verify the reopening. Its own init confirms generation 2, once, before acceptance."
+      },
+      "gates": [
+        {
+          "step": 3,
+          "lifetime": 2,
+          "expect": {
+            "accepted": false,
+            "terminal": null,
+            "error": null,
+            "observations_exclude": [
+              "session.vendor_identity_confirmed",
+              "turn.accepted"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply THREE.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "structured_output": null,
+          "cost": {
+            "usd": 0.003,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": [
+          "THREE"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 3,
+            "vendor_session_id": "39ff47b4-d184-4450-81c9-c067ed1e1874"
+          },
+          "turn.accepted",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1,
+          "session.vendor_identity_confirmed": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "F10, launch 3: the same UUID again, generation 3; each launch read exactly one user line (strict trailing input)."
+      }
+    }
+  ]
+}
