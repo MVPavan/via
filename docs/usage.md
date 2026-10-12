@@ -67,6 +67,9 @@ One binary contains both the CLI and the daemon.
 - The harness CLI for each harness you use, installed: `claude`, `codex`,
   `opencode` or `pi`. VIA looks the binary up on `PATH` (or uses
   `harnesses.<name>.binary`, see [Configuration](#configuration-daemonjson)).
+- OpenCode must be version 2 (2.0.x). Its default installer and npm give
+  1.x, which VIA refuses; install version 2 with
+  `curl -fsSL https://opencode.ai/v2/install | bash`.
 - Claude Code and Codex use your normal login: log in to them yourself. Pi
   needs a one-time login into VIA's private Pi directory
   ([Pi setup](#pi-setup)). OpenCode uses no login at all
@@ -581,7 +584,7 @@ Common errors (`data.kind`) and what to do:
 |---|---|
 | `invalid_params` | read `message` and `data.field`; `data.kind2` is `vendor_option_conflict`, `session_scope_on_resume`, `idempotency_conflict` or `unknown_field` when it applies |
 | `unknown_model` | check the model name and form for the harness (`provider/id` for OpenCode and Pi); `via models` |
-| `harness_unavailable` | install the vendor CLI and put it on `PATH`, then `via daemon stop` so the daemon restarts with the new `PATH`; or set `harnesses.<name>.binary`. `data.reason: handshake_refused`: the vendor version is not usable (OpenCode: install a 2.0.x version) |
+| `harness_unavailable` | install the vendor CLI and put it on `PATH`, then `via daemon stop` so the daemon restarts with the new `PATH`; or set `harnesses.<name>.binary`. `data.reason: handshake_refused`: the vendor version is not usable (OpenCode: install version 2 with `curl -fsSL https://opencode.ai/v2/install | bash`) |
 | `bound_unsupported` | choose a bound the route accepts ([Bounds](#bounds)) |
 | `missing_capability` | a `--require` verb is not supported on that route |
 | `unsupported_verb` | the route does not support the verb (all `steer` calls in this release) |
