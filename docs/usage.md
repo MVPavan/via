@@ -140,9 +140,14 @@ OpenCode directory (`unexpected_credential_state`).
   `--handle h_…` (visible to other processes in the argument list, so prefer
   the others). `via spawn` also accepts one of these to use your own handle.
 
-All output is JSON, one object per line: results on stdout, errors on
-stderr. The `--json` flag is accepted on every verb except the entry points
-`via daemon` and `via serve --stdio`; output is JSON with or without it.
+Results go to stdout and errors to stderr. On a terminal they are readable
+text: aligned fields, tables for `list`, `models` and `events`, and an error
+line with its `kind` and a hint. When the stream is piped or redirected, each
+is JSON, one compact object per line, exactly as documented below; `--json`
+(accepted on every verb except the entry points `via daemon` and `via serve
+--stdio`) prints JSON on a terminal too. Scripts that read VIA's output
+through a pipe or file need no flag, but passing `--json` makes the intent
+explicit. The examples in this guide show the JSON form.
 
 ## The daemon
 
@@ -491,7 +496,8 @@ via models --harness claude
 ## The result envelope
 
 `wait` and `result` print the envelope; a foreground `spawn` prints it as its
-second line. Abbreviated:
+second line (on a terminal, after the receipt and a blank line, with the
+final text last). Abbreviated:
 
 ```json
 {"api_version":1,"session_id":"s_7f3k9q2mzr4c","turn":2,"address":"s_7f3k9q2mzr4c/2","revision":0,
@@ -536,7 +542,7 @@ it; `failure.data.reason` says why, e.g. `handshake_refused`,
 | Exit | Meaning |
 |---|---|
 | 0 | success: the command printed its result; for `spawn` (foreground), `wait` and `result`, the turn `completed` |
-| 2 | request error: a JSON-RPC error object on stderr (`{code, message, data: {kind, …}}`), including CLI argument errors (`invalid_params` with `data.field`) |
+| 2 | request error: a JSON-RPC error object on stderr (`{code, message, data: {kind, …}}`; readable text on a terminal), including CLI argument errors (`invalid_params` with `data.field`; on a terminal, the argument parser's own message) |
 | 3 | foreground `spawn`, `wait` or `result`: the turn ended `failed`, `cancelled` or `unknown` (the envelope is still printed) |
 | 4 | daemon unreachable: it could not be started or reached (`data.kind: daemon_unreachable`) |
 | 130 | interrupted while a foreground `spawn`, `wait` or `events --follow` was waiting; the turn keeps running |
