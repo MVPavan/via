@@ -1082,6 +1082,36 @@ fn classification_follows_qualified_evidence() {
     );
 }
 
+/// Live 2026-10-12 (Claude Code 2.1.296): an account usage limit ends with a
+/// synthetic assistant message carrying `error:"rate_limit"` (transcript
+/// `apiErrorStatus` 429). The turn fails `rate_limit`, the vendor code kept;
+/// HTTP 429 alone is the same class, as 401/403 is `auth`.
+#[test]
+fn rate_limit_is_its_own_class() {
+    let facts = facts(NEW_SID, false);
+    let synthetic = json!({"type":"assistant","session_id":NEW_SID,"error":"rate_limit",
+        "is_api_error_message":true,"message":{"id":"m","model":"<synthetic>",
+        "role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text",
+        "text":"You've hit your session limit"}]}})
+    .to_string();
+    let failed = json!({"subtype":"success","is_error":true,"stop_reason":"stop_sequence",
+        "result":"You've hit your session limit"});
+    let (_, run) = run_lines(
+        &facts,
+        &[init_line(NEW_SID), synthetic, result_line(&failed)],
+    );
+    let terminal = run.terminal();
+    assert_eq!(terminal.status, VendorTerminalStatus::Failed);
+    assert_eq!(terminal.stop_reason, StopReason::Error);
+    assert_eq!(terminal.class_hint, Some(ClassHint::RateLimit));
+    assert_eq!(terminal.vendor_code.as_deref(), Some("rate_limit"));
+    let status = json!({"subtype":"error_during_execution","is_error":true,
+        "terminal_reason":"api_error","api_error_status":429,"result":"x"});
+    let (_, run) = run_lines(&facts, &[init_line(NEW_SID), result_line(&status)]);
+    assert_eq!(run.terminal().class_hint, Some(ClassHint::RateLimit));
+    assert_eq!(run.terminal().vendor_code.as_deref(), Some("api_error"));
+}
+
 /// Review r1 #7: every init is checked: a same-session init that differs
 /// is a protocol contradiction; an identical one is nothing new.
 #[test]
