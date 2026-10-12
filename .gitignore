@@ -16,3 +16,4 @@ target/
 
 # Release artifacts (scripts/build-release.sh)
 dist/
+scripts/container-check/container-check-*.log
