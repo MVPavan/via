@@ -3990,7 +3990,7 @@ mod configure_size {
             args: vec![OsString::from("--version")],
             cwd: "/state/opencode/probe".into(),
             env: env.clone(),
-            admitted: vec!["opencode v2.0.22".into()],
+            admitted: vec!["opencode v2.0.".into()],
         });
         assert!(!fenced.fits_configure());
     }

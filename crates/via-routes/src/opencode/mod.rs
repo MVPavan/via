@@ -16,7 +16,7 @@ pub mod session;
 pub mod state;
 pub mod turn;
 
-pub use handshake::{CatalogModel, Refusal, URL_LINE_BYTES};
+pub use handshake::{CatalogModel, Refusal, URL_LINE_BYTES, accepted, series};
 pub use launch::ACQUISITION;
 pub use server::{GenerationEnd, LOSS_EXIT, SILENCE, Server};
 pub use servers::{

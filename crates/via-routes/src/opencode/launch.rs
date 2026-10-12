@@ -184,7 +184,7 @@ async fn shake(
             step: "match /api/info.pid",
         });
     }
-    if !checked.contains(&info.version.as_str()) {
+    if !handshake::accepted(checked, &info.version) {
         return Err(LaunchFailure::Refused(Refusal::Unchecked {
             version: handshake::printable(&info.version),
             checked,

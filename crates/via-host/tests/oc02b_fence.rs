@@ -1002,7 +1002,7 @@ fn store_rows_never_gate() {
     });
 }
 
-/// `OC01`: `--version` printing an unchecked version is `ProbeRefused` at
+/// `OC01`: `--version` printing a version outside the admitted series is `ProbeRefused` at
 /// configuration: no ARM intent, the lock never taken and the namespace
 /// directory unchanged; no launch-failure cause (a refusal).
 fn version_refused() {
@@ -1012,7 +1012,7 @@ fn version_refused() {
         let main = fixture.report("vendor");
         let refused = host
             .acquire(
-                fixture.probed_spec(&["report", arg(&main)], &["version", "opencode v2.0.23"]),
+                fixture.probed_spec(&["report", arg(&main)], &["version", "opencode v2.1.0"]),
                 within(10),
             )
             .await
@@ -1022,7 +1022,7 @@ fn version_refused() {
         assert_eq!(
             fence(refused),
             FenceRefusal::ProbeRefused {
-                output: "opencode v2.0.23".into()
+                output: "opencode v2.1.0".into()
             }
         );
         assert_eq!(fixture.arm_intents().await, 0);
@@ -1031,21 +1031,26 @@ fn version_refused() {
     });
 }
 
-/// `OC01`: a checked version is admitted.
+/// `OC01`: any patch of the admitted series is admitted.
 fn version_admitted() {
     runtime().block_on(async {
         let fixture = Fixture::new();
         let host = fixture.host();
-        let main = fixture.report("vendor");
-        let admitted = host
-            .acquire(
-                fixture.probed_spec(&["report", arg(&main)], &["version", "opencode v2.0.22"]),
-                within(10),
-            )
-            .await
-            .unwrap();
-        report(&main, Duration::from_secs(5)).await.unwrap();
-        close(admitted).await;
+        for (name, version) in [
+            ("checked", "opencode v2.0.22"),
+            ("patch", "opencode v2.0.26"),
+        ] {
+            let main = fixture.report(name);
+            let admitted = host
+                .acquire(
+                    fixture.probed_spec(&["report", arg(&main)], &["version", version]),
+                    within(10),
+                )
+                .await
+                .unwrap();
+            report(&main, Duration::from_secs(5)).await.unwrap();
+            close(admitted).await;
+        }
     });
 }
 

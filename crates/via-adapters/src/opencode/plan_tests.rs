@@ -379,3 +379,18 @@ async fn opencode_server_key_is_per_daemon() {
     assert!(set.models(Some("opencode")).is_empty());
     assert!(set.servers().is_empty());
 }
+
+/// §12 (owner, 2026-10-10): the checked version is `tested`; any other
+/// patch of its 2.0.x series is `untested` (Core adds
+/// `vendor_version_untested`); another series is `refused`.
+#[test]
+fn opencode_version_status_follows_the_checked_series() {
+    use super::plan::version_status;
+    let status = |version| serde_json::to_value(version_status(version)).unwrap();
+    assert_eq!(status(Some("2.0.22")), json!("tested"));
+    assert_eq!(status(Some("2.0.26")), json!("untested"));
+    assert_eq!(status(None), json!("untested"));
+    for refused in ["2.1.0", "3.0.0", "1.0.22", "2.0.26-beta"] {
+        assert_eq!(status(Some(refused)), json!("refused"), "{refused}");
+    }
+}

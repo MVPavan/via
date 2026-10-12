@@ -135,7 +135,7 @@ between stdin/stdout and the daemon socket.
 |---|---|---|---|---|
 | Claude Code | `claude` | `claude-cli` | `sonnet` (default), `opus`, `haiku`, or a Claude model ID passed through unchanged | 2.1.285, 2.1.289, 2.1.290 |
 | Codex | `codex` | `codex-app-server` | a Codex model name, e.g. `gpt-6-luna`; judged against the catalog the Codex server reports | 0.159.2, 0.160.0, 0.160.1 |
-| OpenCode | `opencode` | `opencode-serve` | `provider/id` as OpenCode names it; no default | 2.0.22 (the only version that runs) |
+| OpenCode | `opencode` | `opencode-serve` | `provider/id` as OpenCode names it; no default | 2.0.22 (any 2.0.x runs) |
 | Pi | `pi` | `pi-rpc` | `provider/id`, e.g. `openai/gpt-6-luna`; a bare `gpt-6-luna` is refused | 1.0.2 |
 
 - `via spawn` requires `--model`. `via describe` accepts `--model` alone and
@@ -146,8 +146,8 @@ between stdin/stdout and the daemon socket.
   model IDs from your OpenCode installation.
 - Any vendor version runs, with the warning `vendor_version_untested` if it
   is not in the checked set, unless a handshake check fails. **Exception:**
-  OpenCode runs only its checked version; any other is refused at the
-  handshake (`handshake_refused`).
+  OpenCode runs only 2.0.x (untested patches with the warning); any other
+  minor or major version is refused at the handshake (`handshake_refused`).
 
 ### Capabilities per route
 
@@ -492,7 +492,7 @@ Common errors (`data.kind`) and what to do:
 |---|---|
 | `invalid_params` | read `message` and `data.field`; `data.kind2` is `vendor_option_conflict`, `session_scope_on_resume`, `idempotency_conflict` or `unknown_field` when it applies |
 | `unknown_model` | check the model name and form for the harness (`provider/id` for OpenCode and Pi); `via models` |
-| `harness_unavailable` | install the vendor CLI and put it on `PATH`, then `via daemon stop` so the daemon restarts with the new `PATH`; or set `harnesses.<name>.binary`. `data.reason: handshake_refused`: the vendor version is not usable (OpenCode: install the checked version) |
+| `harness_unavailable` | install the vendor CLI and put it on `PATH`, then `via daemon stop` so the daemon restarts with the new `PATH`; or set `harnesses.<name>.binary`. `data.reason: handshake_refused`: the vendor version is not usable (OpenCode: install a 2.0.x version) |
 | `bound_unsupported` | choose a bound the route accepts ([Bounds](#bounds)) |
 | `missing_capability` | a `--require` verb is not supported on that route |
 | `unsupported_verb` | the route does not support the verb (all `steer` calls in this release) |
@@ -571,7 +571,7 @@ are refused (the daemon will not start). Example:
   can exceed VIA's 1 MiB event limit when one step creates thousands of
   non-ignored files; the turn then fails with `overflow`. Deferred (bead
   `via-ty8`).
-- OpenCode runs only version 2.0.22, refuses raw vendor arguments, and
+- OpenCode runs only 2.0.x (2.0.22 is tested), refuses raw vendor arguments, and
   supports neither `--output-schema` nor `--max-steps`. Pi supports neither
   either.
 - After a daemon restart (crash or forced stop), a turn that was running is

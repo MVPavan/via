@@ -159,7 +159,7 @@ class DiagnosticTests(unittest.TestCase):
         from opencode_ownership import OwnershipRegistry
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);work=root/'private';work.mkdir()
-            evidence=root/'evidence';evidence.mkdir()
+            evidence=root/'evidence';evidence.mkdir(mode=0o700);evidence.chmod(0o700)
             owned=OwnershipRegistry(evidence);owned.register(work,'vendor-private')
             db=work/'opencode.db'
             with sqlite3.connect(db) as conn:

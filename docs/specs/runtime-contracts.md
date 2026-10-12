@@ -499,7 +499,7 @@ pub struct PrivateProcessSpec {
 }
 pub struct VersionProbe {
     pub args: Vec<OsString>, pub cwd: PathBuf, pub env: EnvAllowList,
-    pub admitted: Vec<String>,           // exact trimmed stdout lines
+    pub admitted: Vec<String>,           // prefixes; trimmed stdout = prefix + digits
 }
 pub enum StderrCapture { Log, CountOnly }
 pub struct AcquiredProcess {
@@ -635,8 +635,8 @@ of these failures is a vendor exit before the route's handshake.
 2. with `version_probe`, runs the program through the exec entry (no
    record path) with the probe's arguments, cwd and environment, stdin
    `/dev/null`, stdout kept up to 256 bytes, stderr discarded, killing and
-   waiting for it at 2 s; exit 0 with a trimmed output in `admitted`
-   passes, exit 0 with other output is `ProbeRefused { output }` (printable
+   waiting for it at 2 s; exit 0 with a trimmed output that is an
+   `admitted` prefix followed by one or more ASCII digits passes, exit 0 with other output is `ProbeRefused { output }` (printable
    ASCII only), and anything else is `ProbeFailed { kind }`;
 3. opens the lock path (create 0600, no symlink follow, close-on-exec, a
    regular file of the daemon's uid) and takes `flock(LOCK_EX | LOCK_NB)`;
