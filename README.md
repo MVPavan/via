@@ -1,5 +1,11 @@
 # VIA
 
+**One CLI for orchestrating across models, across harnesses.**
+
+[![VIA overview: an orchestrator drives Claude Code, Codex, OpenCode and Pi through one CLI](docs/assets/via-overview.gif)](https://github.com/MVPavan/via/releases/download/v0.1.0/via-overview.mp4)
+
+<sub>Click for the full-quality video. Animation source: [docs/assets/via-overview.html](docs/assets/via-overview.html).</sub>
+
 VIA runs a prompt on a coding-agent harness and gives you back one structured
 JSON result, whichever harness ran it.
 
