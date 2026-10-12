@@ -5,8 +5,9 @@ JSON result, whichever harness ran it.
 
 It is one static Rust binary: a CLI plus a per-user daemon that the CLI starts
 on demand. You name the harness, model, prompt and sandbox bound explicitly;
-VIA launches the vendor's own CLI with your existing login, tracks the
-session, and returns a result envelope with the final text, state, stop
+VIA launches the vendor's own CLI (Claude Code and Codex with your existing
+login; Pi and OpenCode as set up in the
+[user guide](docs/usage.md#prerequisites)), tracks the session, and returns a result envelope with the final text, state, stop
 reason, token usage, cost and warnings. Roles and orchestration policy stay
 with the caller.
 

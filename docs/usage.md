@@ -6,6 +6,8 @@ is the public API, [C1](specs/via-api-v1.md); this guide describes how the
 
 - [Install](#install)
 - [Prerequisites](#prerequisites)
+  - [Pi setup](#pi-setup)
+  - [OpenCode models and providers](#opencode-models-and-providers)
 - [Concepts](#concepts)
 - [The daemon](#the-daemon)
 - [Harnesses, routes and models](#harnesses-routes-and-models)
@@ -62,16 +64,63 @@ One binary contains both the CLI and the daemon.
 
 ## Prerequisites
 
-- The harness CLI for each harness you use, installed and **logged in by
-  you**: `claude`, `codex`, `opencode` or `pi`. VIA looks the binary up on
-  `PATH` (or uses `harnesses.<name>.binary`, see
-  [Configuration](#configuration-daemonjson)).
-- VIA uses the vendor's own stored login. It never reads, copies or stores
-  credentials, and it does not pass API-key environment variables through:
+- The harness CLI for each harness you use, installed: `claude`, `codex`,
+  `opencode` or `pi`. VIA looks the binary up on `PATH` (or uses
+  `harnesses.<name>.binary`, see [Configuration](#configuration-daemonjson)).
+- Claude Code and Codex use your normal login: log in to them yourself. Pi
+  needs a one-time login into VIA's private Pi directory
+  ([Pi setup](#pi-setup)). OpenCode uses no login at all
+  ([OpenCode models and providers](#opencode-models-and-providers)).
+- VIA never reads, copies or stores credentials, and it does not pass
+  API-key environment variables through:
   the daemon starts with a cleared environment holding only `HOME`, `PATH`,
   `LANG`, `USER`, `LOGNAME` and `XDG_RUNTIME_DIR`, captured from the CLI
   that started it.
 - `jq` is handy for the examples below; VIA itself does not need it.
+
+### Pi setup
+
+VIA runs Pi with its own agent directory, `~/.via/state/vendor/pi/agent`
+(under `$VIA_STATE_DIR/vendor/pi/agent` if you set that), not your normal
+Pi agent directory. Before every Pi turn VIA checks that directory and refuses the turn
+(`submit_failed`, `handshake_refused`, naming the rule) unless:
+
+- the directory and its parents `vendor/` and `vendor/pi/` are yours and
+  mode 0700;
+- `settings.json` exists, is not group- or world-writable, and holds
+  `"cacheWarming": "off"` plus, at most, the keys Pi writes itself
+  (`defaultProvider`, `defaultModel`, `lastChangelogVersion`, `deviceId`);
+- the directory holds nothing but `settings.json`, `auth.json` (no group or
+  other permission bits), `models-store.json`, `bin/` and `sessions/`, with
+  no symlinks.
+
+One-time setup, in this order (Pi would create missing directories 0755,
+which VIA refuses):
+
+```bash
+(umask 077 && mkdir -p ~/.via/state/vendor/pi/agent)
+(umask 077 && echo '{"cacheWarming":"off"}' > ~/.via/state/vendor/pi/agent/settings.json)
+PI_CODING_AGENT_DIR="$HOME/.via/state/vendor/pi/agent" pi   # then /login, then quit
+```
+
+Check it with a small turn:
+`via spawn --harness pi --model openai/gpt-6-luna --bound full --network --prompt "Reply OK"`.
+VIA never writes, repairs or deletes anything in that directory.
+
+### OpenCode models and providers
+
+VIA runs its own OpenCode server with private `HOME` and XDG directories, so
+your normal OpenCode login and `~/.config/opencode` are not used. What
+works:
+
+- **No configuration:** OpenCode's free anonymous models, e.g.
+  `--model opencode/mimo-v2.6-flash-free`.
+- **A project's own configuration:** an `opencode.json` (or `.opencode/`) in
+  the session's project (`--cwd`) applies, including any provider and models
+  it defines. VIA never logs or stores its keys.
+
+VIA does not start its OpenCode server if a login is stored in its private
+OpenCode directory (`unexpected_credential_state`).
 
 ## Concepts
 
@@ -92,12 +141,13 @@ One binary contains both the CLI and the daemon.
   the others). `via spawn` also accepts one of these to use your own handle.
 
 All output is JSON, one object per line: results on stdout, errors on
-stderr. The `--json` flag is accepted on every verb; output is JSON with or
-without it.
+stderr. The `--json` flag is accepted on every verb except the entry points
+`via daemon` and `via serve --stdio`; output is JSON with or without it.
 
 ## The daemon
 
-Any CLI verb starts the daemon automatically if none is running. There is one
+Any CLI verb except `via daemon stop` starts the daemon automatically if none
+is running. There is one
 daemon per OS user, reached over a user-only Unix socket. It exits on its own
 after 60 s idle (no client connected, no running or queued work, no pending
 cleanup).
@@ -142,8 +192,8 @@ between stdin/stdout and the daemon socket.
   picks the harness whose catalog lists it (`--model openai/gpt-6-luna`
   selects Pi).
 - `via models` lists the bundled catalogs (Claude, Pi) and, while a Codex
-  server is running, the models it reported. OpenCode lists none; use the
-  model IDs from your OpenCode installation.
+  or OpenCode server is running, the models it reported. OpenCode therefore
+  lists none until an OpenCode session has started VIA's OpenCode server.
 - Any vendor version runs, with the warning `vendor_version_untested` if it
   is not in the checked set, unless a handshake check fails. **Exception:**
   OpenCode runs only 2.0.x (untested patches with the warning); any other
@@ -292,8 +342,9 @@ via cancel s_7f3k9q2mzr4c --handle-file handle --wait
 
 `--turn N` picks a turn (default: the running one, else the latest).
 `--force-after MS` (default 10,000) is how long the vendor gets to stop
-before VIA forces it. Without `--wait` the reply comes at once with
-`state: running` and `cleanup: pending`. `cleanup: uncertain` means VIA could
+before VIA forces it. Without `--wait` the reply comes at once: for a running
+turn with `state: running` and `cleanup: pending`; a queued turn is
+`cancelled` at once. `cleanup: uncertain` means VIA could
 not prove the agent's tools stopped. On Codex, a cancel during a running
 shell command settles only when the command finishes or after 60 s; see
 [Known limitations](#known-limitations). Cancelling an already finished turn
@@ -408,7 +459,7 @@ holds VIA's evidence for the turn: `stderr.log` (absent on shared-server
 routes), `undecoded.bin`, and `final_text.txt` / `structured_output.json`
 when a result was too large for the envelope. Read the files yourself.
 
-### `describe`: preflight, no side effects
+### `describe`: preflight, no vendor process
 
 ```bash
 via describe --harness pi --model openai/gpt-6-luna --bound full --network --require cancel
@@ -416,7 +467,8 @@ via describe --harness pi --model openai/gpt-6-luna --bound full --network --req
 
 Prints the route plan: `route`, resolved `model`, `capabilities`,
 `effective_bound`, `version_status`, `refusals` and `warnings`. It starts no
-process and writes nothing. A non-empty `refusals` list tells you why a
+vendor process and creates no session (like any verb, it starts the daemon if
+none is running). A non-empty `refusals` list tells you why a
 `spawn` with the same parameters would be refused, for example:
 
 ```json
