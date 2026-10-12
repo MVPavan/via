@@ -1,0 +1,191 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>VIA motion</title>
+<style>
+  html,body{margin:0;background:#0b0f17;overflow:hidden}
+  svg{display:block}
+  text{font-family:"Inter","Segoe UI","DejaVu Sans",sans-serif}
+  text:not([fill]){fill:#e6edf7}
+  .mono{font-family:"JetBrains Mono","DejaVu Sans Mono",monospace}
+</style></head>
+<body>
+<svg id="s" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity=".35"/><stop offset="1" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#4a5d80"/></marker>
+    <marker id="arY" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#fbbf24"/></marker>
+  </defs>
+
+  <g id="title">
+    <text x="960" y="470" text-anchor="middle" font-size="170" font-weight="800" letter-spacing="18">VIA</text>
+    <text x="960" y="560" text-anchor="middle" font-size="44" fill="#9fb0c8">One CLI for orchestrating</text>
+    <text x="960" y="620" text-anchor="middle" font-size="44" fill="#9fb0c8">across models, across harnesses.</text>
+  </g>
+
+  <g id="header"><text x="80" y="90" font-size="40" font-weight="800" letter-spacing="6">VIA</text>
+    <text x="210" y="90" font-size="26" fill="#7d8ca3">one CLI · across models · across harnesses</text></g>
+
+  <g id="links" fill="none" stroke="#2a3850" stroke-width="3">
+    <path id="pOrch" d="M410,470 L760,470" marker-end="url(#ar)"/>
+    <path id="pH0" d="M1160,470 C1260,470 1260,250 1380,250"/>
+    <path id="pH1" d="M1160,470 C1260,470 1260,410 1380,410"/>
+    <path id="pH2" d="M1160,470 C1260,470 1260,570 1380,570"/>
+    <path id="pH3" d="M1160,470 C1260,470 1260,730 1380,730"/>
+  </g>
+
+  <g id="orch">
+    <rect x="90" y="385" width="320" height="170" rx="22" fill="#121a29" stroke="#3b82f6" stroke-width="3"/>
+    <text x="250" y="450" text-anchor="middle" font-size="30" font-weight="700">Your orchestrator</text>
+    <text x="250" y="492" text-anchor="middle" font-size="22" fill="#d97757">Claude Code · Opus 5.5</text>
+    <text x="250" y="524" text-anchor="middle" font-size="20" fill="#8ea3c2">(or any harness, any script)</text>
+  </g>
+
+  <g id="hub">
+    <circle cx="960" cy="470" r="260" fill="url(#glow)"/>
+    <rect x="760" y="350" width="400" height="240" rx="28" fill="#151225" stroke="#7c5cff" stroke-width="4"/>
+    <text x="960" y="440" text-anchor="middle" font-size="64" font-weight="800" letter-spacing="8">VIA</text>
+    <text x="960" y="490" text-anchor="middle" font-size="24" fill="#b9a8ff">CLI + per-user daemon</text>
+    <text x="960" y="528" text-anchor="middle" font-size="22" fill="#8f86b8">sessions · queue · durable state</text>
+  </g>
+
+  <g id="harn"></g>
+  <g id="planned"><text x="1380" y="845" font-size="20" fill="#7d8ca3">planned · not yet supported</text></g>
+
+  <g id="loopLbl" font-size="24">
+    <text id="lImpl" x="1728" y="260" fill="#34d399">implement</text>
+    <text id="lRev" x="1728" y="420" fill="#fbbf24">review</text>
+    <text id="lFind" x="1200" y="190" fill="#fbbf24" text-anchor="middle">findings → resume · round 2</text>
+    <text id="lOk" x="1728" y="260" fill="#34d399">approved ✓</text>
+  </g>
+
+  <g id="env">
+    <rect x="460" y="700" width="800" height="300" rx="20" fill="#0f1622" stroke="#2f3d55" stroke-width="2"/>
+    <text x="490" y="745" font-size="22" fill="#7d8ca3">one result envelope, every harness</text>
+    <text class="mono" x="490" y="795" font-size="26" fill="#8ea3c2">{ "state": <tspan fill="#34d399">"completed"</tspan>,</text>
+    <text class="mono" x="510" y="838" font-size="26" fill="#8ea3c2">"final_text": <tspan fill="#e6edf7">"All 42 tests pass."</tspan>,</text>
+    <text class="mono" x="510" y="881" font-size="26" fill="#8ea3c2">"usage": {…}, "cost": {…},</text>
+    <text class="mono" x="510" y="924" font-size="26" fill="#8ea3c2">"warnings": [] }</text>
+  </g>
+
+  <g id="life">
+    <text x="960" y="230" text-anchor="middle" font-size="44" font-weight="700">One lifecycle, every harness</text>
+    <text x="960" y="282" text-anchor="middle" font-size="24" fill="#8ea3c2">same verbs on Claude Code · Codex · OpenCode · Pi</text>
+    <line x1="160" y1="600" x2="1730" y2="600" stroke="#2a3850" stroke-width="3"/>
+    <g id="lchips"></g>
+    <text x="160" y="760" font-size="24" fill="#8ea3c2">watch it run: <tspan fill="#e6edf7">status · events · logs</tspan></text>
+    <text x="1290" y="760" font-size="22" fill="#6b7a92">not yet:</text>
+    <g opacity=".55"><rect x="1390" y="730" width="140" height="46" rx="10" fill="#1a2030" stroke="#56647c" stroke-width="2"/>
+      <text x="1460" y="760" text-anchor="middle" font-size="22" fill="#7d8ca3">pause</text>
+      <rect x="1550" y="730" width="140" height="46" rx="10" fill="#1a2030" stroke="#56647c" stroke-width="2"/>
+      <text x="1620" y="760" text-anchor="middle" font-size="22" fill="#7d8ca3">steer</text></g>
+  </g>
+  <g id="graph1"></g><g id="graph2"></g>
+  <text id="cap1" x="960" y="960" text-anchor="middle" font-size="40" font-weight="700">Build a graph on the go.</text>
+  <text id="cap2" x="960" y="960" text-anchor="middle" font-size="40" font-weight="700">Change it any time. Each run is a static graph. <tspan fill="#b9a8ff">VIA runs every node.</tspan></text>
+  <text id="newg" x="960" y="200" text-anchor="middle" font-size="26" fill="#7d8ca3">new graph →</text>
+
+  <g id="end">
+    <text x="960" y="360" text-anchor="middle" font-size="120" font-weight="800" letter-spacing="14">VIA 0.1.0</text>
+    <text x="960" y="450" text-anchor="middle" font-size="40" fill="#9fb0c8">Claude Code · Codex · OpenCode · Pi</text>
+    <text x="960" y="510" text-anchor="middle" font-size="28" fill="#6b7a92">planned: Cursor · Gemini CLI · Devin · Amp · Kimi · Goose · …</text>
+    <text x="960" y="600" text-anchor="middle" font-size="36" fill="#e6edf7">Linux today · <tspan fill="#fbbf24">macOS next: help wanted</tspan></text>
+    <text class="mono" x="960" y="690" text-anchor="middle" font-size="34" fill="#b9a8ff">github.com/MVPavan/via</text>
+  </g>
+
+  <g id="dots"></g>
+</svg>
+<script>
+const NS='http://www.w3.org/2000/svg', $=id=>document.getElementById(id);
+const C={claude:'#d97757',codex:'#10a37f',oc:'#60a5fa',pi:'#f472b6',y:'#fbbf24'};
+const H=[{n:'Claude Code',m:'Opus 5.5',c:C.claude,y:250},{n:'Codex',m:'GPT-6.1 Sol',c:C.codex,y:410},
+         {n:'OpenCode',m:'DeepSeek',c:C.oc,y:570},{n:'Pi',m:'GPT-6.1 Sol',c:C.pi,y:730}];
+const el=(tag,attrs,html)=>{const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(html)e.innerHTML=html;return e;};
+H.forEach((h,i)=>$('harn').appendChild(el('g',{id:'h'+i},
+  `<rect x="1380" y="${h.y-55}" width="330" height="110" rx="18" fill="#121a29" stroke="${h.c}" stroke-width="3"/>
+   <circle cx="1418" cy="${h.y}" r="12" fill="${h.c}"/>
+   <text x="1446" y="${h.y-6}" font-size="30" font-weight="700">${h.n}</text>
+   <text x="1446" y="${h.y+28}" font-size="21" fill="#8ea3c2">${h.m}</text>`)));
+['Cursor','Gemini CLI','Devin','Amp','Kimi','Goose','+ more'].forEach((n,i)=>{
+  const x=1380+(i%4)*130, y=870+Math.floor(i/4)*62;
+  $('planned').appendChild(el('g',{id:'pl'+i},`<rect x="${x}" y="${y}" width="118" height="48" rx="10" fill="none" stroke="#56647c" stroke-width="2" stroke-dasharray="7 6"/>
+   <text x="${x+59}" y="${y+31}" text-anchor="middle" font-size="19" fill="#9aa8bd">${n}</text>`));});
+
+const HN={claude:'Claude Code',codex:'Codex',oc:'OpenCode',pi:'Pi'};
+const G1={n:[['plan','claude','Opus 5.5'],['implement','claude','Opus 5.5'],['review','codex','GPT-6.1 Sol'],['test','pi','GPT-6.1 Sol'],['ship','oc','DeepSeek']],
+  p1:[[300,560],[630,560],[960,560],[1290,560],[1620,560]], p2:[[300,560],[700,390],[700,730],[1180,560],[1620,560]],
+  e:[[0,1],[1,2],[2,3],[3,4],[2,1,'loop'],[0,2]]};
+const G2={n:[['plan','claude','Opus 5.5',200,520],['implement API','claude','Opus 5.5',560,330],['implement UI','oc','DeepSeek',560,520],
+  ['write tests','pi','GPT-6.1 Sol',560,710],['merge','claude','Opus 5.5',920,520],['review','codex','GPT-6.1 Sol',1280,400],
+  ['review','claude','Opus 5.5',1280,640],['test','pi','GPT-6.1 Sol',1640,430],['ship','oc','DeepSeek',1640,640]],
+  e:[[0,1],[0,2],[0,3],[1,4],[2,4],[3,4],[4,5],[4,6],[5,7],[6,7],[7,8],[5,1,'loop']]};
+function build(gid,G){G.n.forEach((n,i)=>{$(gid).appendChild(el('g',{id:gid+'n'+i},
+  `<rect x="-128" y="-50" width="256" height="100" rx="16" fill="#121a29" stroke="${C[n[1]]}" stroke-width="3"/>
+   <text y="-6" text-anchor="middle" font-size="27" font-weight="700">${n[0]}</text>
+   <text y="28" text-anchor="middle" font-size="18" fill="#8ea3c2">${HN[n[1]]} · ${n[2]}</text>`));});
+  G.e.forEach((e,i)=>$(gid).prepend(el('path',{id:gid+'e'+i,fill:'none','stroke-width':3,
+    stroke:e[2]?C.y:'#3a4a66','stroke-dasharray':e[2]?'10 8':'','marker-end':e[2]?'url(#arY)':'url(#ar)'})));}
+build('graph1',G1);
+const LV=['spawn','wait · result','resume','queue','cancel','⟳ restart','resume','close'];
+LV.forEach((v,i)=>{const x=160+i*200;$('lchips').appendChild(el('g',{id:'lc'+i},
+  `<rect x="${x}" y="470" width="170" height="70" rx="14" fill="#121a29" stroke="#7c5cff" stroke-width="3"/>
+   <text x="${x+85}" y="514" text-anchor="middle" font-size="${v.length>8?21:25}" font-weight="700">${v}</text>`));});
+['turn 3','turn 4'].forEach((v,i)=>$('lchips').appendChild(el('g',{id:'lq'+i},
+  `<rect x="${760}" y="${400-i*52}" width="170" height="42" rx="10" fill="#151225" stroke="#b9a8ff" stroke-width="2" stroke-dasharray="6 5"/>
+   <text x="845" y="${428-i*52}" text-anchor="middle" font-size="20" fill="#b9a8ff">${v} queued</text>`))); build('graph2',G2);
+function bound(c,o){const dx=o[0]-c[0],dy=o[1]-c[1],s=Math.min(134/Math.abs(dx||1e-6),56/Math.abs(dy||1e-6));return [c[0]+dx*s,c[1]+dy*s];}
+function edge(id,a,b,loop){const s=bound(a,b),e=bound(b,a);let mx=(s[0]+e[0])/2,my=(s[1]+e[1])/2;
+  if(loop){const dx=e[0]-s[0],dy=e[1]-s[1],L=Math.hypot(dx,dy)||1;const b=L<300?230:170;mx+=dy/L*b;my-=dx/L*b;}
+  $(id).setAttribute('d',`M${s[0]},${s[1]} Q${mx},${my} ${e[0]},${e[1]}`);}
+
+const cl=(x,a=0,b=1)=>Math.max(a,Math.min(b,x));
+const ease=x=>x<.5?2*x*x:1-Math.pow(-2*x+2,2)/2;
+const win=(t,a,b,f=.6)=>cl((t-a)/f)*cl((b-t)/f);
+const op=(id,v)=>$(id).setAttribute('opacity',v);
+function dot(path,u,color,r=11,rev=false){const p=$(path),L=p.getTotalLength(),q=p.getPointAtLength((rev?1-u:u)*L);
+  $('dots').appendChild(el('circle',{cx:q.x,cy:q.y,r,fill:color}));}
+
+function render(t){
+  $('dots').innerHTML='';
+  op('title',win(t,0,3.2));
+  const main=win(t,3.2,19.4);
+  op('header',win(t,3.2,35.2));
+  op('orch',main*cl((t-3.2)/.6)); op('hub',main*cl((t-3.6)/.6)); op('pOrch',main*cl((t-3.6)/.6));
+  for(let i=0;i<4;i++){const a=6+i*.5;op('h'+i,main*cl((t-a)/.5));op('pH'+i,main*cl((t-a)/.5));}
+  op('planned',main*cl((t-8.6)/.6));
+  for(let i=0;i<7;i++) op('pl'+i,cl((t-8.8-i*.18)/.4));
+  if(t>4.2&&t<5.6) dot('pOrch',ease((t-4.2)/1.4),'#3b82f6',13);
+  for(let i=0;i<4;i++){const a=6.3+i*.5; if(t>a&&t<a+1.3) dot('pH'+i,ease((t-a)/1.3),H[i].c);}
+  [['pH0',11,12.2,false,C.claude],['pH0',12.4,13.4,true,C.claude],['pH1',13.4,14.4,false,C.y],
+   ['pH1',14.6,15.6,true,C.y],['pH0',15.6,16.6,false,C.y]].forEach(([p,a,b,rev,c])=>{if(t>a&&t<b) dot(p,ease((t-a)/(b-a)),c,13,rev);});
+  op('lImpl',win(t,11.2,16.6,.4)*main); op('lRev',win(t,13.8,17,.4)*main);
+  op('lFind',win(t,14.6,17,.4)*main); op('lOk',win(t,16.8,19.4,.4)*main);
+  $('h0').querySelector('rect').setAttribute('stroke-width',(t>11&&t<19)?6:3);
+  $('h1').querySelector('rect').setAttribute('stroke-width',(t>13.4&&t<16)?6:3);
+  op('env',main*cl((t-17)/.6));
+  for(let i=0;i<4;i++){const a=17.2+i*.2; if(t>a&&t<a+1) dot('pH'+i,ease(t-a),H[i].c,10,true);}
+  const lf=win(t,19.6,24.6); op('life',lf);
+  const ph=cl((t-20.2)/3.8);
+  LV.forEach((_,i)=>{const on=ph*8>i; $('lc'+i).setAttribute('opacity',on?1:.35);
+    $('lc'+i).querySelector('rect').setAttribute('stroke',i===5?'#fbbf24':(on?'#7c5cff':'#3a4a66'));});
+  ['lq0','lq1'].forEach((q,i)=>op(q,lf*cl((t-21.5-i*.2)/.3)*cl((23.2+i*.3-t)/.3)));
+  if(lf>0){const x=245+ph*1400; $('dots').appendChild(el('circle',{cx:x,cy:600,r:12,fill:'#b9a8ff'}));}
+  t-=5;
+  const g1=win(t,19.6,24.4); op('graph1',g1); op('cap1',g1);
+  const k=ease(cl((t-21)/1.2));
+  const P=G1.n.map((_,i)=>[G1.p1[i][0]+(G1.p2[i][0]-G1.p1[i][0])*k,G1.p1[i][1]+(G1.p2[i][1]-G1.p1[i][1])*k]);
+  P.forEach((p,i)=>$('graph1n'+i).setAttribute('transform',`translate(${p[0]},${p[1]})`));
+  G1.e.forEach((e,i)=>{edge('graph1e'+i,P[e[0]],P[e[1]],e[2]); op('graph1e'+i,i<4?1:k);});
+  if(t>22.6&&t<23.8) dot('graph1e4',ease((t-22.6)/1.2),C.y,11);
+  op('newg',win(t,23.6,25,.4));
+  const g2=win(t,24.6,30); op('graph2',g2); op('cap2',win(t,26.6,30));
+  G2.n.forEach((n,i)=>{$('graph2n'+i).setAttribute('transform',`translate(${n[3]},${n[4]})`); op('graph2n'+i,cl((t-24.8-i*.18)/.35));});
+  G2.e.forEach((e,i)=>{edge('graph2e'+i,[G2.n[e[0]][3],G2.n[e[0]][4]],[G2.n[e[1]][3],G2.n[e[1]][4]],e[2]);
+    op('graph2e'+i,cl((t-25.2-i*.12)/.35));});
+  const wave=[[0,1,2],[3,4,5],[6,7],[11],[8,9],[10]];
+  wave.forEach((es,w)=>{const a=26.8+w*.5; if(t>a&&t<a+.7) es.forEach(i=>dot('graph2e'+i,ease((t-a)/.7),G2.e[i][2]?C.y:'#b9a8ff',9));});
+  op('end',cl((t-30.2)/.6));
+}
+const T=parseFloat((location.hash.match(/t=([\d.]+)/)||[])[1]||'0'); render(T); window.render=render;
+</script>
+</body></html>
