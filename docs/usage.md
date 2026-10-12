@@ -1,6 +1,6 @@
 # VIA user guide
 
-This guide covers the first release (VIA 0.1.0). The authoritative contract
+This guide covers VIA 0.1.1. The authoritative contract
 is the public API, [C1](specs/via-api-v1.md); this guide describes how the
 `via` CLI exposes it.
 
