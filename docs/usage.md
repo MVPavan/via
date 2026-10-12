@@ -148,6 +148,10 @@ between stdin/stdout and the daemon socket.
   is not in the checked set, unless a handshake check fails. **Exception:**
   OpenCode runs only 2.0.x (untested patches with the warning); any other
   minor or major version is refused at the handshake (`handshake_refused`).
+  OpenCode updates itself, so expect `vendor_version_untested` on it.
+- A Claude turn ends at its result. Background commands the agent started
+  (`Bash` with `run_in_background`) do not continue with the session; see
+  [Known limitations](#known-limitations).
 
 ### Capabilities per route
 
@@ -239,7 +243,7 @@ Main flags:
   compatibility; no effect).
 - Per-turn settings, inherited by later turns unless changed on `resume`:
   `--bound`/`--network`/`--allow-dir`, `--effort` (`low` … `max`, or a vendor
-  value), `--output-schema F` (a file holding a JSON Schema draft 2020-12
+  value; on OpenCode, a variant the model offers), `--output-schema F` (a file holding a JSON Schema draft 2020-12
   object; a file holding just `null` clears an inherited schema), `--wall-ms` (default
   3,600,000), `--idle-ms` (default 600,000), `--max-steps`.
 - `--require steer,cancel` refuses the spawn unless the route supports those
@@ -290,7 +294,9 @@ via cancel s_7f3k9q2mzr4c --handle-file handle --wait
 `--force-after MS` (default 10,000) is how long the vendor gets to stop
 before VIA forces it. Without `--wait` the reply comes at once with
 `state: running` and `cleanup: pending`. `cleanup: uncertain` means VIA could
-not prove the agent's tools stopped. Cancelling an already finished turn
+not prove the agent's tools stopped. On Codex, a cancel during a running
+shell command settles only when the command finishes or after 60 s; see
+[Known limitations](#known-limitations). Cancelling an already finished turn
 returns `already_terminal: true`.
 
 ### `close`: end the session
@@ -466,7 +472,8 @@ second line. Abbreviated:
 Failure classes (`failure.class`): `deadline_wall`, `deadline_idle` (raise
 `--wall-ms`/`--idle-ms`), `submit_failed` (rejected before the vendor accepted
 it; `failure.data.reason` says why, e.g. `handshake_refused`,
-`launch_failed`), `auth` (log in to the vendor CLI again), `rate_limit`,
+`launch_failed`), `auth` (log in to the vendor CLI again), `rate_limit`
+(the vendor account hit a rate or usage limit; retry after it resets),
 `context_exceeded`, `budget_exceeded`, `vendor_error`, `resume_mismatch`,
 `process_exited` and `server_lost` (check `stderr.log` via `via logs`),
 `protocol`, `overflow`, `structured_output_invalid`, `daemon_restart`,
@@ -574,5 +581,21 @@ are refused (the daemon will not start). Example:
 - OpenCode runs only 2.0.x (2.0.22 is tested), refuses raw vendor arguments, and
   supports neither `--output-schema` nor `--max-steps`. Pi supports neither
   either.
+- **OpenCode `--effort`** must be a variant the chosen model offers;
+  otherwise the turn fails `submit_failed` with `failure.data.reason:
+  invalid_param` and `field: effort` (seen with
+  `opencode/mimo-v2.6-flash-free` and `--effort low`).
+- **Codex cancel during a shell command.** VIA interrupts at once but settles
+  the cancel only when the command reports finishing, or after a 60 s
+  grace. Codex may leave the command running in the background, so the
+  result can say `cleanup: uncertain` (`cancel_cleanup_uncertain`) and the
+  next turn may warn `predecessor_cleanup_uncertain`. Without `--wait`,
+  `via cancel` returns at once.
+- **Claude background tasks.** A Claude turn ends at its result; Claude Code
+  gets up to 5 s to exit, then VIA stops it. Background commands the agent
+  started (`Bash` with `run_in_background`) do not continue as part of the
+  session, and Claude Code's own follow-up turn for them never runs.
+- **Slow or free providers** can keep a turn in progress phase `model` for minutes;
+  `--idle-ms` (default 600,000) bounds it and `via cancel` stops it.
 - After a daemon restart (crash or forced stop), a turn that was running is
   reported `unknown`; VIA never resends it.
