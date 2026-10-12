@@ -532,11 +532,14 @@ fn store_evidence(evidence: &Evidence, store: &Path) -> EvidencedResult {
 
 /// Every turn that launched a vendor (it has an anchor) has its evidence
 /// folder, whether or not the scenario waived folders: only unlaunched
-/// turns lack one (S1-contract r2 finding 3).
+/// turns lack one (S1-contract r2 finding 3). A shared server's anchor
+/// (`owner_server`) names no turn, as one `models` discovery starts.
 fn launched_turns_have_folders(evidence: &Evidence, store: &Path) -> EvidencedResult {
     let store =
         rusqlite::Connection::open_with_flags(store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut statement = store.prepare("SELECT DISTINCT owner_session, owner_turn FROM anchors")?;
+    let mut statement = store.prepare(
+        "SELECT DISTINCT owner_session, owner_turn FROM anchors WHERE owner_session IS NOT NULL",
+    )?;
     for row in statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })? {

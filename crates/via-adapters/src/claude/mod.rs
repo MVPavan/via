@@ -24,6 +24,11 @@ use crate::plan::CatalogModel;
 /// The harness this adapter serves, a [`crate::HARNESSES`] name.
 pub(crate) const HARNESS: &str = "claude";
 
+/// C1 `models`' note on the bundled catalog: Claude Code has no listing
+/// API, and passes any other model name to the vendor unchanged.
+pub(crate) const MODELS_NOTE: &str = "bundled aliases; Claude Code has no model listing, \
+    and any full Claude model ID is passed to it unchanged";
+
 /// The Claude Code adapter.
 pub(crate) struct ClaudeAdapter {
     /// The resolved vendor binary (design §5.4).
