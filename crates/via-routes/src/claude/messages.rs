@@ -347,6 +347,19 @@ pub struct ResultMessage {
     pub extra: BTreeMap<String, Box<RawValue>>,
 }
 
+impl ResultMessage {
+    /// Whether Claude Code ran this result's turn on its own, for a
+    /// background task's notification, rather than for a prompt it was
+    /// sent: its `origin.kind` is `task-notification` (observed on
+    /// 2.1.296, before the prompt's turn of a resumed process).
+    pub fn task_notification(&self) -> bool {
+        self.extra
+            .get("origin")
+            .and_then(|origin| serde_json::from_str::<Value>(origin.get()).ok())
+            .is_some_and(|origin| origin["kind"] == "task-notification")
+    }
+}
+
 /// `control_request`, flattened.
 #[derive(Debug)]
 pub struct ControlRequest {
@@ -987,6 +1000,27 @@ mod tests {
             .map(|(key, value)| (key.as_str(), value.get()))
             .collect();
         assert_eq!(extra, [("duration_ms", "9"), ("new_vendor_stat", "3")]);
+    }
+
+    /// A result whose `origin.kind` is `task-notification` is Claude
+    /// Code's own turn; one without an origin, or of another kind, is not.
+    #[test]
+    fn result_task_notification_origin() {
+        let of = |origin: Option<Value>| {
+            let mut line = json!({"type":"result","subtype":"success","is_error":false,
+                "session_id":"u","result":""});
+            if let Some(origin) = origin {
+                line["origin"] = origin;
+            }
+            let Message::Result(result) = decoded(&line) else {
+                panic!("not a result")
+            };
+            result.task_notification()
+        };
+        assert!(of(Some(json!({"kind": "task-notification"}))));
+        assert!(!of(None));
+        assert!(!of(Some(json!({"kind": "sdk"}))));
+        assert!(!of(Some(json!("task-notification"))));
     }
 
     /// The encoders write the packet's pinned lines.

@@ -288,6 +288,12 @@ impl PrivateProtocol for ClaudeLane {
         message: Message,
     ) -> Result<Option<ClaudeItem>, Failed> {
         let turn = serving.turn;
+        // Claude Code's own turn for a background task's notification (a
+        // resumed process runs it before the prompt): its result is not
+        // this turn's, which reads on to the prompt's own.
+        if matches!(&message, Message::Result(result) if result.task_notification()) {
+            return Ok(None);
+        }
         let read = serving.lane.result.is_some();
         let foreign = serving
             .lane

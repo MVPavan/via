@@ -1172,6 +1172,56 @@ fn claude_background_task_cancel_settles() {
     check_background_task("claude_background_task_cancel", &tail, knobs).unwrap();
 }
 
+/// The turn after a background-task turn (observed on 2.1.296): resumed,
+/// Claude Code first runs a turn of its own for the task's pending
+/// notification (it did not finish before the previous process ended),
+/// with no model call, and emits that turn's `result`, marked `origin`
+/// `task-notification`, before it runs VIA's prompt. That result is not the
+/// VIA turn's: the turn reads on to the prompt's own result. Both orders
+/// are replayed: the notification's result after the process's init, and
+/// before it.
+#[test]
+fn claude_task_notification_result_is_not_the_turns() {
+    let name = "claude_lazy_init_acceptance";
+    let base = replay_of(name).unwrap();
+    let steps = base["steps"].as_array().unwrap();
+    let notification = emit(&json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "duration_ms": 87, "duration_api_ms": 0, "num_turns": 0, "result": "",
+        "stop_reason": "", "session_id": "${sid}", "total_cost_usd": 0.0005,
+        "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0, "output_tokens": 0},
+        "origin": {"kind": "task-notification"},
+    }));
+    // The prompt, the init, the notification's turn, the init again, then
+    // the prompt's turn: its reply and result, without the SIGUSR1 gate.
+    let after_init = [
+        &steps[..3],
+        std::slice::from_ref(&notification),
+        &steps[2..4],
+        &steps[5..],
+    ]
+    .concat();
+    let before_init = [
+        &steps[..2],
+        std::slice::from_ref(&notification),
+        &steps[2..4],
+        &steps[5..],
+    ]
+    .concat();
+    let mut expect = conformance_expect::load(&fixtures(), name).unwrap();
+    expect["turns"][0]["gates"] = json!([]);
+    for (variant, steps) in [
+        ("claude_task_notification_after_init", after_init),
+        ("claude_task_notification_before_init", before_init),
+    ] {
+        let mut replay = base.clone();
+        replay["steps"] = json!(steps);
+        let knobs = conformance_run::Knobs::default();
+        check_variant(variant, &replay, &expect, knobs).unwrap();
+    }
+}
+
 /// Carry-item 1 (Claude ruling C1, packet §5): a session-cumulative cost
 /// lower than the session's last one is an unexpected counter reset: the
 /// turn warns `cost_counter_reset` (outside C1 §5's closed list, so the
