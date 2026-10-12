@@ -196,9 +196,29 @@ between stdin/stdout and the daemon socket.
 - `via spawn` requires `--model`. `via describe` accepts `--model` alone and
   picks the harness whose catalog lists it (`--model openai/gpt-6-luna`
   selects Pi).
-- `via models` lists the bundled catalogs (Claude, Pi) and, while a Codex
-  or OpenCode server is running, the models it reported. OpenCode therefore
-  lists none until an OpenCode session has started VIA's OpenCode server.
+- `via models [--harness H]` lists each harness's models, fetching a live
+  catalog when VIA does not already know one: Codex through VIA's own Codex
+  server (`model/list`; once known, its last catalog is kept across
+  restarts), OpenCode through VIA's own OpenCode server, Pi through one short
+  `pi --mode rpc` process in VIA's private Pi directory. A server started
+  just for the listing is stopped again right after it. Claude Code has no
+  model listing: `sonnet`, `opus` and `haiku` are listed, and any full Claude
+  model ID also works. Each harness gets at most 20 s; `--harness H` asks
+  only H. The result's `harnesses` array says how each harness went:
+
+  ```json
+  {"models": [{"model": "gpt-6-luna", "harness": "codex", "aliases": [], "source": "discovered"}],
+   "harnesses": [{"harness": "codex", "status": "ok"},
+                 {"harness": "pi", "status": "error", "message": "discovery timed out"},
+                 {"harness": "opencode", "status": "unavailable",
+                  "message": "the harness binary was not found when the daemon started"}]}
+  ```
+
+  On `error` Pi still lists its bundled model; a failed harness never fails
+  the command. OpenCode lists
+  the models available without a project; models a project's own
+  `opencode.json` defines are not listed, but work for sessions in that
+  project.
 - Any vendor version runs, with the warning `vendor_version_untested` if it
   is not in the checked set, unless a handshake check fails. **Exception:**
   OpenCode runs only 2.0.x (untested patches with the warning); any other

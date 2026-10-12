@@ -197,9 +197,9 @@ fn codex_catalog_survives_retirement_and_restart() {
         return;
     };
     let case = codex_case(&root, NAME, echo_copy(C1_PROMPT));
-    let listed = |daemon: &Daemon| {
+    let listed = async |daemon: &Daemon| {
         let params = serde_json::from_value(json!({"harness":"codex"})).unwrap();
-        let models = daemon.engine.models(&params);
+        let models = daemon.engine.models(&params).await;
         assert_eq!(models["models"].as_array().unwrap().len(), 3, "{models}");
         let params = serde_json::from_value(json!({"model":"gpt-6-luna"})).unwrap();
         let described = daemon.engine.describe(&params).unwrap();
@@ -210,12 +210,12 @@ fn codex_catalog_survives_retirement_and_restart() {
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
         c1_turn(&daemon, &case, 1).await;
-        listed(&daemon);
+        listed(&daemon).await;
         daemon.stop().await;
     });
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
-        listed(&daemon);
+        listed(&daemon).await;
         daemon.shutdown().await;
     });
 }
@@ -270,9 +270,9 @@ fn codex_catalog_replaces_only_after_complete_discovery() {
     let replay = json!({"source":NAME,"lifetimes":[full, partial, replacement]});
     let case = codex_case(&root, NAME, replay);
     let original = ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"];
-    let listed = |daemon: &Daemon, expected: &[&str], version: &str| {
+    let listed = async |daemon: &Daemon, expected: &[&str], version: &str| {
         let params = serde_json::from_value(json!({"harness":"codex"})).unwrap();
-        let models = daemon.engine.models(&params);
+        let models = daemon.engine.models(&params).await;
         let names: Vec<_> = models["models"]
             .as_array()
             .unwrap()
@@ -288,28 +288,28 @@ fn codex_catalog_replaces_only_after_complete_discovery() {
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
         c1_turn(&daemon, &case, 1).await;
-        listed(&daemon, &original, "0.159.2");
+        listed(&daemon, &original, "0.159.2").await;
         daemon.stop().await;
     });
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
-        listed(&daemon, &original, "0.159.2");
+        listed(&daemon, &original, "0.159.2").await;
         let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
         let failed = daemon.wait(&session, 1).await;
         assert_eq!(class(&failed), "protocol", "{failed}");
-        listed(&daemon, &original, "0.159.2");
+        listed(&daemon, &original, "0.159.2").await;
         daemon.stop().await;
     });
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
-        listed(&daemon, &original, "0.159.2");
+        listed(&daemon, &original, "0.159.2").await;
         c1_turn(&daemon, &case, 3).await;
-        listed(&daemon, &["gpt-6-luna"], "0.160.0");
+        listed(&daemon, &["gpt-6-luna"], "0.160.0").await;
         daemon.stop().await;
     });
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
-        listed(&daemon, &["gpt-6-luna"], "0.160.0");
+        listed(&daemon, &["gpt-6-luna"], "0.160.0").await;
         let params = serde_json::from_value(json!({"model":"gpt-6-luna"})).unwrap();
         assert_eq!(
             daemon.engine.describe(&params).unwrap()["vendor_version"],

@@ -312,6 +312,7 @@ fn spawn_daemon(paths: &Paths) -> anyhow::Result<Starting> {
         "VIA_FAILPOINT_DIR",
         "VIA_FAILPOINT_TOKEN",
         "VIA_TEST_HARNESS_PROCESSES",
+        "VIA_TEST_MODELS_DISCOVERY_MS",
         "VIA_TEST_IDLE_EXIT_MS",
         "VIA_TEST_CLIENT_VERSION",
         "VIA_TEST_PARTIAL_LINE_MS",

@@ -166,9 +166,11 @@ impl Engine {
         params.describe(&self.adapter)
     }
 
-    /// `models` (Task 4 design §4.6): each configured harness's catalog.
-    pub fn models(&self, params: &ModelsParams) -> Value {
-        params.models(&self.adapter)
+    /// `models` (Task 4 design §4.6; C1 §3.13): each configured harness's
+    /// catalog, discovered on demand with the daemon's harness-process
+    /// slots; nothing is written to the Store.
+    pub async fn models(&self, params: &ModelsParams) -> Value {
+        params.models(&self.adapter, &self.slots).await
     }
 
     /// `daemon/status.servers` (C1 §3.14, C2 §2 `servers`): the adapters'

@@ -629,7 +629,31 @@ not read or decode them; the caller reads the files. There is no paging.
 
 ### 3.13 `models`; 3.14 `daemon/status`, `daemon/stop`
 
-`via models [--harness H]` → `{models: [{model, harness, aliases, source}]}`.
+`via models [--harness H]` → `{models: [{model, harness, aliases, source}],
+harnesses: [{harness, status, message?}]}`. `source` is `bundled` or
+`discovered`. Where no catalog is known, `models` discovers one on demand
+(owner 2026-10-12): Codex from VIA's own `codex app-server` (`model/list`),
+OpenCode from VIA's own OpenCode server (its handshake catalog), Pi from one
+private `pi --mode rpc` process asked only `get_available_models`. Claude
+Code has no listing: its bundled aliases are listed, and any full Claude
+model ID passes through. A Codex catalog already known (a live server's, or
+the snapshot of its last complete discovery, kept across restarts) is listed
+without a launch. Harnesses are discovered concurrently, each within 20 s.
+Each process started for discovery holds a harness-process slot. Pi's
+probe is closed before the reply. A Codex or OpenCode server started for
+the call is released with the reply and retires at once (stdin closed, then
+Host's close within 5 s) unless a session took it meanwhile; one still in
+its handshake at the 20 s bound is retired by its registry when that
+handshake ends, within the route's own handshake bound. `--harness H` discovers only H; a name
+no adapter serves lists nothing.
+
+`harnesses` holds one entry per harness listed, in `models` order. `status`
+is `ok`, `unavailable` (the harness's binary was not found when the daemon
+started; no entries) or `error` (discovery failed or timed out; Pi lists
+its bundled catalog, the others none).
+`message` is VIA's text: why, on `unavailable` and `error`; a note on
+Claude's `ok`. A failed harness never fails the call. `harnesses` was added
+2026-10-12; the `models` entries are unchanged.
 `via daemon status` → `{daemon_version, pid, started_at, sessions: {idle,
 active, closing}, servers: [{harness, vendor_version, key, sessions}],
 socket_path, store_path, health, store_failure, harness_processes, limits,

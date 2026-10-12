@@ -161,6 +161,9 @@ impl AdapterSet {
     /// Pure: validates a resume turn's values against the frozen route.
     pub fn check_turn(&self, session: &SessionRef, turn: &TurnParams) -> Result<TurnCheck, Refusal>;
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry>;              // bundled + discovered
+    /// C1 `models` (owner 2026-10-12): `models`, plus each harness's outcome, discovering a
+    /// catalog where none is known with Core's slot pool, by Core's one absolute deadline.
+    pub async fn discover_models(&self, harness: Option<&str>, limits: (&Arc<Semaphore>, Deadline)) -> ModelsReport;
     /// Pure, in-memory: the live shared servers for C1 `daemon/status.servers`; empty for per-turn routes.
     pub fn servers(&self) -> Vec<ServerReport>;
     /// Sticky: some Host journal write's outcome was uncertain, including writes no driver owns.
@@ -807,6 +810,15 @@ fake agent reports no version".
   step (`vendors/opencode.md` §5).
 
 `plan`, `check_turn` and `models` are process-free and write nothing.
+`discover_models` is the one listing that may start processes (owner
+2026-10-12; C1 §3.13): where a harness's catalog is not known it starts VIA's
+own server or probe process, each holding a harness-process slot from Core's
+pool, through the route's ordinary launch: Codex's and OpenCode's registries
+(`launch_or_join`, released after the handshake's catalog was read, so the
+server retires as its last holder) and Pi's private probe (one
+`get_available_models`, closed before it returns). It feeds the Codex
+discovered catalog and saved snapshot exactly as a turn's handshake does;
+every other harness's result is reported, not retained.
 `check_turn` reads only bundled data and live instance catalogs. Codex also
 loads its last complete public catalog and vendor version at adapter bootstrap
 from adapter-private state (via-3fc; `vendors/codex.md` §3); `models` and model

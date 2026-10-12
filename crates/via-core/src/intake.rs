@@ -626,10 +626,39 @@ impl DescribeParams {
     }
 }
 
+/// How long `models` waits for any one harness's discovery (C1 §3.13,
+/// owner 2026-10-12): every harness is discovered concurrently under one
+/// absolute deadline this far ahead, well inside the client's 30 s read.
+const DISCOVERY_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// [`DISCOVERY_BOUND`]. Test builds only: `VIA_TEST_MODELS_DISCOVERY_MS`
+/// lowers it.
+fn discovery_bound() -> std::time::Duration {
+    #[cfg(feature = "test-failpoints")]
+    if let Some(lowered) = std::env::var("VIA_TEST_MODELS_DISCOVERY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(lowered);
+    }
+    DISCOVERY_BOUND
+}
+
 impl ModelsParams {
-    /// `models` (C1 §3.13): each configured harness's catalog, or one's.
-    pub(crate) fn models(&self, adapter: &AdapterSet) -> Value {
-        json!({ "models": adapter.models(self.harness.as_deref()) })
+    /// `models` (C1 §3.13): each configured harness's catalog, or one's,
+    /// discovered where no live catalog is known, with harness-process
+    /// slots from `slots`; `harnesses` reports each one's outcome.
+    pub(crate) async fn models(
+        &self,
+        adapter: &AdapterSet,
+        slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Value {
+        let deadline = via_adapters::Deadline::at(tokio::time::Instant::now() + discovery_bound());
+        // Boxed: four concurrent discoveries make a large future, which
+        // would otherwise sit inline in every client connection's.
+        let report =
+            Box::pin(adapter.discover_models(self.harness.as_deref(), (slots, deadline))).await;
+        json!({ "models": report.models, "harnesses": report.harnesses })
     }
 }
 
