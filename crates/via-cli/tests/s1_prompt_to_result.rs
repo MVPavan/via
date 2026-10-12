@@ -331,7 +331,7 @@ fn piped_output_is_json(
         &["events", session],
         &["logs", &turn],
         &["list"],
-        &["models"],
+        &["models", "--harness", "fake"],
         &["describe", "--harness", "fake", "--model", "fake"],
         &["events", session, "--types", "turn.ended"],
     ];
