@@ -315,6 +315,67 @@ fn expect_request_error(
     Ok(())
 }
 
+/// With stdout and stderr not a terminal, every read verb prints exactly
+/// what it prints with `--json`: one compact JSON line, so scripts keep
+/// working without the flag. A request error on stderr is the same too.
+fn piped_output_is_json(
+    cx: &Context<'_>,
+    evidence: &Evidence,
+    session: &str,
+) -> Result<(), ScenarioError> {
+    let turn = format!("{session}/1");
+    let verbs: [&[&str]; 9] = [
+        &["wait", session],
+        &["result", &turn],
+        &["status", session],
+        &["events", session],
+        &["logs", &turn],
+        &["list"],
+        &["models"],
+        &["describe", "--harness", "fake", "--model", "fake"],
+        &["events", session, "--types", "turn.ended"],
+    ];
+    for (index, args) in verbs.iter().enumerate() {
+        let name = format!("piped-{index}");
+        let plain = cli(cx, evidence, &name, args, Duration::from_secs(5))?;
+        let mut with_json = args.to_vec();
+        with_json.push("--json");
+        let forced = cli(
+            cx,
+            evidence,
+            &format!("{name}-json"),
+            &with_json,
+            Duration::from_secs(5),
+        )?;
+        let value: Value = serde_json::from_slice(&plain).map_err(infra)?;
+        let compact = format!("{value}\n").into_bytes();
+        if plain != forced || plain != compact {
+            return Err(ScenarioError::Failure(format!(
+                "via {args:?} piped is not the --json line: {} vs {}",
+                String::from_utf8_lossy(&plain),
+                String::from_utf8_lossy(&forced)
+            )));
+        }
+    }
+    let missing = ["result", "s_000000000000/1"];
+    let plain = cx.run(&missing, Duration::from_secs(5)).map_err(infra)?;
+    let forced = cx
+        .run(&[missing[0], missing[1], "--json"], Duration::from_secs(5))
+        .map_err(infra)?;
+    let error: Value = serde_json::from_slice(&plain.stderr).map_err(infra)?;
+    if plain.status.code() != Some(2)
+        || plain.stderr != forced.stderr
+        || plain.stderr != format!("{error}\n").into_bytes()
+        || !plain.stdout.is_empty()
+    {
+        return Err(ScenarioError::Failure(format!(
+            "a piped request error is not the --json line: {}",
+            String::from_utf8_lossy(&plain.stderr)
+        )));
+    }
+    Ok(())
+}
+
 /// F16: the plaintext handle appears in no terminal envelope, the daemon's
 /// log, the Store or any file of the turns' evidence folders.
 fn scan_for_handle(evidence: &Evidence, handle: &str) -> Result<(), ScenarioError> {
@@ -471,6 +532,7 @@ fn s1_prompt_to_result_real_cli() -> TestResult {
                 Duration::from_secs(5),
             )?;
             evidence.write("logs.ndjson", &logs).map_err(infra)?;
+            piped_output_is_json(&cx, evidence, &session)?;
             Ok(())
         },
         |evidence| {
