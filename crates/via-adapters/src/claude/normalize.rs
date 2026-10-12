@@ -618,8 +618,8 @@ impl Normalizer {
     /// Packet §5 and §7 terminal mapping, on qualified combinations of
     /// `is_error`, `subtype`, `terminal_reason`, `api_error_status` and
     /// the synthetic error code (review r1 #6, r2 #4), in this order: success;
-    /// the acknowledged abort; authentication evidence; the max-turns
-    /// pair; any other vendor error. The vendor code is always one the
+    /// the acknowledged abort; authentication evidence; rate-limit
+    /// evidence; the max-turns pair; any other vendor error. The vendor code is always one the
     /// vendor sent. The retained payload is bounded (review r1 #3).
     fn terminal(
         &mut self,
@@ -658,6 +658,16 @@ impl Normalizer {
                 VendorTerminalStatus::Failed,
                 StopReason::Error,
                 Some(ClassHint::Auth),
+                Some(code),
+            )
+        } else if self.synthetic_error.as_deref() == Some("rate_limit")
+            || result.api_error_status == Some(429)
+        {
+            // Live 2026-10-12: an account usage limit (C1 §8.2 `rate_limit`).
+            (
+                VendorTerminalStatus::Failed,
+                StopReason::Error,
+                Some(ClassHint::RateLimit),
                 Some(code),
             )
         } else if result.subtype == "error_max_turns" && reason == Some("max_turns") {

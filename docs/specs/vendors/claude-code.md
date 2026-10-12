@@ -535,7 +535,9 @@ the qualified receipt plus `error_during_execution/aborted_tools` → Interrupte
 Classify on `is_error`, `terminal_reason`, `api_error_status` and the
 synthetic `error` code, never on `subtype` (a `success` subtype can carry
 `is_error:true`): `authentication_failed` or HTTP 401/403 → Failed `auth`;
-`model_not_found` → Failed `vendor_error` with that `vendor_code`. An
+synthetic `rate_limit` or HTTP 429 → Failed `rate_limit` (an account usage
+limit, live 2.1.296); `model_not_found` → Failed `vendor_error` with that
+`vendor_code`. An
 explicit model refusal (`is_error:true` with `stop_reason:"refusal"`, after
 `system/model_refusal_no_fallback` and a synthetic message with
 `stop_details.type:"refusal"`; live probe sC, 2.1.289) → Failed
