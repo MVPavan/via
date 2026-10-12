@@ -404,15 +404,21 @@ async fn run_probe(program: &Path, probe: &ProbeConfig) -> Result<(), FenceRefus
         }));
     }
     let trimmed = output.trim_ascii();
-    if probe
-        .admitted
-        .iter()
-        .any(|admitted| admitted.as_bytes() == trimmed)
-    {
+    if admits(&probe.admitted, trimmed) {
         return Ok(());
     }
     Err(FenceRefusal::ProbeRefused {
         output: printable(trimmed),
+    })
+}
+
+/// Whether `trimmed` is an admitted prefix followed by one or more ASCII
+/// digits (`opencode v2.0.` admits `opencode v2.0.26`).
+fn admits(admitted: &[String], trimmed: &[u8]) -> bool {
+    admitted.iter().any(|prefix| {
+        trimmed
+            .strip_prefix(prefix.as_bytes())
+            .is_some_and(|rest| !rest.is_empty() && rest.iter().all(u8::is_ascii_digit))
     })
 }
 
@@ -914,5 +920,27 @@ mod tests {
     fn printable_output_replaces_other_bytes() {
         assert_eq!(printable(b"opencode v2.0.23"), "opencode v2.0.23");
         assert_eq!(printable(b"a\tb\x1b[0m\xff"), "a?b?[0m?");
+    }
+
+    #[test]
+    fn a_prefix_followed_by_digits_is_admitted() {
+        let admitted = ["opencode v2.0.".to_owned()];
+        for line in [
+            &b"opencode v2.0.22"[..],
+            b"opencode v2.0.26",
+            b"opencode v2.0.0",
+        ] {
+            assert!(admits(&admitted, line), "{}", printable(line));
+        }
+        for line in [
+            &b"opencode v2.1.0"[..],
+            b"opencode v2.0.",
+            b"opencode v2.0.26-beta",
+            b"opencode v2.0.2.6",
+            b"opencode v1.0.22",
+            b"",
+        ] {
+            assert!(!admits(&admitted, line), "{}", printable(line));
+        }
     }
 }

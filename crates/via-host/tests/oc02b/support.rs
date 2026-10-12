@@ -94,7 +94,7 @@ impl Fixture {
     }
 
     /// [`Self::spec`] with a version check printing `version_args`'s
-    /// outcome and admitting `opencode v2.0.22`.
+    /// outcome and admitting the `opencode v2.0.` series.
     pub(crate) fn probed_spec(&self, args: &[&str], version_args: &[&str]) -> PrivateProcessSpec {
         let mut spec = self.spec(args);
         spec.version_probe = Some(VersionProbe {
@@ -104,7 +104,7 @@ impl Fixture {
                 .collect(),
             cwd: self.root.join("probe"),
             env: EnvAllowList::default(),
-            admitted: vec!["opencode v2.0.22".into()],
+            admitted: vec!["opencode v2.0.".into()],
         });
         spec
     }

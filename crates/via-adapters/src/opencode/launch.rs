@@ -233,7 +233,8 @@ impl ServerRecipe {
                 env: list(self.probe_env()),
                 admitted: checked
                     .iter()
-                    .map(|version| format!("opencode v{version}"))
+                    .filter_map(|version| via_routes::opencode::series(version))
+                    .map(|series| format!("opencode v{series}."))
                     .collect(),
             }),
             stderr: StderrCapture::CountOnly,

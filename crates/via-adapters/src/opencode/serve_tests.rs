@@ -689,28 +689,29 @@ async fn oc01_incompatible_handshakes_are_refused() {
     rig.finish().await;
 }
 
-/// OC01: a fully compatible server reporting 2.0.23 is refused naming the
-/// version and the checked set; it was retired before publication and
-/// only `/api/info` was read; a 2.0.22 server then admits at once.
+/// OC01: a fully compatible server reporting 2.1.0, outside the checked
+/// 2.0.x series, is refused naming the version and the checked set; it was
+/// retired before publication and only `/api/info` was read; a 2.0.22
+/// server then admits at once.
 #[tokio::test]
 async fn oc01_unchecked_version_is_refused_before_publication() {
     let fixture = with_route(
         compatible(),
         get(
             "/api/info",
-            &json!([{"status": 200, "json": {"version": "2.0.23", "pid": "$PID"}}]),
+            &json!([{"status": 200, "json": {"version": "2.1.0", "pid": "$PID"}}]),
         ),
     );
     let rig = Rig::new(&with(fixture, "stderr", json!(STDERR_SECRET)));
     let error = rig.refused().await;
     let refusal = Refusal::Unchecked {
-        version: "2.0.23".to_owned(),
+        version: "2.1.0".to_owned(),
         checked: CHECKED,
     };
     assert_eq!(error.failure, LaunchFailure::Refused(refusal.clone()));
-    assert_eq!(error.version.as_deref(), Some("2.0.23"));
+    assert_eq!(error.version.as_deref(), Some("2.1.0"));
     let text = refusal.to_string();
-    assert!(text.contains("2.0.23") && text.contains("2.0.22"), "{text}");
+    assert!(text.contains("2.1.0") && text.contains("2.0.22"), "{text}");
     assert_eq!(
         cause(&error),
         RouteError::HandshakeRefused {
@@ -906,6 +907,32 @@ async fn oc01_empty_catalog_ends_at_the_deadline() {
     rig.finish().await;
 }
 
+/// OC01 (§12, owner 2026-10-10): an unchecked patch of the checked series
+/// runs: the version check printing `opencode v2.0.26` and `/api/info`
+/// reporting 2.0.26 admit, the server's facts and report naming 2.0.26.
+#[tokio::test]
+async fn oc01_an_untested_patch_of_the_checked_series_admits() {
+    let fixture = with_route(
+        with(
+            compatible(),
+            "version",
+            json!({"output": "opencode v2.0.26"}),
+        ),
+        get(
+            "/api/info",
+            &json!([{"status": 200, "json": {"version": "2.0.26", "pid": "$PID"}}]),
+        ),
+    );
+    let rig = Rig::new(&fixture);
+    let pin = rig.launch().await.expect("2.0.26 admits");
+    assert_eq!(pin.live().unwrap().1.version, "2.0.26");
+    let reports = rig.servers.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].version, "2.0.26");
+    drop(pin);
+    rig.finish().await;
+}
+
 /// OC01: the best-effort version check: output outside the checked set is
 /// `handshake_refused` with nothing launched, no lock and no file in the
 /// namespace; a check that fails, hangs or overflows is transient; a
@@ -915,16 +942,16 @@ async fn oc01_version_check_refuses_before_launch() {
     let rig = Rig::new(&with(
         compatible(),
         "version",
-        json!({"output": "opencode v2.0.23"}),
+        json!({"output": "opencode v2.1.0"}),
     ));
     let error = rig.refused().await;
     let refusal = Refusal::VersionCheck {
-        output: "opencode v2.0.23".to_owned(),
+        output: "opencode v2.1.0".to_owned(),
         checked: CHECKED,
     };
     let detail = refusal.to_string();
     assert!(
-        detail.contains("opencode v2.0.23") && detail.contains("2.0.22"),
+        detail.contains("opencode v2.1.0") && detail.contains("2.0.22"),
         "{detail}"
     );
     assert_eq!(error.failure, LaunchFailure::Refused(refusal));

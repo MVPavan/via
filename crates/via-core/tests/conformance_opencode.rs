@@ -749,8 +749,8 @@ fn oc11_refusals_before_any_receipt() {
 }
 
 /// OC01 (§2.2, §12) at the turn: a fully compatible server reporting
-/// `2.0.23` fails the turn `submit_failed`/`handshake_refused`, its message
-/// naming the version and the checked set; nothing is created or
+/// `2.1.0` fails the turn `submit_failed`/`handshake_refused`, its message
+/// naming the version and the checked set (§12: outside the 2.0.x series); nothing is created or
 /// submitted only after setup. The refusal is cached by binary identity: the next spawn,
 /// `allow_untested` or not, is refused at its plan, before any start; the
 /// same path replaced by a 2.0.22 program is admitted at once.
@@ -763,7 +763,7 @@ fn oc01_an_unchecked_version_is_refused_and_cached_by_binary() {
         route(
             "GET",
             "/api/info",
-            json!([{"status": 200, "json": {"version": "2.0.23", "pid": "$PID"}}]),
+            json!([{"status": 200, "json": {"version": "2.1.0", "pid": "$PID"}}]),
         ),
     );
     case.fixture(&unchecked);
@@ -779,7 +779,7 @@ fn oc01_an_unchecked_version_is_refused_and_cached_by_binary() {
         );
         let message = envelope["failure"]["message"].as_str().unwrap();
         assert!(
-            message.contains("2.0.23") && message.contains("2.0.22"),
+            message.contains("2.1.0") && message.contains("2.0.22"),
             "{message}"
         );
         assert!(case.creates().is_empty());
@@ -797,6 +797,45 @@ fn oc01_an_unchecked_version_is_refused_and_cached_by_binary() {
         let (admitted, _) = daemon.spawn(&cwd, &json!({})).await;
         setup_succeeded(&daemon.wait(&admitted, 1).await);
         assert_eq!(case.creates().len(), 1);
+        daemon.stop().await;
+    });
+    run(case.all_gone());
+}
+
+/// OC01 (§12, owner 2026-10-10): an untested patch of the checked 2.0.x
+/// series runs: a fake reporting 2.0.26 at the version check and at
+/// `/api/info` sets up the turn, which reports `untested` with
+/// `vendor_version_untested`, as does the session's status.
+#[test]
+fn oc01_an_untested_patch_runs_with_a_warning() {
+    let case = Case::new(&json!({}));
+    let cwd = case.cwd("a");
+    let mut fixture = with_route(
+        server(&cwd, None),
+        route(
+            "GET",
+            "/api/info",
+            json!([{"status": 200, "json": {"version": "2.0.26", "pid": "$PID"}}]),
+        ),
+    );
+    fixture["version"] = json!({"output": "opencode v2.0.26"});
+    case.fixture(&fixture);
+    run(async {
+        let daemon = case.daemon();
+        let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        setup_succeeded(&envelope);
+        assert_eq!(envelope["vendor_version"], "2.0.26", "{envelope}");
+        let untested = |value: &Value| {
+            value["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "vendor_version_untested")
+        };
+        assert!(untested(&envelope), "{envelope}");
+        let status = daemon.status(&session).await;
+        assert_eq!(status["version_status"], "untested", "{status}");
         daemon.stop().await;
     });
     run(case.all_gone());

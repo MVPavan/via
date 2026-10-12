@@ -27,8 +27,9 @@ gone before ARM. The
 `"opencode:<namespace>:<generation>"` `owner_server` label is withdrawn
 (it did not fit `ServerId`; this supersedes decision C-1 of
 `scratchpad/execution/c2-gap/report.md`), and no Store schema change is
-needed. Only checked versions run, refused at the handshake otherwise
-(§12). `vendor_args` stays refused (§2.2). Changed:
+needed. Only patches of a checked version's series (2.0.x) run, refused
+at the handshake otherwise (§12; owner, 2026-10-10, superseding the
+checked-only rule). `vendor_args` stays refused (§2.2). Changed:
 §§2.2, 2.3, 3, 4.1–4.5, 5, 6, 7.1, 7.3, 8, 9, 10, 11, 12, 13 (OC01, OC02,
 OC02b, OC04, OC07, OC09, OC10, OC11, OC12b, L4, L5, L9, L11, L14), 14 and
 15. Revisit items after the release are in §14. Critical review round 3
@@ -92,7 +93,7 @@ rejected: tools would inherit the password.
 | Launch | Host's anchor starts `<resolved program> serve --stdio --hostname 127.0.0.1 --port 0` as a process that dies with its anchor (§3.2; runtime §5, `die_with_anchor`), cwd = the namespace directory (§3.2), environment exactly §4.1, stdin a pipe VIA holds open and never writes, stdout a pipe, stderr drained and counted only, never persisted (§4.3; runtime §4) | E2, E3 |
 | URL handoff | The first stdout line, at most 4 KiB, must be a JSON object whose `url` is `http://127.0.0.1:<1–65535>` with no path, credentials or query. Later stdout bytes are read, counted and discarded | E4 |
 | Authentication | HTTP Basic `opencode:<password>` to that exact origin only; no proxies, no redirects, no unauthenticated fallback | E5 |
-| Identity and version | `GET /api/info` must be 200 JSON with string `version` and integer `pid`; `pid` must equal the vendor child pid in Host's `Spawned` report, which Host passes up as passive data (runtime §5 `AcquiredProcess.vendor_pid`, through Wire to the route); `version` must be in `checked` (§12), else the server is refused before publication (owner, 2026-10-06) | E5 |
+| Identity and version | `GET /api/info` must be 200 JSON with string `version` and integer `pid`; `pid` must equal the vendor child pid in Host's `Spawned` report, which Host passes up as passive data (runtime §5 `AcquiredProcess.vendor_pid`, through Wire to the route); `version` must be a patch of a checked version's series, 2.0.x (§12), else the server is refused before publication (owner, 2026-10-10) | E5 |
 | Credential state | §4.3 | E41 |
 | Catalog | `GET /api/model` (no location) repeated 200 ms apart until non-empty, decoded through §4.3's allow-list; cached per server generation with the version for `models`; effort is checked in `run_turn` against a fresh per-location fetch instead (§5) | E10 |
 | Events | `GET /api/event` (SSE) opened; `server.connected` received before the server is published | E18 |
@@ -112,14 +113,15 @@ private `HOME`, XDG directories and `TMPDIR`,
 `OPENCODE_DISABLE_AUTOUPDATE=1` and no password (`--version` writes a log
 and creates XDG directories, E58); stdin `/dev/null`, stdout kept up to
 256 bytes, stderr discarded, killed and waited for at 2 s. Exit 0 with a
-trimmed output of `opencode v<v>` for a `v` in `checked` admits; exit 0
-with any other output is `handshake_refused`, cached by binary identity
-and naming the output and the checked set, with nothing launched. A
+trimmed output of `opencode v<series>.<digits>` for the series of a
+version in `checked` (`opencode v2.0.26` for 2.0.x) admits; exit 0 with any
+other output is `handshake_refused`, cached by binary identity and naming
+the output, the accepted range and the checked set, with nothing launched. A
 non-zero exit, a timeout, output over the cap or a failure to run it is a
 transient startup failure, not cached. The handshake's `/api/info.version`
 check stays authoritative. An in-place overwrite of the binary, or an
 atomic replacement of its path, between this check and the server's exec
-can still let an unchecked version start,
+can still let a version outside the range start,
 during an upgrade race only; that is accepted, because the check guards
 data compatibility, not the fence.
 
@@ -155,10 +157,10 @@ destination, every operand, and `--`.
   turn fails through C2's server-acquisition failure path; nothing is
   cached.
 - **Incompatible handshake**: a version check whose output is outside
-  `checked` (above, nothing launched); a first stdout line that is not JSON, is
+  the accepted range (above, nothing launched); a first stdout line that is not JSON, is
   over 4 KiB, or is JSON of the wrong shape or with a non-loopback URL;
   `/api/info` 200 with HTML, non-JSON or missing `version` or `pid`; an
-  `/api/info.version` outside `checked` (§12), even when every other check
+  `/api/info.version` outside the accepted range (§12), even when every other check
   passes; a first SSE event other than `server.connected`; or a required
   endpoint answering 404. These are server-level `handshake_refused` (C2
   §5): nothing is launched (version check) or the server is retired
@@ -167,8 +169,8 @@ destination, every operand, and `--`.
   `failure.data.reason:"handshake_refused"`. The refusal is cached under C2
   §5's key: program path and file identity (device, inode, size, mtime,
   ctime) plus the recipe hash, 10 minutes, so a binary replaced at the same
-  path retries at once. An unchecked version's message names the version
-  found and the `checked` set. A readback that differs from a value VIA has
+  path retries at once. A refused version's message names the version
+  found, the accepted range and the `checked` set. A readback that differs from a value VIA has
   just sent is a session-level refusal with its own key (§5).
 
 ### 2.3 Password
@@ -560,8 +562,8 @@ secret values (doc, E41). Stored credentials live in the namespace database
   - Known shape, no connection: proceed.
   - Unknown shape: skip the check, proceed, and add the warning
     `credential_state_unchecked` to every turn on that server generation.
-    Only checked versions run (§12), so this needs a checked version's
-    response to differ from its known shape.
+    Only 2.0.x runs (§12), so this needs a 2.0.x version's response to
+    differ from its known shape.
 - Keep no state file.
 
 **Project provider configuration (owner, 2026-10-06).** A session
@@ -1121,32 +1123,41 @@ unavailable, not zero.
 A bad model is accepted at creation and fails after acceptance (E33).
 `session.retry.scheduled` is activity, never authority to resubmit.
 
-**Version (owner, 2026-10-06; an exception to C2 §5's OD1 rule).**
-`/api/info.version` is reported, and OpenCode runs **only** versions in
-`checked = {"2.0.22"}`: versions that passed every gate (L4, L5, L11,
-L14). Any other version is refused at the handshake before the server is
-published (§2.2): `handshake_refused`, cached by binary identity, with a
-message naming the version and the checked set, and the server is retired
-through Host. Claude, Codex and Pi run untested versions with a warning;
-OpenCode does not, because one server carries every OpenCode session and
-an unqualified version's protocol and behaviour (event routing, the
-execution rule, permission and secrecy behaviour, dying with its anchor)
-are not qualified, and a handshake cannot show them. `allow_untested`
-does not waive it. `describe` starts no process and reports the last
-version seen, `refused` when it is outside `checked`.
+**Version (owner, 2026-10-10; supersedes the 2026-10-06 checked-only
+rule).** `/api/info.version` is reported. `checked = {"2.0.22"}` holds the
+versions that passed every gate (L4, L5, L11, L14); they report `tested`.
+Any other patch of a checked version's series (2.0.x: a version whose text
+after its last `.` is digits and whose text before it is a checked
+version's) runs as `untested` with C2 §5's `vendor_version_untested`
+warning, as Claude, Codex and Pi do. Any other version (2.1.0, 3.x, 1.x,
+or a malformed one such as `2.0.26-beta`) is refused at the handshake
+before the server is published (§2.2): `handshake_refused`, cached by
+binary identity, with a message naming the version, the accepted range
+(`2.0.x`) and the checked set, and the server is retired through Host.
+The range is narrower than OD1's because one server carries every
+OpenCode session, and another minor's protocol and behaviour (event
+routing, the execution rule, permission and secrecy behaviour, dying with
+its anchor) are not qualified, and a handshake cannot show them.
+`allow_untested` does not waive the refusal. The pre-launch version check
+(§2.2) and the `/api/info.version` check apply the same rule. `describe`
+starts no process and reports the last version seen: `tested` for a
+checked version, `untested` for another 2.0.x patch or none seen,
+`refused` outside the range.
 
-Limitation: an unchecked version could migrate VIA's private database to
-its own schema, and a checked version restored later (the natural
-workaround for a refusal) would then meet that schema. The best-effort
-version check (§2.2) refuses an unchecked binary before the data root is
-touched; the residue is an in-place overwrite or an atomic replacement of
-the binary's path between that check and the server's exec (an upgrade
-race), or a binary whose
-`--version` disagrees with its server, after which the unchecked server
-runs until its handshake refusal. That residue is accepted (coordinator,
-critical review round 4). The fence holds throughout (the lock is the
-anchor's, and the server dies with it or, past §3.2's limits, is fenced
-by the record).
+Limitation: a version outside the range, or an untested 2.0.x patch, could
+migrate VIA's private database to its own schema, and a checked version
+restored later (the natural workaround for a refusal or odd behaviour)
+would then meet that schema. Untested patches run by the owner's decision,
+so that risk is accepted for them. For other minors, the best-effort
+version check (§2.2) refuses the binary before the data root is touched;
+the residue is an in-place overwrite or an atomic replacement of the
+binary's path between that check and the server's exec (an upgrade race),
+or a binary whose `--version` disagrees with its server, after which the
+refused server runs until its handshake refusal. That residue is accepted
+(coordinator, critical review round 4). The fence holds throughout (the
+lock is the anchor's, and the server dies with it or, past §3.2's limits,
+is fenced by the record). Revisit when an untested patch is observed to
+break the database or the protocol.
 
 **Declared capability** after its tests pass:
 
@@ -1159,7 +1170,7 @@ by the record).
 | Recover | unsupported (P12) |
 | Instructions | native session instruction entry, at most 262,144 encoded bytes |
 | Effort | native only for a variant of the model in the session location's catalog, checked in `run_turn` (§5) |
-| Version | only versions in `checked` run; any other is refused at the handshake (`handshake_refused`) before publication |
+| Version | `checked` (2.0.22) is `tested`; other 2.0.x patches run `untested` with `vendor_version_untested`; any other version is refused at the handshake (`handshake_refused`) before publication |
 | Output schema | unsupported |
 | Max steps | `params.max_steps:{support:"unsupported",reason:"No per-turn step limit on opencode-serve 2.0.22"}`; non-null refused by Core preflight before server acquisition or vendor I/O |
 | Bound | `full` with `network:true` only; nonempty `extra_write_dirs` → `invalid_params` |

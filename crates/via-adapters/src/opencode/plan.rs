@@ -121,11 +121,14 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     ])
 }
 
-/// `tested` for a checked version, `refused` for any other seen, else
-/// `untested` (§12).
+/// `tested` for a checked version, `untested` for another patch of its
+/// series or none seen, `refused` for any other (§12).
 pub(crate) fn version_status(version: Option<&str>) -> VersionStatus {
     match version {
         Some(version) if CHECKED.contains(&version) => VersionStatus::Tested,
+        Some(version) if via_routes::opencode::accepted(CHECKED, version) => {
+            VersionStatus::Untested
+        }
         Some(_) => VersionStatus::Refused,
         None => VersionStatus::Untested,
     }

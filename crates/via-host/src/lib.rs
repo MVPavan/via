@@ -134,7 +134,8 @@ pub struct VersionProbe {
     pub cwd: PathBuf,
     /// The probe's explicit environment.
     pub env: EnvAllowList,
-    /// The exact trimmed stdout lines that admit the program.
+    /// The prefixes that admit the program: its trimmed stdout is one of
+    /// them followed by one or more ASCII digits (a version series).
     pub admitted: Vec<String>,
 }
 
@@ -167,7 +168,7 @@ pub enum FenceRefusal {
         /// The operating-system error number, when there was one.
         errno: Option<i32>,
     },
-    /// The version check ran and exited 0 with output outside `admitted`
+    /// The version check ran and exited 0 with output `admitted` refuses
     /// (printable ASCII only; other bytes are `?`).
     ProbeRefused {
         /// The trimmed output.

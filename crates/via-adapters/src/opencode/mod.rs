@@ -58,7 +58,7 @@ pub(crate) const HARNESS: &str = "opencode";
 /// The adapter version, part of the launch key (§3.1).
 pub(crate) const ADAPTER_VERSION: &str = "1";
 
-/// The versions that run (§12).
+/// The `tested` versions; any patch of their series runs (§12).
 pub(crate) const CHECKED: &[&str] = &["2.0.22"];
 
 /// The adapter version a session's turns record (AD12).

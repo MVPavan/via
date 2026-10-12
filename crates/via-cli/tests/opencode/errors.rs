@@ -52,7 +52,7 @@ fn oc01_daemon_version_probe_refusal_is_bounded_and_cached() -> TestResult {
     let case = Case::new()?;
     let cwd = case.cwd("a");
     let mut fixture = fixtures::server(&cwd);
-    fixture["version"] = json!({"output":"opencode v2.0.23"});
+    fixture["version"] = json!({"output":"opencode v2.1.0"});
     case.fixture(&fixture)?;
     case.scenario(
         "oc01_daemon_version_probe_refusal",
@@ -62,7 +62,7 @@ fn oc01_daemon_version_probe_refusal_is_bounded_and_cached() -> TestResult {
             let envelope = wait_turn(raw, &session, 1)?;
             failed(&envelope, "handshake_refused")?;
             check(
-                message(&envelope).contains("2.0.23") && message(&envelope).contains("2.0.22"),
+                message(&envelope).contains("2.1.0") && message(&envelope).contains("2.0.22"),
                 "Version refusal omitted the found version or checked set",
             )?;
             check(
@@ -107,7 +107,7 @@ fn oc01_daemon_info_refusal_names_found_version_and_checked_set() -> TestResult 
         fixtures::route(
             "GET",
             "/api/info",
-            json!([{"status":200,"json":{"version":"2.0.23","pid":"$PID"}}]),
+            json!([{"status":200,"json":{"version":"2.1.0","pid":"$PID"}}]),
         ),
     ))?;
     case.scenario("oc01_daemon_info_refusal", true, |case, evidence, raw| {
@@ -115,11 +115,11 @@ fn oc01_daemon_info_refusal_names_found_version_and_checked_set() -> TestResult 
         let envelope = wait_turn(raw, &session, 1)?;
         failed(&envelope, "handshake_refused")?;
         check(
-            message(&envelope).contains("2.0.23") && message(&envelope).contains("2.0.22"),
+            message(&envelope).contains("2.1.0") && message(&envelope).contains("2.0.22"),
             "Server version refusal omitted the found version or checked set",
         )?;
         check(
-            envelope["vendor_version"] == "2.0.23",
+            envelope["vendor_version"] == "2.1.0",
             "Server version refusal omitted its vendor version",
         )?;
         check(

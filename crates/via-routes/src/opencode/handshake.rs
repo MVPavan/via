@@ -23,7 +23,7 @@ pub const URL_LINE_BYTES: usize = 4096;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Refusal {
     /// The best-effort version check printed something outside the checked
-    /// set (runtime §5 `ProbeRefused`).
+    /// versions' series (runtime §5 `ProbeRefused`).
     VersionCheck {
         /// The check's trimmed output.
         output: String,
@@ -34,7 +34,7 @@ pub enum Refusal {
     UrlLine(&'static str),
     /// `/api/info` answered 200 without a usable identity.
     Info(&'static str),
-    /// `/api/info.version` is outside the checked set (§12).
+    /// `/api/info.version` is outside the checked versions' series (§12).
     Unchecked {
         /// The version the server reported.
         version: String,
@@ -55,19 +55,56 @@ impl fmt::Display for Refusal {
         match self {
             Self::VersionCheck { output, checked } => write!(
                 formatter,
-                "the version check printed {output:?}, outside the checked versions {checked:?}"
+                "the version check printed {output:?}, outside the accepted versions {} \
+                 (checked: {checked:?})",
+                Range(checked)
             ),
             Self::UrlLine(why) => write!(formatter, "the server's URL line {why}"),
             Self::Info(why) => write!(formatter, "the server's /api/info {why}"),
             Self::Unchecked { version, checked } => write!(
                 formatter,
-                "OpenCode {version:?} is not a checked version (checked: {checked:?})"
+                "OpenCode {version:?} is outside the accepted versions {} (checked: {checked:?})",
+                Range(checked)
             ),
             Self::FirstEvent => {
                 formatter.write_str("the server's first event was not server.connected")
             }
             Self::NotFound { endpoint } => write!(formatter, "the server has no {endpoint}"),
         }
+    }
+}
+
+/// A version's series (§12): its text before the last `.`, when what
+/// follows is one or more ASCII digits (`2.0` for `2.0.22`).
+#[must_use]
+pub fn series(version: &str) -> Option<&str> {
+    let (series, patch) = version.rsplit_once('.')?;
+    (!patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())).then_some(series)
+}
+
+/// §12 (owner, 2026-10-10): a version runs when it is a patch of a checked
+/// version's series; only a checked version itself is `tested`.
+#[must_use]
+pub fn accepted(checked: &[&str], version: &str) -> bool {
+    series(version).is_some_and(|found| checked.iter().any(|known| series(known) == Some(found)))
+}
+
+/// The accepted series as refusals name them, such as `2.0.x`.
+struct Range<'a>(&'a [&'a str]);
+
+impl fmt::Display for Range<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut seen: Vec<&str> = Vec::new();
+        for series in self.0.iter().filter_map(|version| series(version)) {
+            if !seen.contains(&series) {
+                if !seen.is_empty() {
+                    formatter.write_str(", ")?;
+                }
+                write!(formatter, "{series}.x")?;
+                seen.push(series);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -411,5 +448,52 @@ mod tests {
             br#"{"id":"evt_1","type":"session.created","data":{}}"#
         ));
         assert!(!connected(b"not json"));
+    }
+
+    /// §12 (owner, 2026-10-10): any patch of a checked version's series
+    /// runs; other series and malformed versions do not; both refusals
+    /// name the version, the accepted range and the checked set.
+    #[test]
+    fn a_checked_series_is_accepted() {
+        const CHECKED: &[&str] = &["2.0.22"];
+        for version in ["2.0.22", "2.0.26", "2.0.0", "2.0.100"] {
+            assert!(accepted(CHECKED, version), "{version}");
+        }
+        for version in [
+            "2.1.0",
+            "3.0.22",
+            "1.0.22",
+            "2.0",
+            "2.0.",
+            "2.0.26-beta",
+            "2.0.2.6",
+            "v2.0.26",
+            "",
+        ] {
+            assert!(!accepted(CHECKED, version), "{version}");
+        }
+        assert_eq!(series("2.0.22"), Some("2.0"));
+        let unchecked = Refusal::Unchecked {
+            version: "2.1.0".to_owned(),
+            checked: CHECKED,
+        }
+        .to_string();
+        assert!(
+            unchecked.contains("2.1.0")
+                && unchecked.contains("2.0.x")
+                && unchecked.contains("2.0.22"),
+            "{unchecked}"
+        );
+        let probe = Refusal::VersionCheck {
+            output: "opencode v2.1.0".to_owned(),
+            checked: CHECKED,
+        }
+        .to_string();
+        assert!(
+            probe.contains("opencode v2.1.0")
+                && probe.contains("2.0.x")
+                && probe.contains("2.0.22"),
+            "{probe}"
+        );
     }
 }
